@@ -178,7 +178,7 @@ def create_model_pipeline(device, num_inference_steps, image_size=(256, 256)):
 def warmup_model():
     # create device, these constants are specific to n150 & n300
     device_id = 0
-    device_params = {"l1_small_size": 11 * 8192, "trace_region_size": 789835776}
+    device_params = {"l1_small_size": 11 * 8192, "trace_region_size": 799245312}
     device = ttnn.CreateDevice(device_id=device_id, **device_params)
     num_inference_steps = 50
     image_size = (512, 512)

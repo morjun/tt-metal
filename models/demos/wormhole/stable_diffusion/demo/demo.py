@@ -4,6 +4,7 @@
 
 import json
 import os
+import time
 
 import numpy as np
 import pytest
@@ -157,6 +158,7 @@ def run_demo_inference(device, reset_seeds, input_path, num_prompts, num_inferen
     output_images = []
     # EXEC
     while i < num_prompts:
+        start_time = time.time()
         ttnn_scheduler.set_timesteps(num_inference_steps)
         input_prompt = [input_prompts[i]]
         i = i + 1
@@ -204,6 +206,8 @@ def run_demo_inference(device, reset_seeds, input_path, num_prompts, num_inferen
         pil_images = [Image.fromarray(image) for image in images][0]
         ttnn_output_path = f"{experiment_name}_ttnn.png"
         pil_images.save(ttnn_output_path)
+        end_time = time.time()
+        logger.info(f"Time taken for prompt {i}: {end_time - start_time} seconds")
     ttnn.release_trace(device, tid)
     profiler.print()
 
@@ -521,7 +525,7 @@ def run_demo_inference_diffusiondb(
 
 @pytest.mark.parametrize(
     "device_params",
-    [{"l1_small_size": 11 * 8192, "trace_region_size": 789835776}],
+    [{"l1_small_size": 11 * 8192, "trace_region_size": 799245312}],
     indirect=True,
 )
 @pytest.mark.parametrize(
