@@ -444,16 +444,30 @@ class ModelArgs:
         max_seq_len=1024 * 128,
         optimizations=None,
         cache_hf=False,  # Set to False to reduce memory usage by not caching HF model
+        subdevice=None,
     ):
-        self.num_devices = mesh_device.get_num_devices() if mesh_device else 0
-        self.mesh_device = mesh_device
+        if subdevice:
+            self.num_devices = 1
+        else:
+            self.num_devices = mesh_device.get_num_devices() if mesh_device else 0
+
+        if subdevice:
+            self.mesh_device = subdevice
+        else:
+            self.mesh_device = mesh_device
         self.arch_name = ttnn.get_arch_name()
         self.dram_grid_size = mesh_device.dram_grid_size() if mesh_device else None  # CoreCoord with (x, y)
 
-        self.device_name = determine_device_name(self.mesh_device)
+        self.device_name = determine_device_name(mesh_device)
 
         logger.info(f"Inferring device name: {self.device_name}")
-        device = mesh_device if mesh_device is not None else None
+        if subdevice:
+            device = subdevice
+        else:
+            device = mesh_device if mesh_device else None
+        # if subdevice:
+        #     self.cluster_shape = list(subdevice.shape)
+        # else:
         self.cluster_shape = list(mesh_device.shape) if mesh_device is not None else None
         self.is_galaxy = self.num_devices == 32
 
