@@ -348,10 +348,6 @@ Tensor reduce_scatter_minimal_async_impl(
     const std::optional<uint32_t>& chunks_per_sync,
     const std::optional<uint32_t>& num_workers_per_link,
     const std::optional<uint32_t>& num_buffers_per_channel) {
-    TT_FATAL(
-        std::getenv("TT_METAL_SLOW_DISPATCH_MODE") == nullptr,
-        "reduce_scatter_minimal_async op is only supported for Fast Dispatch");
-
     int32_t rank = input_tensor.logical_shape().rank();
     int32_t scatter_dim = (dim < 0) ? rank + dim : dim;
 
@@ -367,10 +363,6 @@ Tensor reduce_scatter_minimal_async_impl(
     }
 
     log_debug(tt::LogOp, "DEBUG: line_fabric is created");
-
-    // create this semaphore for all cores since we don't know which core will be used for teardown draining
-    CoreCoord grid_size = input_tensor.device()->compute_with_storage_grid_size();
-    auto core_grid = CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1});
 
     bool using_persistent_buffers = persistent_output_buffers.has_value();
 
