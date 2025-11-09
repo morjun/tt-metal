@@ -100,7 +100,12 @@ def parse_device_profile(csv_path: Path) -> List[DeviceZone]:
 
 
 def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
-    """Analyze a single operation's device profile"""
+    """Analyze a single operation's device profile
+
+    CORRECT calculation method:
+    - Parallel work = timeline_span × num_cores (not sum of all zone durations!)
+    - This accounts for zones running in parallel on different cores
+    """
 
     if not zones:
         return {}
@@ -112,67 +117,78 @@ def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
     wall_ms = (wall_cycles / TT_FREQ_HZ) * 1000.0
 
     # RISC breakdown
-    risc_times = defaultdict(list)
     risc_zones_by_type = defaultdict(list)
 
     for z in zones:
-        duration_ms = (z.duration_cycles / TT_FREQ_HZ) * 1000.0
         risc_type = normalize_risc_type(z.risc_type)
-        risc_times[risc_type].append(duration_ms)
         risc_zones_by_type[risc_type].append(z)
 
-    # Calculate timeline span for each RISC type (actual wall clock contribution)
+    # Calculate CORRECT parallel work (timeline span × num_cores)
+    # This is the actual amount of work done, accounting for parallelism
+    risc_parallel_work = {}
     risc_timeline_spans = {}
+    risc_num_cores = {}
+
     for risc_type in ["BRISC", "NCRISC", "TRISC"]:
         if risc_type in risc_zones_by_type:
             zones_list = risc_zones_by_type[risc_type]
+
+            # Timeline span
             earliest_start = min(z.start_cycle for z in zones_list)
             latest_end = max(z.end_cycle for z in zones_list)
             span_ms = ((latest_end - earliest_start) / TT_FREQ_HZ) * 1000.0
+
+            # Number of unique cores
+            num_cores = len(set(z.core_id for z in zones_list))
+
+            # Parallel work = span × cores
+            parallel_work = span_ms * num_cores
+
             risc_timeline_spans[risc_type] = span_ms
+            risc_num_cores[risc_type] = num_cores
+            risc_parallel_work[risc_type] = parallel_work
         else:
             risc_timeline_spans[risc_type] = 0.0
+            risc_num_cores[risc_type] = 0
+            risc_parallel_work[risc_type] = 0.0
 
-    # Calculate totals
-    brisc_total = sum(risc_times.get("BRISC", []))
-    ncrisc_total = sum(risc_times.get("NCRISC", []))
-    trisc_total = sum(risc_times.get("TRISC", []))
-    data_movement_total = brisc_total + ncrisc_total
+    # Get values
+    brisc_work = risc_parallel_work.get("BRISC", 0)
+    ncrisc_work = risc_parallel_work.get("NCRISC", 0)
+    trisc_work = risc_parallel_work.get("TRISC", 0)
+    total_work = brisc_work + ncrisc_work + trisc_work
 
-    # Average per-core execution times
-    brisc_avg = brisc_total / len(risc_times.get("BRISC", [1])) if risc_times.get("BRISC") else 0
-    ncrisc_avg = ncrisc_total / len(risc_times.get("NCRISC", [1])) if risc_times.get("NCRISC") else 0
-    trisc_avg = trisc_total / len(risc_times.get("TRISC", [1])) if risc_times.get("TRISC") else 0
+    # Calculate parallelism (should be <= max theoretical: 130 cores × 5 RISCs = 650x)
+    parallelism = total_work / wall_ms if wall_ms > 0 else 0
 
     return {
         "description": description,
         "num_zones": len(zones),
         "wall_clock_ms": wall_ms,
-        "brisc_total_ms": brisc_total,
-        "ncrisc_total_ms": ncrisc_total,
-        "trisc_total_ms": trisc_total,
+        "brisc_parallel_work_ms": brisc_work,
+        "ncrisc_parallel_work_ms": ncrisc_work,
+        "trisc_parallel_work_ms": trisc_work,
+        "total_parallel_work_ms": total_work,
+        "parallelism": parallelism,
         "brisc_timeline_span_ms": risc_timeline_spans.get("BRISC", 0),
         "ncrisc_timeline_span_ms": risc_timeline_spans.get("NCRISC", 0),
         "trisc_timeline_span_ms": risc_timeline_spans.get("TRISC", 0),
-        "brisc_avg_ms": brisc_avg,
-        "ncrisc_avg_ms": ncrisc_avg,
-        "trisc_avg_ms": trisc_avg,
-        "data_movement_total_ms": data_movement_total,
-        "compute_total_ms": trisc_total,
-        "data_to_compute_ratio": data_movement_total / trisc_total if trisc_total > 0 else 0,
-        "brisc_count": len(risc_times.get("BRISC", [])),
-        "ncrisc_count": len(risc_times.get("NCRISC", [])),
-        "trisc_count": len(risc_times.get("TRISC", [])),
+        "brisc_num_cores": risc_num_cores.get("BRISC", 0),
+        "ncrisc_num_cores": risc_num_cores.get("NCRISC", 0),
+        "trisc_num_cores": risc_num_cores.get("TRISC", 0),
+        "brisc_count": len(risc_zones_by_type.get("BRISC", [])),
+        "ncrisc_count": len(risc_zones_by_type.get("NCRISC", [])),
+        "trisc_count": len(risc_zones_by_type.get("TRISC", [])),
     }
 
 
-def print_analysis(analysis: Dict, python_ms: float = None):
-    """Print analysis results"""
+def print_analysis(analysis: Dict, python_ms: float | None = None):
+    """Print analysis results with CORRECT parallel work calculation"""
     print(f"\n{'='*80}")
     print(f"{analysis['description']}")
     print(f"{'='*80}")
     print(f"Zones: {analysis['num_zones']}")
-    print(f"Device Wall Clock: {analysis['wall_clock_ms']:.6f} ms (100%)")
+    print(f"Device Wall Clock: {analysis['wall_clock_ms']:.6f} ms")
 
     if python_ms is not None:
         sync_overhead = python_ms - analysis["wall_clock_ms"]
@@ -182,65 +198,57 @@ def print_analysis(analysis: Dict, python_ms: float = None):
 
     print()
     print("=" * 80)
-    print("WALL CLOCK TIME BREAKDOWN")
+    print("PARALLEL WORK BREAKDOWN (timeline span × num_cores)")
     print("=" * 80)
     print()
 
     wall_clock = analysis["wall_clock_ms"]
+    brisc_work = analysis.get("brisc_parallel_work_ms", 0)
+    ncrisc_work = analysis.get("ncrisc_parallel_work_ms", 0)
+    trisc_work = analysis.get("trisc_parallel_work_ms", 0)
+    total_work = analysis.get("total_parallel_work_ms", 0)
+    parallelism = analysis.get("parallelism", 0)
 
-    print("Each component's contribution to wall clock:")
-    print(f"  Wall Clock Total: {wall_clock:.6f} ms")
-    print()
-
-    # Timeline spans (actual wall clock contributions)
     brisc_span = analysis.get("brisc_timeline_span_ms", 0)
     ncrisc_span = analysis.get("ncrisc_timeline_span_ms", 0)
     trisc_span = analysis.get("trisc_timeline_span_ms", 0)
 
-    print(f"{'Component':<35} {'Timeline Span (ms)':<20} {'% of Wall Clock':<20}")
+    brisc_cores = analysis.get("brisc_num_cores", 0)
+    ncrisc_cores = analysis.get("ncrisc_num_cores", 0)
+    trisc_cores = analysis.get("trisc_num_cores", 0)
+
+    print(f"{'Component':<25} {'Span (ms)':<15} {'Cores':<10} {'Work (ms)':<15} {'% of Total':<15}")
     print("-" * 80)
 
-    # Weight Streaming (BRISC)
-    brisc_pct = (brisc_span / wall_clock * 100) if wall_clock > 0 else 0
-    print(f"{'Weight Streaming (BRISC)':<35} {brisc_span:<20.6f} {brisc_pct:<20.1f}%")
-    print(f"  {'Timeline: covers full forward pass':<33}")
+    brisc_pct = (brisc_work / total_work * 100) if total_work > 0 else 0
+    print(f"{'Weight Streaming':<25} {brisc_span:<15.6f} {brisc_cores:<10} {brisc_work:<15.2f} {brisc_pct:<15.1f}%")
 
-    # NoC Communication (NCRISC)
-    ncrisc_pct = (ncrisc_span / wall_clock * 100) if wall_clock > 0 else 0
-    print(f"{'NoC Communication (NCRISC)':<35} {ncrisc_span:<20.6f} {ncrisc_pct:<20.1f}%")
-    print(f"  {'Timeline: mostly overlaps with BRISC':<33}")
+    ncrisc_pct = (ncrisc_work / total_work * 100) if total_work > 0 else 0
+    print(
+        f"{'NoC Communication':<25} {ncrisc_span:<15.6f} {ncrisc_cores:<10} {ncrisc_work:<15.2f} {ncrisc_pct:<15.1f}%"
+    )
 
-    # Computation (TRISC)
-    trisc_pct = (trisc_span / wall_clock * 100) if wall_clock > 0 else 0
-    print(f"{'Computation (TRISC)':<35} {trisc_span:<20.6f} {trisc_pct:<20.1f}%")
-    print(f"  {'Timeline: mostly overlaps with BRISC/NCRISC':<33}")
+    trisc_pct = (trisc_work / total_work * 100) if total_work > 0 else 0
+    print(f"{'Computation':<25} {trisc_span:<15.6f} {trisc_cores:<10} {trisc_work:<15.2f} {trisc_pct:<15.1f}%")
 
     print("-" * 80)
-    print(f"{'All components run IN PARALLEL':<35} {'Wall clock = max span':<20}")
+    print(f"{'TOTAL':<25} {'':<15} {'':<10} {total_work:<15.2f} {'100.0%':<15}")
     print()
 
-    print("Note: All components run simultaneously (parallel execution).")
-    print(f"      Wall clock ({wall_clock:.6f} ms) ≈ max({brisc_span:.3f}, {ncrisc_span:.3f}, {trisc_span:.3f})")
+    print(f"Effective Parallelism: {parallelism:.1f}x")
+    print(f"  (Total work {total_work:.1f} ms / Wall clock {wall_clock:.3f} ms)")
     print()
 
-    print("=" * 80)
-    print("AVERAGE PER-CORE EXECUTION TIMES")
-    print("=" * 80)
-    print()
+    # Validation
+    max_theoretical = 130 * 5  # 130 Tensix cores × 5 RISC processors
+    efficiency = (parallelism / max_theoretical * 100) if max_theoretical > 0 else 0
+    print(f"Theoretical Maximum: {max_theoretical}x (130 cores × 5 RISCs)")
+    print(f"Efficiency: {efficiency:.1f}%")
 
-    brisc_avg = analysis.get("brisc_avg_ms", 0)
-    ncrisc_avg = analysis.get("ncrisc_avg_ms", 0)
-    trisc_avg = analysis.get("trisc_avg_ms", 0)
-
-    print(f"{'Component':<35} {'Avg Time (ms)':<20} {'Cores/Processors':<20}")
-    print("-" * 80)
-    print(f"{'Weight Streaming (BRISC)':<35} {brisc_avg:<20.6f} {analysis['brisc_count']:<20}")
-    print(f"{'NoC Communication (NCRISC)':<35} {ncrisc_avg:<20.6f} {analysis['ncrisc_count']:<20}")
-    print(f"{'Computation (TRISC)':<35} {trisc_avg:<20.6f} {analysis['trisc_count']:<20}")
-    print()
-
-    print("This shows how long each core/processor actually worked.")
-    print(f"Average times are similar (±5%), indicating balanced parallel execution.")
+    if parallelism > max_theoretical:
+        print()
+        print("⚠️  WARNING: Parallelism exceeds theoretical maximum!")
+        print("    This indicates an error in calculation or data.")
     print()
 
 
@@ -252,15 +260,16 @@ def main():
     print("=" * 80)
     print()
     print("Configuration:")
-    print("  - Hardware: Tenstorrent Blackhole P150A")
-    print("  - Frequency: 1.35 GHz")
+    print("  - Hardware: Tenstorrent Blackhole P150A @ 1.35 GHz")
+    print("  - Tensix cores: 130 (13×10 grid)")
+    print("  - Max parallelism: 130 cores × 5 RISCs = 650x")
     print("  - Matrix: 4096×4096 @ bfloat16")
-    print("  - Large batch: B=256")
-    print("  - Mini-batch: b=32 × 8 forwards")
+    print("  - Large batch: B=256 (1 forward)")
+    print("  - Mini-batch: b=32 (8 forwards)")
     print("  - Profiling: TT_METAL_DEVICE_PROFILER=1 (cycle-accurate)")
     print()
 
-    # Parse device profile (should contain most recent run)
+    # Parse device profile
     csv_path = Path("generated/profiler/.logs/profile_log_device.csv")
 
     if not csv_path.exists():
@@ -274,209 +283,63 @@ def main():
     print(f"Device profile loaded: {len(zones)} zones, {len(run_host_ids)} operations")
     print()
 
-    # Detect scenario based on number of operations
-    # Large batch: ~5 operations (setup + 1 warmup + 1 measurement)
-    # Mini-batch: ~20 operations (setup + 8×2 forwards)
-
+    # Detect scenario
     if len(run_host_ids) <= 10:
-        # Large batch scenario
+        # Large batch
         print("Detected: LARGE BATCH scenario")
         print()
 
-        # Last operation is the measurement forward
         last_run_id = run_host_ids[-1]
         last_op_zones = [z for z in zones if z.run_host_id == last_run_id]
 
         analysis = analyze_operation(last_op_zones, "Large Batch Forward (B=256)")
-        python_ms = 0.246  # From Python measurement
+        python_ms = 0.239  # From Python measurement
         print_analysis(analysis, python_ms)
 
     else:
-        # Mini-batch scenario
+        # Mini-batch
         print("Detected: MINI-BATCH scenario (8 forwards)")
         print()
 
-        # Calculate SEQUENTIAL sum of each forward (each forward = 2 operations)
+        # Analyze last 16 operations (8 forwards × 2 ops each)
+        mini_run_ids = run_host_ids[-16:]
+
+        # Calculate total wall clock
         total_wall_ms = 0.0
-        forward_times = []
+        for i in range(8):
+            fwd_run_ids = [mini_run_ids[i * 2], mini_run_ids[i * 2 + 1]]
+            fwd_zones = [z for z in zones if z.run_host_id in fwd_run_ids]
 
-        for fwd_idx in range(8):
-            start_idx = len(run_host_ids) - 16 + fwd_idx * 2
-            run_id_1 = run_host_ids[start_idx]
-            run_id_2 = run_host_ids[start_idx + 1]
+            if fwd_zones:
+                fwd_wall = (
+                    (max(z.end_cycle for z in fwd_zones) - min(z.start_cycle for z in fwd_zones)) / TT_FREQ_HZ
+                ) * 1000
+                total_wall_ms += fwd_wall
 
-            # Get zones for each operation separately
-            op1_zones = [z for z in zones if z.run_host_id == run_id_1]
-            op2_zones = [z for z in zones if z.run_host_id == run_id_2]
-
-            # Calculate wall clock for EACH operation
-            op1_wall = (
-                (max(z.end_cycle for z in op1_zones) - min(z.start_cycle for z in op1_zones)) / TT_FREQ_HZ
-            ) * 1000
-            op2_wall = (
-                (max(z.end_cycle for z in op2_zones) - min(z.start_cycle for z in op2_zones)) / TT_FREQ_HZ
-            ) * 1000
-
-            # Sum for this forward
-            fwd_wall = op1_wall + op2_wall
-            forward_times.append((fwd_idx + 1, run_id_1, run_id_2, op1_wall, op2_wall, fwd_wall))
-            total_wall_ms += fwd_wall
-
-        python_total_ms = 1.663  # From Python measurement
+        python_total_ms = 1.439  # From Python measurement
 
         print("Mini-batch Summary:")
         print(f"  Total device time (8 forwards): {total_wall_ms:.6f} ms")
         print(f"  Total Python time (8 forwards): {python_total_ms:.6f} ms")
-        print(
-            f"  Sync overhead: {(python_total_ms - total_wall_ms):.6f} ms ({((python_total_ms - total_wall_ms) / python_total_ms * 100):.1f}%)"
-        )
-        print()
         print(f"  Per-forward device: {(total_wall_ms / 8):.6f} ms")
         print(f"  Per-forward Python: {(python_total_ms / 8):.6f} ms")
         print()
 
-        # Individual forward breakdown
-        print("Individual Forward Breakdown:")
-        print(f"{'Forward':<10} {'Run IDs':<20} {'Op1 (ms)':<12} {'Op2 (ms)':<12} {'Total (ms)':<12}")
-        print("-" * 75)
-
-        for fwd, r1, r2, op1, op2, total in forward_times:
-            print(f"{fwd:<10} {r1},{r2:<17} {op1:<12.6f} {op2:<12.6f} {total:<12.6f}")
+        # Analyze all 8 forwards together
+        all_mini_zones = [z for z in zones if z.run_host_id in mini_run_ids]
+        analysis = analyze_operation(all_mini_zones, "Mini-batch Total (8 forwards)")
+        print_analysis(analysis, python_total_ms)
 
         print()
-
-        # Analyze one representative forward for RISC breakdown
-        # Use the last forward as representative
-        last_fwd_run_ids = [forward_times[-1][1], forward_times[-1][2]]
-        last_fwd_zones = [z for z in zones if z.run_host_id in last_fwd_run_ids]
-
-        analysis_one = analyze_operation(last_fwd_zones, "Representative Forward (last of 8)")
-        print_analysis(analysis_one)
-
-        # Compare with large batch
-        print("\n" + "=" * 80)
-        print("COMPARISON: Large Batch vs Mini-batch")
         print("=" * 80)
-
-        large_batch_device_ms = 0.166
-        large_batch_python_ms = 0.246
-        mini_per_forward_device_ms = total_wall_ms / 8
-        mini_per_forward_python_ms = python_total_ms / 8
-
-        print()
-        print("Per-Forward Metrics:")
-        print(f"  {'Scenario':<25} {'Device (ms)':<15} {'Python (ms)':<15} {'Sync Overhead':<15}")
-        print(f"  {'-'*70}")
-        print(
-            f"  {'Large batch (B=256)':<25} {large_batch_device_ms:<15.6f} {large_batch_python_ms:<15.6f} {((large_batch_python_ms - large_batch_device_ms) / large_batch_python_ms * 100):.1f}%"
-        )
-        print(
-            f"  {'Mini-batch (b=32)':<25} {mini_per_forward_device_ms:<15.6f} {mini_per_forward_python_ms:<15.6f} {((mini_per_forward_python_ms - mini_per_forward_device_ms) / mini_per_forward_python_ms * 100):.1f}%"
-        )
-        print()
-
-        device_ratio = mini_per_forward_device_ms / large_batch_device_ms
-        python_ratio = mini_per_forward_python_ms / large_batch_python_ms
-
-        print(f"  Per-forward comparison:")
-        print(f"    Mini-batch / Large batch (device): {device_ratio:.3f}x  ({((device_ratio - 1) * 100):+.1f}%)")
-        print(f"    Mini-batch / Large batch (Python): {python_ratio:.3f}x  ({((python_ratio - 1) * 100):+.1f}%)")
-        print()
-
-        print("Total Time to Process 256 Elements:")
-        print(f"  {'Scenario':<25} {'Device (ms)':<15} {'Python (ms)':<15}")
-        print(f"  {'-'*55}")
-        print(f"  {'Large batch (1×256)':<25} {large_batch_device_ms:<15.6f} {large_batch_python_ms:<15.6f}")
-        print(f"  {'Mini-batch (8×32)':<25} {total_wall_ms:<15.6f} {python_total_ms:<15.6f}")
-        print()
-
-        total_device_ratio = total_wall_ms / large_batch_device_ms
-        total_python_ratio = python_total_ms / large_batch_python_ms
-
-        print(f"  Total time comparison (Mini-batch / Large batch):")
-        print(f"    Device: {total_device_ratio:.2f}x slower  (mini-batch takes {total_device_ratio:.2f}x more time)")
-        print(f"    Python: {total_python_ratio:.2f}x slower  (mini-batch takes {total_python_ratio:.2f}x more time)")
-        print()
-
-        print("Key Insights:")
-        print(f"  1. Per-forward: Mini-batch is actually {(1 - device_ratio)*100:.1f}% FASTER on device")
-        print(f"     (Device: {mini_per_forward_device_ms:.3f} ms vs {large_batch_device_ms:.3f} ms)")
-        print(
-            f"  2. But mini-batch has HIGHER sync overhead ({((mini_per_forward_python_ms - mini_per_forward_device_ms) / mini_per_forward_python_ms * 100):.1f}% vs {((large_batch_python_ms - large_batch_device_ms) / large_batch_python_ms * 100):.1f}%)"
-        )
-        print(
-            f"  3. Overall: Large batch is {total_device_ratio:.1f}x faster (device) and {total_python_ratio:.1f}x faster (Python)"
-        )
-        print(f"  4. The overhead of 8 separate forwards >> the per-forward efficiency gain")
-        print()
-
-        # Component breakdown comparison
+        print("Per-forward Average:")
         print("=" * 80)
-        print("COMPONENT TIME COMPARISON (Timeline Spans)")
-        print("=" * 80)
-        print()
-        print("This shows how long each component takes within the wall clock time.")
-        print()
-
-        # Get actual values from analysis
-        # For large batch (need to store these)
-        large_brisc_span = 0.167  # ms
-        large_ncrisc_span = 0.153  # ms
-        large_trisc_span = 0.154  # ms
-        large_wall = 0.167  # ms
-
-        # For mini-batch (from representative forward - need to get actual values)
-        print(f"{'Component':<30} {'Large Batch':<20} {'Mini-batch':<20} {'Difference':<20}")
-        print(f"  {'':<30} {'(B=256)':<20} {'(b=32, per fwd)':<20}")
-        print(f"  {'-'*90}")
-
-        print(f"{'Wall Clock':<30} {large_wall:<20.6f} ms  {'0.217':<20} ms  {'+0.050 ms':<20}")
-        print()
-        print(
-            f"{'Weight Streaming':<30} {large_brisc_span:<20.6f} ms  {'0.217':<20} ms  {'+0.050 ms (30% longer!)':<20}"
-        )
-        print(f"  {'% of wall clock':<28} {'100%':<20} {'100%':<20}")
-        print()
-        print(
-            f"{'NoC Communication':<30} {large_ncrisc_span:<20.6f} ms  {'0.215':<20} ms  {'+0.062 ms (40% longer!)':<20}"
-        )
-        print(f"  {'% of wall clock':<28} {'92%':<20} {'99%':<20}")
-        print()
-        print(f"{'Computation':<30} {large_trisc_span:<20.6f} ms  {'0.112':<20} ms  {'-0.042 ms (27% shorter!)':<20}")
-        print(f"  {'% of wall clock':<28} {'93%':<20} {'52%':<20}")
-        print()
-
-        print("=" * 80)
-        print("KEY FINDINGS")
-        print("=" * 80)
-        print()
-        print("1. WEIGHT STREAMING TIME:")
-        print(f"   Large batch: {large_brisc_span:.6f} ms")
-        print(f"   Mini-batch:  0.217 ms (per forward)")
-        print(f"   → Mini-batch weight streaming is 30% LONGER!")
-        print(f"   → This contradicts the hypothesis that weight streaming should be similar")
-        print()
-        print("2. COMPUTATION TIME:")
-        print(f"   Large batch: {large_trisc_span:.6f} ms (93% of wall clock)")
-        print(f"   Mini-batch:  0.112 ms (52% of wall clock)")
-        print(f"   → Mini-batch computation is 27% SHORTER (expected: smaller batch)")
-        print()
-        print("3. WHY IS MINI-BATCH WEIGHT STREAMING LONGER?")
-        print("   Possible reasons:")
-        print("   a) Smaller batch uses FEWER cores (516 vs 256)")
-        print("      → Less parallelism in weight distribution")
-        print("   b) Weight loading overhead doesn't scale linearly with batch size")
-        print("   c) Different sharding strategy for smaller batches")
-        print()
-        print("4. WALL CLOCK BOTTLENECK:")
-        print("   Large batch: Weight streaming (100%) = wall clock")
-        print("   Mini-batch:  Weight streaming (100%) = wall clock")
-        print("   → Weight streaming IS the bottleneck in BOTH cases!")
-        print()
-        print("5. COMPUTATION IS NOT THE BOTTLENECK:")
-        print("   Large batch: Compute finishes at 93% of wall clock")
-        print("   Mini-batch:  Compute finishes at 52% of wall clock")
-        print("   → Compute waits for weight streaming to complete")
+        per_fwd_work = analysis["total_parallel_work_ms"] / 8
+        per_fwd_wall = total_wall_ms / 8
+        per_fwd_parallelism = per_fwd_work / per_fwd_wall if per_fwd_wall > 0 else 0
+        print(f"  Wall clock: {per_fwd_wall:.6f} ms")
+        print(f"  Total work: {per_fwd_work:.2f} ms")
+        print(f"  Parallelism: {per_fwd_parallelism:.1f}x")
         print()
 
 
