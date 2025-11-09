@@ -350,10 +350,12 @@ def time_forward(
     # Warmup and ensure kernel is resident
     if pre_measured_compile_ms is not None:
         timings.kernel_compilation_ms = pre_measured_compile_ms
+        print(f"[PROFILE] Warmup forward 0 (kernel already compiled)")
         _ = linear(x_tt)
         device_synchronize(device)
     else:
         t_warmup_compile_start = time.perf_counter()
+        print(f"[PROFILE] Warmup forward 0 (compiling kernels)")
         _ = linear(x_tt)
         device_synchronize(device)
         t_warmup_compile_end = time.perf_counter()
@@ -362,6 +364,7 @@ def time_forward(
 
     # Continue with remaining warmup iterations (compilation already done)
     for i in range(1, warmup_iters):
+        print(f"[PROFILE] Warmup forward {i}")
         _ = linear(x_tt)
         device_synchronize(device)
 
@@ -387,6 +390,7 @@ def time_forward(
 
         # Forward pass - measure compute time
         t_f0 = time.perf_counter()
+        print(f"[PROFILE] Measurement forward {iter_idx}")
         _ = linear(x_tt)
         device_synchronize(device)
         t_f1 = time.perf_counter()
