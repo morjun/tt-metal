@@ -44,6 +44,8 @@ class BenchmarkConfig:
     seed: int = 1337
     output_csv: Optional[str] = None
     append_csv: bool = False
+    only_large: bool = False  # Run only large batch scenario
+    only_mini: bool = False  # Run only mini-batch scenario
 
 
 @dataclass
@@ -175,6 +177,16 @@ def parse_args() -> BenchmarkConfig:
         action="store_true",
         help="Append to existing CSV file instead of overwriting",
     )
+    parser.add_argument(
+        "--only-large",
+        action="store_true",
+        help="Run only large batch scenario (for device profiling comparison)",
+    )
+    parser.add_argument(
+        "--only-mini",
+        action="store_true",
+        help="Run only mini-batch scenario (for device profiling comparison)",
+    )
 
     args = parser.parse_args()
     return BenchmarkConfig(
@@ -189,6 +201,8 @@ def parse_args() -> BenchmarkConfig:
         seed=args.seed,
         output_csv=args.output_csv,
         append_csv=args.append_csv,
+        only_large=args.only_large,
+        only_mini=args.only_mini,
     )
 
 
@@ -651,92 +665,109 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             f"[warn] small_batch_size * minibatches ({small_total}) != large_batch_size ({cfg.large_batch_size}); comparing unequal total tokens"
         )
 
+    # Check for mutually exclusive options
+    if cfg.only_large and cfg.only_mini:
+        raise ValueError("Cannot use --only-large and --only-mini together")
+
     # Pre-stage the full logical-batch input in DRAM once
     staged_large_input = make_staged_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 42)
 
-    # Measure compilation time for both kernels before benchmarks
+    # Initialize result variables
+    large_phase_timings = None
+    large_total_ms = 0.0
+    large_w_ms = 0.0
+    large_f_ms = 0.0
+    mini_phase_timings = None
+    mini_total_ms = 0.0
+    mini_w_ms = 0.0
+    mini_f_ms = 0.0
 
-    # Measure large batch kernel compilation
-    pre_w_large, pre_b_large, _ = make_tt_weight_and_bias(
-        device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9999, timings=None
-    )
-    pre_linear_large = TtLinear(
-        cfg.in_features, cfg.out_features, pre_w_large, pre_b_large, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
-    )
-    pre_x_large = make_tt_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 9998, timings=None)
-    t_compile_large_start = time.perf_counter()
-    _ = pre_linear_large(pre_x_large)
-    device_synchronize(device)
-    t_compile_large_end = time.perf_counter()
-    large_batch_compile_ms = (t_compile_large_end - t_compile_large_start) * 1000.0
+    # Run large batch scenario
+    if not cfg.only_mini:
+        # Measure large batch kernel compilation
+        pre_w_large, pre_b_large, _ = make_tt_weight_and_bias(
+            device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9999, timings=None
+        )
+        pre_linear_large = TtLinear(
+            cfg.in_features, cfg.out_features, pre_w_large, pre_b_large, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        pre_x_large = make_tt_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 9998, timings=None)
+        t_compile_large_start = time.perf_counter()
+        _ = pre_linear_large(pre_x_large)
+        device_synchronize(device)
+        t_compile_large_end = time.perf_counter()
+        large_batch_compile_ms = (t_compile_large_end - t_compile_large_start) * 1000.0
 
-    # Clean up and let device settle
-    pre_x_large.deallocate()
-    pre_w_large.deallocate()
-    if pre_b_large is not None:
-        pre_b_large.deallocate()
-    device_synchronize(device)
-    time.sleep(0.05)  # Small delay to let device settle
+        # Clean up and let device settle
+        pre_x_large.deallocate()
+        pre_w_large.deallocate()
+        if pre_b_large is not None:
+            pre_b_large.deallocate()
+        device_synchronize(device)
+        time.sleep(0.05)
 
-    # Measure small batch kernel compilation
-    pre_w_small, pre_b_small, _ = make_tt_weight_and_bias(
-        device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9997, timings=None
-    )
-    pre_linear_small = TtLinear(
-        cfg.in_features, cfg.out_features, pre_w_small, pre_b_small, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
-    )
-    pre_x_small = make_tt_input(device, cfg.small_batch_size, cfg.in_features, dtype, cfg.seed + 9996, timings=None)
-    t_compile_small_start = time.perf_counter()
-    _ = pre_linear_small(pre_x_small)
-    device_synchronize(device)
-    t_compile_small_end = time.perf_counter()
-    small_batch_compile_ms = (t_compile_small_end - t_compile_small_start) * 1000.0
+        # Run large batch benchmark
+        large_phase_timings, large_total_ms, large_w_ms, large_f_ms = time_forward(
+            device,
+            cfg.in_features,
+            cfg.out_features,
+            cfg.large_batch_size,
+            dtype,
+            cfg.seed,
+            cfg.warmup_iters,
+            cfg.measure_iters,
+            pre_measured_compile_ms=large_batch_compile_ms,
+        )
 
-    # Clean up
-    pre_x_small.deallocate()
-    pre_w_small.deallocate()
-    if pre_b_small is not None:
-        pre_b_small.deallocate()
-    device_synchronize(device)
-    time.sleep(0.1)  # Let device settle after cleanup
+    # Run mini-batch scenario
+    if not cfg.only_large:
+        # Measure small batch kernel compilation
+        pre_w_small, pre_b_small, _ = make_tt_weight_and_bias(
+            device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9997, timings=None
+        )
+        pre_linear_small = TtLinear(
+            cfg.in_features, cfg.out_features, pre_w_small, pre_b_small, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        pre_x_small = make_tt_input(device, cfg.small_batch_size, cfg.in_features, dtype, cfg.seed + 9996, timings=None)
+        t_compile_small_start = time.perf_counter()
+        _ = pre_linear_small(pre_x_small)
+        device_synchronize(device)
+        t_compile_small_end = time.perf_counter()
+        small_batch_compile_ms = (t_compile_small_end - t_compile_small_start) * 1000.0
 
-    # Kernels compiled; start benchmarks
+        # Clean up
+        pre_x_small.deallocate()
+        pre_w_small.deallocate()
+        if pre_b_small is not None:
+            pre_b_small.deallocate()
+        device_synchronize(device)
+        time.sleep(0.1)
 
-    # Goal comparison: large batch (single weight load) vs minibatches (same weights, re-streamed DRAM->L1)
-    # Large batch single pass, weights created once, use full staged input
-    # Pass pre-measured compilation time so it uses the accurate measurement
-    large_phase_timings, large_total_ms, large_w_ms, large_f_ms = time_forward(
-        device,
-        cfg.in_features,
-        cfg.out_features,
-        cfg.large_batch_size,
-        dtype,
-        cfg.seed,
-        cfg.warmup_iters,
-        cfg.measure_iters,
-        pre_measured_compile_ms=large_batch_compile_ms,
-    )
-
-    # Mini-batch repeated passes: slice from staged_large_input to avoid host transfers
-    # Pass pre-measured compilation time so it uses the accurate measurement
-    mini_phase_timings, mini_total_ms, mini_w_ms, mini_f_ms = time_minibatch_sequence(
-        device,
-        cfg.in_features,
-        cfg.out_features,
-        cfg.small_batch_size,
-        cfg.minibatches,
-        dtype,
-        cfg.seed,
-        staged_large_input,
-        cfg.warmup_iters,
-        cfg.measure_iters,
-        pre_measured_compile_ms=small_batch_compile_ms,
-    )
+        # Run mini-batch benchmark
+        mini_phase_timings, mini_total_ms, mini_w_ms, mini_f_ms = time_minibatch_sequence(
+            device,
+            cfg.in_features,
+            cfg.out_features,
+            cfg.small_batch_size,
+            cfg.minibatches,
+            dtype,
+            cfg.seed,
+            staged_large_input,
+            cfg.warmup_iters,
+            cfg.measure_iters,
+            pre_measured_compile_ms=small_batch_compile_ms,
+        )
 
     # Overhead assessment
     overhead_ms = mini_f_ms - large_f_ms
 
     ttnn.close_device(device)
+
+    # Create default PhaseTimings if not set
+    if large_phase_timings is None:
+        large_phase_timings = PhaseTimings()
+    if mini_phase_timings is None:
+        mini_phase_timings = PhaseTimings()
 
     return BenchmarkResult(
         large_phase_timings=large_phase_timings,
