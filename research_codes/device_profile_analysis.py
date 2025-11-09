@@ -328,7 +328,9 @@ def main():
         # Analyze all 8 forwards together
         all_mini_zones = [z for z in zones if z.run_host_id in mini_run_ids]
         analysis = analyze_operation(all_mini_zones, "Mini-batch Total (8 forwards)")
-        print_analysis(analysis, python_total_ms)
+        # Don't compare timeline span to python sum - they measure different things!
+        # Timeline span includes overlaps, python sum is sequential
+        print_analysis(analysis, python_ms=None)
 
         print()
         print("=" * 80)
@@ -336,10 +338,20 @@ def main():
         print("=" * 80)
         per_fwd_work = analysis["total_parallel_work_ms"] / 8
         per_fwd_wall = total_wall_ms / 8
+        per_fwd_python = python_total_ms / 8
         per_fwd_parallelism = per_fwd_work / per_fwd_wall if per_fwd_wall > 0 else 0
-        print(f"  Wall clock: {per_fwd_wall:.6f} ms")
+        per_fwd_sync = per_fwd_python - per_fwd_wall
+        per_fwd_sync_pct = (per_fwd_sync / per_fwd_python * 100) if per_fwd_python > 0 else 0
+
+        print(f"  Device wall clock: {per_fwd_wall:.6f} ms")
+        print(f"  Python measurement: {per_fwd_python:.6f} ms")
+        if per_fwd_sync >= 0:
+            print(f"  Sync overhead: {per_fwd_sync:.6f} ms ({per_fwd_sync_pct:.1f}%)")
+        else:
+            print(f"  Python underestimate: {abs(per_fwd_sync):.6f} ms ({abs(per_fwd_sync_pct):.1f}%)")
+            print("    (Device profiler captures work Python timer misses)")
         print(f"  Total work: {per_fwd_work:.2f} ms")
-        print(f"  Parallelism: {per_fwd_parallelism:.1f}x")
+        print(f"  Parallelism: {per_fwd_parallelism:.1f}x ({(per_fwd_parallelism / 650 * 100):.1f}% efficiency)")
         print()
 
 
