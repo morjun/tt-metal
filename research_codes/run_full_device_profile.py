@@ -74,48 +74,64 @@ def extract_minibatches_from_benchmark_csv() -> int | None:
 
 
 def parse_analysis_output(output: str) -> dict:
-    """Parse device_profile_analysis.py output to extract key metrics"""
+    """Parse device_profile_analysis.py output to extract key metrics
+
+    Now handles both:
+    - Large batch: single forward pass metrics
+    - Mini-batch: full sequence metrics + per-forward metrics
+    """
     lines = output.split("\n")
     data = {}
+    in_total_sequence = False
+    in_per_forward = False
 
     for i, line in enumerate(lines):
+        # Detect sections
+        if "TOTAL SEQUENCE METRICS" in line or "TOTAL SEQUENCE PARALLEL WORK BREAKDOWN" in line:
+            in_total_sequence = True
+            in_per_forward = False
+        elif "PER-FORWARD AVERAGE METRICS" in line:
+            in_total_sequence = False
+            in_per_forward = True
+        elif "PARALLEL WORK BREAKDOWN" in line and "TOTAL" not in line:
+            # Single forward pass section (large batch or single forward in mini-batch)
+            in_total_sequence = False
+            in_per_forward = False
+
         # Wall clock time - handle both old and new formats
         if "Device Wall Clock" in line and ":" in line:
             parts = line.split(":")
             if len(parts) >= 2:
                 try:
-                    data["wall_clock_ms"] = float(parts[1].strip().split()[0])
+                    val = float(parts[1].strip().split()[0])
+                    if "Total Device Wall Clock" in line or in_total_sequence:
+                        data["total_wall_clock_ms"] = val
+                    elif "Per-forward Device Wall Clock" in line or in_per_forward:
+                        data["per_fwd_wall_clock_ms"] = val
+                    else:
+                        data["wall_clock_ms"] = val
                 except (ValueError, IndexError):
                     pass
 
         # Python measurement - handle both old and new formats
-        if "Python measurement:" in line or "Python Measurement:" in line or "Python per-forward time:" in line:
+        if "Python" in line and ("Measurement" in line or "per-forward" in line) and ":" in line:
             parts = line.split(":")
             if len(parts) >= 2:
                 try:
-                    data["python_ms"] = float(parts[1].strip().split()[0])
+                    val = float(parts[1].strip().split()[0])
+                    if "Total Python Measurement" in line or in_total_sequence:
+                        data["total_python_ms"] = val
+                    elif "Per-forward Python Measurement" in line or in_per_forward:
+                        data["per_fwd_python_ms"] = val
+                    else:
+                        data["python_ms"] = val
                 except (ValueError, IndexError):
                     pass
 
         # Component breakdown - parse table format more carefully
         # Format: Component  Span  Cores  WORK  Percentage%
-        if "Weight Streaming" in line and "Cores" not in line:
-            # Split by whitespace and get numeric values
-            parts = line.split()
-            nums = []
-            for p in parts:
-                try:
-                    # Try to extract number (remove % if present)
-                    val_str = p.rstrip("%")
-                    val = float(val_str)
-                    nums.append(val)
-                except ValueError:
-                    continue
-            # Should have: [span, cores, work, percentage]
-            if len(nums) >= 3:
-                data["weight_streaming_ms"] = nums[2]  # 3rd number is work
-
-        if "NoC Communication" in line and "Cores" not in line:
+        # Handle both "Total Work (ms)" and "Per-Forward Work (ms)" columns
+        if "Weight Streaming" in line and "Cores" not in line and "Component" not in line:
             parts = line.split()
             nums = []
             for p in parts:
@@ -125,10 +141,20 @@ def parse_analysis_output(output: str) -> dict:
                     nums.append(val)
                 except ValueError:
                     continue
+            # Should have: [span, cores, work, percentage] or [work, percentage] for per-forward
             if len(nums) >= 3:
-                data["noc_communication_ms"] = nums[2]
+                work_val = nums[2]  # 3rd number is work (for total sequence)
+                if in_total_sequence:
+                    data["total_weight_streaming_ms"] = work_val
+                elif in_per_forward:
+                    data["per_fwd_weight_streaming_ms"] = work_val
+                else:
+                    data["weight_streaming_ms"] = work_val
+            elif len(nums) >= 1 and in_per_forward:
+                # Per-forward format: [work, percentage]
+                data["per_fwd_weight_streaming_ms"] = nums[0]
 
-        if "Computation" in line and "NoC" not in line and "Cores" not in line:
+        if "NoC Communication" in line and "Cores" not in line and "Component" not in line:
             parts = line.split()
             nums = []
             for p in parts:
@@ -139,89 +165,123 @@ def parse_analysis_output(output: str) -> dict:
                 except ValueError:
                     continue
             if len(nums) >= 3:
-                data["computation_ms"] = nums[2]
+                work_val = nums[2]
+                if in_total_sequence:
+                    data["total_noc_communication_ms"] = work_val
+                elif in_per_forward:
+                    data["per_fwd_noc_communication_ms"] = work_val
+                else:
+                    data["noc_communication_ms"] = work_val
+            elif len(nums) >= 1 and in_per_forward:
+                data["per_fwd_noc_communication_ms"] = nums[0]
 
-        # Total work
+        if "Computation" in line and "NoC" not in line and "Cores" not in line and "Component" not in line:
+            parts = line.split()
+            nums = []
+            for p in parts:
+                try:
+                    val_str = p.rstrip("%")
+                    val = float(val_str)
+                    nums.append(val)
+                except ValueError:
+                    continue
+            if len(nums) >= 3:
+                work_val = nums[2]
+                if in_total_sequence:
+                    data["total_computation_ms"] = work_val
+                elif in_per_forward:
+                    data["per_fwd_computation_ms"] = work_val
+                else:
+                    data["computation_ms"] = work_val
+            elif len(nums) >= 1 and in_per_forward:
+                data["per_fwd_computation_ms"] = nums[0]
+
+        # Total work - handle both total sequence and per-forward
         if "TOTAL" in line and not line.strip().startswith("Component"):
             parts = line.split()
             for j, p in enumerate(parts):
                 try:
                     val = float(p)
-                    if val > 1.0 and "total_work_ms" not in data:
-                        data["total_work_ms"] = val
+                    if val > 1.0:
+                        if in_total_sequence and "total_parallel_work_ms" not in data:
+                            data["total_parallel_work_ms"] = val
+                        elif in_per_forward and "per_fwd_total_parallel_work_ms" not in data:
+                            data["per_fwd_total_parallel_work_ms"] = val
+                        elif "total_work_ms" not in data:
+                            data["total_work_ms"] = val
                         break
                 except ValueError:
                     continue
 
-        # Also try to get from "Total work X ms" pattern
-        if "Total work:" in line:
+        # Parallelism
+        if (
+            "Effective Parallelism:" in line
+            or "Total Effective Parallelism:" in line
+            or "Per-forward Effective Parallelism:" in line
+        ):
             parts = line.split(":")
             if len(parts) >= 2:
                 try:
-                    val = float(parts[1].strip().split()[0])
-                    data["total_work_ms"] = val
+                    val = float(parts[1].strip().split("x")[0])
+                    if "Total Effective Parallelism" in line or in_total_sequence:
+                        data["total_parallelism"] = val
+                    elif "Per-forward Effective Parallelism" in line or in_per_forward:
+                        data["per_fwd_parallelism"] = val
+                    else:
+                        data["parallelism"] = val
                 except (ValueError, IndexError):
                     pass
-
-        # Parallelism
-        if "Effective Parallelism:" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                data["parallelism"] = float(parts[1].strip().split("x")[0])
 
         # Efficiency
         if "Efficiency:" in line and "%" in line:
             parts = line.split(":")
             if len(parts) >= 2:
-                data["efficiency_pct"] = float(parts[1].strip().split("%")[0])
+                try:
+                    val = float(parts[1].strip().split("%")[0])
+                    if "Total Sequence Efficiency" in line:
+                        data["total_efficiency_pct"] = val
+                    elif "Per-forward Efficiency" in line:
+                        data["per_fwd_efficiency_pct"] = val
+                    else:
+                        data["efficiency_pct"] = val
+                except (ValueError, IndexError):
+                    pass
 
-        # Cores used
-        if "cores =" in line.lower() or ("cores" in line.lower() and "work" in line.lower()):
+        # Cores used - extract from table
+        if "Cores" in line and any(c.isdigit() for c in line):
             parts = line.split()
             for j, p in enumerate(parts):
                 if p.isdigit() and 100 <= int(p) <= 130:
                     data["cores_used"] = int(p)
                     break
 
-        # For mini-batch: the new format analyzes a single forward pass directly
-        # So all metrics are already per-forward - we just need to detect mini-batch scenario
-        # and copy the metrics to per_fwd_* fields
-        if "Mini-batch" in line or "mini-batch" in line.lower():
-            # This is a mini-batch analysis - all metrics are per-forward
-            # We'll copy them at the end if they exist
-            data["_is_minibatch"] = True
-
-        # Also look for "Total work:" which appears in the output
-        if "Total work:" in line and "per_fwd_work_ms" not in data:
+        # Number of forward passes
+        if "Number of forward passes:" in line:
             parts = line.split(":")
             if len(parts) >= 2:
                 try:
-                    # Check if this is in a mini-batch context
-                    if data.get("_is_minibatch", False):
-                        data["per_fwd_work_ms"] = float(parts[1].strip().split()[0])
-                    else:
-                        data["total_work_ms"] = float(parts[1].strip().split()[0])
+                    data["num_forwards"] = int(parts[1].strip())
                 except (ValueError, IndexError):
                     pass
 
-    # For mini-batch scenario: copy metrics to per_fwd_* fields if not already set
-    # The new format analyzes a single forward pass, so all metrics are per-forward
-    if data.get("_is_minibatch", False):
-        if "per_fwd_wall_ms" not in data and "wall_clock_ms" in data:
-            data["per_fwd_wall_ms"] = data["wall_clock_ms"]
-        if "per_fwd_python_ms" not in data and "python_ms" in data:
-            data["per_fwd_python_ms"] = data["python_ms"]
-        if "per_fwd_work_ms" not in data and "total_work_ms" in data:
-            data["per_fwd_work_ms"] = data["total_work_ms"]
-        if "per_fwd_parallelism" not in data and "parallelism" in data:
-            data["per_fwd_parallelism"] = data["parallelism"]
-        if "per_fwd_efficiency_pct" not in data and "efficiency_pct" in data:
-            data["per_fwd_efficiency_pct"] = data["efficiency_pct"]
-        # Component work (weight_streaming_ms, etc.) is already per-forward in mini-batch
+    # For mini-batch: ensure per_fwd_* fields are set from total sequence if needed
+    if "total_parallel_work_ms" in data and "per_fwd_total_parallel_work_ms" not in data:
+        if "num_forwards" in data and data["num_forwards"] > 0:
+            data["per_fwd_total_parallel_work_ms"] = data["total_parallel_work_ms"] / data["num_forwards"]
+            if "total_weight_streaming_ms" in data:
+                data["per_fwd_weight_streaming_ms"] = data["total_weight_streaming_ms"] / data["num_forwards"]
+            if "total_noc_communication_ms" in data:
+                data["per_fwd_noc_communication_ms"] = data["total_noc_communication_ms"] / data["num_forwards"]
+            if "total_computation_ms" in data:
+                data["per_fwd_computation_ms"] = data["total_computation_ms"] / data["num_forwards"]
+            if "total_wall_clock_ms" in data:
+                data["per_fwd_wall_clock_ms"] = data["total_wall_clock_ms"] / data["num_forwards"]
 
-    # Clean up temporary flag
-    if "_is_minibatch" in data:
-        del data["_is_minibatch"]
+    # Backward compatibility: copy per_fwd_* to old field names if needed
+    if "per_fwd_wall_clock_ms" in data and "per_fwd_wall_ms" not in data:
+        data["per_fwd_wall_ms"] = data["per_fwd_wall_clock_ms"]
+    if "per_fwd_total_parallel_work_ms" in data and "per_fwd_work_ms" not in data:
+        data["per_fwd_work_ms"] = data["per_fwd_total_parallel_work_ms"]
 
     return data
 
@@ -240,46 +300,63 @@ def append_comparison_to_csv(large_data: dict, mini_data: dict, csv_path: Path):
     large_compute = large_data.get("computation_ms", 0)
     large_cores = large_data.get("cores_used", 0)
 
-    mini_per_fwd_wall = mini_data.get("per_fwd_wall_ms", 0)
+    # Extract total sequence metrics (for mini-batch full sequence)
+    mini_total_wall = mini_data.get("total_wall_clock_ms", 0)
+    mini_total_python = mini_data.get("total_python_ms", 0)
+    mini_total_work = mini_data.get("total_parallel_work_ms", 0)
+    mini_total_parallelism = mini_data.get("total_parallelism", 0)
+    mini_total_efficiency = mini_data.get("total_efficiency_pct", 0)
+    mini_total_weight = mini_data.get("total_weight_streaming_ms", 0)
+    mini_total_noc = mini_data.get("total_noc_communication_ms", 0)
+    mini_total_compute = mini_data.get("total_computation_ms", 0)
+
+    # Extract per-forward metrics
+    mini_per_fwd_wall = mini_data.get("per_fwd_wall_ms", 0) or mini_data.get("per_fwd_wall_clock_ms", 0)
     mini_per_fwd_python = mini_data.get("per_fwd_python_ms", 0)
-    mini_per_fwd_work = mini_data.get("per_fwd_work_ms", 0)
+    mini_per_fwd_work = mini_data.get("per_fwd_work_ms", 0) or mini_data.get("per_fwd_total_parallel_work_ms", 0)
     mini_per_fwd_parallelism = mini_data.get("per_fwd_parallelism", 0)
     mini_per_fwd_efficiency = mini_data.get("per_fwd_efficiency_pct", 0)
-    mini_total_weight = mini_data.get("weight_streaming_ms", 0)
-    mini_total_noc = mini_data.get("noc_communication_ms", 0)
-    mini_total_compute = mini_data.get("computation_ms", 0)
+    mini_per_fwd_weight = mini_data.get("per_fwd_weight_streaming_ms", 0)
+    mini_per_fwd_noc = mini_data.get("per_fwd_noc_communication_ms", 0)
+    mini_per_fwd_compute = mini_data.get("per_fwd_computation_ms", 0)
     mini_cores = mini_data.get("cores_used", 0)
+    num_forwards = mini_data.get("num_forwards", 0)
 
-    # In the new format, mini-batch analysis is already per-forward (single forward pass)
-    # So component work is already per-forward, no need to divide
-    # But we still need to check if we have per_fwd_* fields set
-    if mini_per_fwd_work == 0 and mini_data.get("total_work_ms", 0) > 0:
-        # Fallback: use total_work_ms if per_fwd_work_ms not set
-        mini_per_fwd_work = mini_data.get("total_work_ms", 0)
+    # If we have total sequence metrics but not per-forward, calculate from total
+    if mini_total_work > 0 and mini_per_fwd_work == 0:
+        if num_forwards > 0:
+            mini_per_fwd_work = mini_total_work / num_forwards
+            mini_per_fwd_wall = mini_total_wall / num_forwards
+            if mini_total_weight > 0:
+                mini_per_fwd_weight = mini_total_weight / num_forwards
+            if mini_total_noc > 0:
+                mini_per_fwd_noc = mini_total_noc / num_forwards
+            if mini_total_compute > 0:
+                mini_per_fwd_compute = mini_total_compute / num_forwards
+        else:
+            # Fallback: try to get from old format
+            mini_per_fwd_work = mini_data.get("total_work_ms", 0)
 
-    # Component work is already per-forward in new format
-    # Only divide if it looks like total (very large values)
-    if mini_total_weight > 100:  # Likely total, not per-forward
-        # Get actual minibatches count from benchmark CSV
-        actual_minibatches = extract_minibatches_from_benchmark_csv()
-        if actual_minibatches is None:
-            actual_minibatches = 8  # Default fallback
-        mini_per_fwd_weight = mini_total_weight / actual_minibatches
-        mini_per_fwd_noc = mini_total_noc / actual_minibatches
-        mini_per_fwd_compute = mini_total_compute / actual_minibatches
-    else:
-        # Already per-forward
-        mini_per_fwd_weight = mini_total_weight
-        mini_per_fwd_noc = mini_total_noc
-        mini_per_fwd_compute = mini_total_compute
+    # If we have per-forward but not total, calculate from per-forward
+    if mini_per_fwd_work > 0 and mini_total_work == 0:
+        if num_forwards > 0:
+            mini_total_work = mini_per_fwd_work * num_forwards
+            mini_total_wall = mini_per_fwd_wall * num_forwards
+            if mini_per_fwd_weight > 0:
+                mini_total_weight = mini_per_fwd_weight * num_forwards
+            if mini_per_fwd_noc > 0:
+                mini_total_noc = mini_per_fwd_noc * num_forwards
+            if mini_per_fwd_compute > 0:
+                mini_total_compute = mini_per_fwd_compute * num_forwards
 
     # Calculate overhead percentages
     work_overhead_pct = ((mini_per_fwd_work / large_work) - 1) * 100 if large_work > 0 else 0
     wall_clock_overhead_pct = ((mini_per_fwd_wall / large_wall) - 1) * 100 if large_wall > 0 else 0
 
-    # Prepare row data
+    # Prepare row data with both total sequence and per-forward metrics
     row = {
         "timestamp": datetime.now().isoformat(),
+        # Large batch metrics
         "large_wall_clock_ms": f"{large_wall:.6f}",
         "large_python_ms": f"{large_python:.6f}",
         "large_total_work_ms": f"{large_work:.2f}",
@@ -288,6 +365,17 @@ def append_comparison_to_csv(large_data: dict, mini_data: dict, csv_path: Path):
         "large_weight_streaming_ms": f"{large_weight:.2f}",
         "large_noc_communication_ms": f"{large_noc:.2f}",
         "large_computation_ms": f"{large_compute:.2f}",
+        # Mini-batch total sequence metrics
+        "mini_total_wall_clock_ms": f"{mini_total_wall:.6f}",
+        "mini_total_python_ms": f"{mini_total_python:.6f}",
+        "mini_total_work_ms": f"{mini_total_work:.2f}",
+        "mini_total_parallelism": f"{mini_total_parallelism:.1f}",
+        "mini_total_efficiency_pct": f"{mini_total_efficiency:.1f}",
+        "mini_total_weight_streaming_ms": f"{mini_total_weight:.2f}",
+        "mini_total_noc_communication_ms": f"{mini_total_noc:.2f}",
+        "mini_total_computation_ms": f"{mini_total_compute:.2f}",
+        "mini_num_forwards": str(num_forwards),
+        # Mini-batch per-forward metrics
         "mini_per_fwd_wall_clock_ms": f"{mini_per_fwd_wall:.6f}",
         "mini_per_fwd_python_ms": f"{mini_per_fwd_python:.6f}",
         "mini_per_fwd_total_work_ms": f"{mini_per_fwd_work:.2f}",
@@ -296,6 +384,7 @@ def append_comparison_to_csv(large_data: dict, mini_data: dict, csv_path: Path):
         "mini_per_fwd_weight_streaming_ms": f"{mini_per_fwd_weight:.2f}",
         "mini_per_fwd_noc_communication_ms": f"{mini_per_fwd_noc:.2f}",
         "mini_per_fwd_computation_ms": f"{mini_per_fwd_compute:.2f}",
+        # Comparison metrics
         "work_overhead_pct": f"{work_overhead_pct:.1f}",
         "wall_clock_overhead_pct": f"{wall_clock_overhead_pct:.1f}",
         "cores_used_large": str(large_cores),
@@ -643,10 +732,19 @@ def main():
         sys.exit(1)
 
     large_data = parse_analysis_output(large_output)
-    print(f"\n✓ Large batch analysis complete")
-    print(f"  Wall clock: {large_data.get('wall_clock_ms', 0):.3f} ms")
+    print(f"\n{'='*80}")
+    print("✓ Large batch analysis complete")
+    print(f"{'='*80}")
+    print(f"  Wall clock: {large_data.get('wall_clock_ms', 0):.6f} ms")
+    print(f"  Python time: {large_data.get('python_ms', 0):.6f} ms")
     print(f"  Total work: {large_data.get('total_work_ms', 0):.2f} ms")
     print(f"  Parallelism: {large_data.get('parallelism', 0):.1f}x")
+    print(f"  Efficiency: {large_data.get('efficiency_pct', 0):.1f}%")
+    print(f"  Component breakdown:")
+    print(f"    - Weight Streaming (BRISC): {large_data.get('weight_streaming_ms', 0):.2f} ms")
+    print(f"    - NoC Communication (NCRISC): {large_data.get('noc_communication_ms', 0):.2f} ms")
+    print(f"    - Computation (TRISC): {large_data.get('computation_ms', 0):.2f} ms")
+    print(f"  Cores used: {large_data.get('cores_used', 'N/A')}")
 
     # Save large batch results
     large_json_path = Path("research_codes/large_batch_profile.json")
@@ -675,10 +773,38 @@ def main():
         sys.exit(1)
 
     mini_data = parse_analysis_output(mini_output)
-    print(f"\n✓ Mini-batch analysis complete")
-    print(f"  Wall clock (per fwd): {mini_data.get('per_fwd_wall_ms', 0):.3f} ms")
-    print(f"  Total work (per fwd): {mini_data.get('per_fwd_work_ms', 0):.2f} ms")
-    print(f"  Parallelism (per fwd): {mini_data.get('per_fwd_parallelism', 0):.1f}x")
+    print(f"\n{'='*80}")
+    print("✓ Mini-batch analysis complete")
+    print(f"{'='*80}")
+    num_forwards = mini_data.get("num_forwards", 0)
+    print(f"  Number of forward passes: {num_forwards}")
+    print()
+    print(f"  TOTAL SEQUENCE METRICS (all {num_forwards} forwards):")
+    print(f"    Total wall clock: {mini_data.get('total_wall_clock_ms', 0):.6f} ms")
+    print(f"    Total Python time: {mini_data.get('total_python_ms', 0):.6f} ms")
+    print(f"    Total work: {mini_data.get('total_parallel_work_ms', 0):.2f} ms")
+    print(f"    Total parallelism: {mini_data.get('total_parallelism', 0):.1f}x")
+    print(f"    Total efficiency: {mini_data.get('total_efficiency_pct', 0):.1f}%")
+    print(f"    Total component breakdown:")
+    print(f"      - Weight Streaming (BRISC): {mini_data.get('total_weight_streaming_ms', 0):.2f} ms")
+    print(f"      - NoC Communication (NCRISC): {mini_data.get('total_noc_communication_ms', 0):.2f} ms")
+    print(f"      - Computation (TRISC): {mini_data.get('total_computation_ms', 0):.2f} ms")
+    print()
+    print(f"  PER-FORWARD AVERAGE METRICS:")
+    print(
+        f"    Per-forward wall clock: {mini_data.get('per_fwd_wall_ms', 0) or mini_data.get('per_fwd_wall_clock_ms', 0):.6f} ms"
+    )
+    print(f"    Per-forward Python time: {mini_data.get('per_fwd_python_ms', 0):.6f} ms")
+    print(
+        f"    Per-forward work: {mini_data.get('per_fwd_work_ms', 0) or mini_data.get('per_fwd_total_parallel_work_ms', 0):.2f} ms"
+    )
+    print(f"    Per-forward parallelism: {mini_data.get('per_fwd_parallelism', 0):.1f}x")
+    print(f"    Per-forward efficiency: {mini_data.get('per_fwd_efficiency_pct', 0):.1f}%")
+    print(f"    Per-forward component breakdown:")
+    print(f"      - Weight Streaming (BRISC): {mini_data.get('per_fwd_weight_streaming_ms', 0):.2f} ms")
+    print(f"      - NoC Communication (NCRISC): {mini_data.get('per_fwd_noc_communication_ms', 0):.2f} ms")
+    print(f"      - Computation (TRISC): {mini_data.get('per_fwd_computation_ms', 0):.2f} ms")
+    print(f"  Cores used: {mini_data.get('cores_used', 'N/A')}")
 
     # Save mini-batch results
     mini_json_path = Path("research_codes/mini_batch_profile.json")

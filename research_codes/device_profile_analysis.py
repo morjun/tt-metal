@@ -327,6 +327,199 @@ def analyze_single_forward_pass(
     }
 
 
+def analyze_full_sequence(
+    all_zones: List[DeviceZone],
+    measurement_forward_run_ids: List[int],
+    description: str,
+    freq_hz: float,
+    unmatched_starts: Optional[dict] = None,
+) -> Dict:
+    """Analyze the FULL sequence of measurement forward passes
+
+    This aggregates all measurement forward passes to calculate:
+    - Total wall clock time for entire sequence
+    - Total parallel work for each component (weight streaming, NoC, computation)
+    - Per-forward averages
+
+    Args:
+        all_zones: All device zones from the profile
+        measurement_forward_run_ids: List of run_host_ids for measurement forward passes
+        description: Description of the operation
+        freq_hz: Device frequency in Hz
+        unmatched_starts: Dict of unmatched zone starts
+    """
+    if not measurement_forward_run_ids:
+        return {}
+
+    # Get all zones for measurement forward passes
+    measurement_zones = [z for z in all_zones if z.run_host_id in measurement_forward_run_ids]
+    measurement_unmatched = {}
+    if unmatched_starts:
+        for key, start_cycle in unmatched_starts.items():
+            if key[2] in measurement_forward_run_ids:  # key[2] is run_host_id
+                measurement_unmatched[key] = start_cycle
+
+    if not measurement_zones:
+        return {}
+
+    # Calculate total wall clock time for entire sequence
+    # Method: Calculate wall clock time for each forward pass individually, then sum them
+    # This is more accurate than taking min_start to max_end, which includes gaps between forward passes
+    forward_pass_wall_times = []
+    for run_id in measurement_forward_run_ids:
+        forward_zones = [z for z in measurement_zones if z.run_host_id == run_id]
+        if not forward_zones:
+            continue
+
+        # Calculate wall clock for this forward pass
+        fwd_min_start = min(z.start_cycle for z in forward_zones)
+        fwd_max_end = max(z.end_cycle for z in forward_zones)
+
+        # Check unmatched starts for this forward pass
+        fwd_unmatched = {}
+        if measurement_unmatched:
+            for key, start_cycle in measurement_unmatched.items():
+                if key[2] == run_id:  # key[2] is run_host_id
+                    fwd_unmatched[key] = start_cycle
+
+        if fwd_unmatched:
+            for key, start_cycle in fwd_unmatched.items():
+                if start_cycle < fwd_min_start:
+                    fwd_min_start = start_cycle
+
+        fwd_wall_cycles = fwd_max_end - fwd_min_start
+        fwd_wall_ms = (fwd_wall_cycles / freq_hz) * 1000.0
+        forward_pass_wall_times.append(fwd_wall_ms)
+
+    # Total wall clock time is the sum of individual forward pass wall clock times
+    # This represents the actual execution time, excluding gaps between forward passes
+    total_wall_ms = sum(forward_pass_wall_times)
+
+    # Debug: Print individual forward pass wall clock times
+    if len(forward_pass_wall_times) > 0:
+        print(f"  Individual forward pass wall clock times:")
+        for i, (run_id, wall_ms) in enumerate(zip(measurement_forward_run_ids, forward_pass_wall_times)):
+            print(f"    Forward {i+1} (run_id={run_id}): {wall_ms:.6f} ms")
+        print(f"  Average: {total_wall_ms / len(forward_pass_wall_times):.6f} ms")
+        print()
+
+    # Also calculate the timeline span (first start to last end) for reference
+    min_start = min(z.start_cycle for z in measurement_zones)
+    max_end = max(z.end_cycle for z in measurement_zones)
+    if measurement_unmatched:
+        for key, start_cycle in measurement_unmatched.items():
+            if start_cycle < min_start:
+                min_start = start_cycle
+    timeline_span_cycles = max_end - min_start
+    timeline_span_ms = (timeline_span_cycles / freq_hz) * 1000.0
+
+    # RISC breakdown for entire sequence
+    # Method: Calculate parallel work for each forward pass individually, then sum them
+    # This is correct because each forward pass executes independently
+    total_brisc_work = 0.0
+    total_ncrisc_work = 0.0
+    total_trisc_work = 0.0
+
+    # Track timeline spans and core counts across all forward passes (for display)
+    risc_timeline_spans = {}
+    risc_num_cores = {}
+    risc_all_zones_by_type = defaultdict(list)
+
+    # Calculate parallel work for each forward pass
+    for run_id in measurement_forward_run_ids:
+        forward_zones = [z for z in measurement_zones if z.run_host_id == run_id]
+        if not forward_zones:
+            continue
+
+        # Calculate parallel work for this forward pass
+        forward_risc_zones_by_type = defaultdict(list)
+        for z in forward_zones:
+            risc_type = normalize_risc_type(z.risc_type)
+            forward_risc_zones_by_type[risc_type].append(z)
+            risc_all_zones_by_type[risc_type].append(z)  # For overall stats
+
+        for risc_type in ["BRISC", "NCRISC", "TRISC"]:
+            if risc_type in forward_risc_zones_by_type:
+                zones_list = forward_risc_zones_by_type[risc_type]
+                earliest_start = min(z.start_cycle for z in zones_list)
+                latest_end = max(z.end_cycle for z in zones_list)
+                span_ms = ((latest_end - earliest_start) / freq_hz) * 1000.0
+                num_cores = len(set(z.core_id for z in zones_list))
+                parallel_work = span_ms * num_cores
+
+                if risc_type == "BRISC":
+                    total_brisc_work += parallel_work
+                elif risc_type == "NCRISC":
+                    total_ncrisc_work += parallel_work
+                elif risc_type == "TRISC":
+                    total_trisc_work += parallel_work
+
+    total_work = total_brisc_work + total_ncrisc_work + total_trisc_work
+
+    # Calculate overall timeline spans and core counts (for display/reference)
+    for risc_type in ["BRISC", "NCRISC", "TRISC"]:
+        if risc_type in risc_all_zones_by_type:
+            zones_list = risc_all_zones_by_type[risc_type]
+            earliest_start = min(z.start_cycle for z in zones_list)
+            latest_end = max(z.end_cycle for z in zones_list)
+            span_ms = ((latest_end - earliest_start) / freq_hz) * 1000.0
+            num_cores = len(set(z.core_id for z in zones_list))
+
+            risc_timeline_spans[risc_type] = span_ms
+            risc_num_cores[risc_type] = num_cores
+        else:
+            risc_timeline_spans[risc_type] = 0.0
+            risc_num_cores[risc_type] = 0
+
+    total_parallelism = total_work / total_wall_ms if total_wall_ms > 0 else 0
+
+    # Calculate per-forward averages
+    num_forwards = len(measurement_forward_run_ids)
+    # Use actual average from individual forward pass wall times if available
+    if len(forward_pass_wall_times) > 0:
+        per_fwd_wall_ms = sum(forward_pass_wall_times) / len(forward_pass_wall_times)
+    else:
+        per_fwd_wall_ms = total_wall_ms / num_forwards if num_forwards > 0 else 0
+    per_fwd_brisc_work = total_brisc_work / num_forwards if num_forwards > 0 else 0
+    per_fwd_ncrisc_work = total_ncrisc_work / num_forwards if num_forwards > 0 else 0
+    per_fwd_trisc_work = total_trisc_work / num_forwards if num_forwards > 0 else 0
+    per_fwd_total_work = total_work / num_forwards if num_forwards > 0 else 0
+    per_fwd_parallelism = per_fwd_total_work / per_fwd_wall_ms if per_fwd_wall_ms > 0 else 0
+
+    return {
+        "description": description,
+        "num_forwards": num_forwards,
+        "num_zones": len(measurement_zones),
+        # Total sequence metrics
+        "total_wall_clock_ms": total_wall_ms,  # Sum of individual forward pass wall clock times
+        "total_timeline_span_ms": timeline_span_ms,  # First start to last end (includes gaps)
+        "total_brisc_parallel_work_ms": total_brisc_work,
+        "total_ncrisc_parallel_work_ms": total_ncrisc_work,
+        "total_trisc_parallel_work_ms": total_trisc_work,
+        "total_parallel_work_ms": total_work,
+        "total_parallelism": total_parallelism,
+        # Per-forward averages
+        "per_fwd_wall_clock_ms": per_fwd_wall_ms,
+        "per_fwd_brisc_parallel_work_ms": per_fwd_brisc_work,
+        "per_fwd_ncrisc_parallel_work_ms": per_fwd_ncrisc_work,
+        "per_fwd_trisc_parallel_work_ms": per_fwd_trisc_work,
+        "per_fwd_total_parallel_work_ms": per_fwd_total_work,
+        "per_fwd_parallelism": per_fwd_parallelism,
+        # Timeline spans
+        "total_brisc_timeline_span_ms": risc_timeline_spans.get("BRISC", 0),
+        "total_ncrisc_timeline_span_ms": risc_timeline_spans.get("NCRISC", 0),
+        "total_trisc_timeline_span_ms": risc_timeline_spans.get("TRISC", 0),
+        # Core counts
+        "brisc_num_cores": risc_num_cores.get("BRISC", 0),
+        "ncrisc_num_cores": risc_num_cores.get("NCRISC", 0),
+        "trisc_num_cores": risc_num_cores.get("TRISC", 0),
+        # Zone counts
+        "brisc_count": len(risc_all_zones_by_type.get("BRISC", [])),
+        "ncrisc_count": len(risc_all_zones_by_type.get("NCRISC", [])),
+        "trisc_count": len(risc_all_zones_by_type.get("TRISC", [])),
+    }
+
+
 def print_single_forward_analysis(analysis: Dict, python_ms: float | None = None):
     """Print analysis for a SINGLE forward pass"""
     print(f"\n{'='*80}")
@@ -397,6 +590,143 @@ def print_single_forward_analysis(analysis: Dict, python_ms: float | None = None
     print(f"Efficiency: {efficiency:.1f}%")
 
     if parallelism > max_theoretical:
+        print()
+        print("⚠️  WARNING: Parallelism exceeds theoretical maximum!")
+        print("    This indicates an error in calculation or data.")
+    print()
+
+
+def print_full_sequence_analysis(analysis: Dict, python_total_ms: float | None = None):
+    """Print analysis for FULL sequence of forward passes (mini-batch scenario)"""
+    print(f"\n{'='*80}")
+    print(f"{analysis['description']}")
+    print(f"{'='*80}")
+    print(f"Number of forward passes: {analysis['num_forwards']}")
+    print(f"Total zones: {analysis['num_zones']}")
+    print()
+
+    # Total sequence metrics
+    print("=" * 80)
+    print("TOTAL SEQUENCE METRICS (All measurement forward passes combined)")
+    print("=" * 80)
+    print()
+    print(f"Total Device Wall Clock (sum of individual forward passes): {analysis['total_wall_clock_ms']:.6f} ms")
+    if "total_timeline_span_ms" in analysis:
+        timeline_span = analysis["total_timeline_span_ms"]
+        gap_ms = timeline_span - analysis["total_wall_clock_ms"]
+        print(f"Total Timeline Span (first start to last end): {timeline_span:.6f} ms")
+        if gap_ms > 0.1:  # Only show if gap is significant
+            print(f"  Gap between forward passes: {gap_ms:.6f} ms ({gap_ms/timeline_span*100:.1f}% of timeline)")
+
+    if python_total_ms is not None:
+        sync_overhead = python_total_ms - analysis["total_wall_clock_ms"]
+        sync_pct = (sync_overhead / python_total_ms * 100) if python_total_ms > 0 else 0
+        print(f"Total Python Measurement (from CSV): {python_total_ms:.6f} ms")
+        if sync_overhead > 0:
+            print(f"Sync Overhead: {sync_overhead:.6f} ms ({sync_pct:.1f}%)")
+            print("  ✓ Device time < Python time (expected: sync overhead included in Python)")
+        else:
+            print(f"⚠️  Device time exceeds Python: {abs(sync_overhead):.6f} ms ({abs(sync_pct):.1f}%)")
+            print("  This may indicate:")
+            print("    - Device profiler captures overlapping work Python timer misses")
+            print("    - Or measurement timing mismatch")
+
+    print()
+    print("=" * 80)
+    print("TOTAL SEQUENCE PARALLEL WORK BREAKDOWN")
+    print("=" * 80)
+    print()
+
+    total_wall_clock = analysis["total_wall_clock_ms"]
+    total_brisc_work = analysis.get("total_brisc_parallel_work_ms", 0)
+    total_ncrisc_work = analysis.get("total_ncrisc_parallel_work_ms", 0)
+    total_trisc_work = analysis.get("total_trisc_parallel_work_ms", 0)
+    total_work = analysis.get("total_parallel_work_ms", 0)
+    total_parallelism = analysis.get("total_parallelism", 0)
+
+    total_brisc_span = analysis.get("total_brisc_timeline_span_ms", 0)
+    total_ncrisc_span = analysis.get("total_ncrisc_timeline_span_ms", 0)
+    total_trisc_span = analysis.get("total_trisc_timeline_span_ms", 0)
+
+    brisc_cores = analysis.get("brisc_num_cores", 0)
+    ncrisc_cores = analysis.get("ncrisc_num_cores", 0)
+    trisc_cores = analysis.get("trisc_num_cores", 0)
+
+    print(f"{'Component':<25} {'Timeline Span* (ms)':<20} {'Cores':<10} {'Total Work (ms)':<18} {'% of Total':<15}")
+    print("-" * 90)
+    print("* Timeline span is for reference only (first start to last end across all forwards)")
+    print("-" * 90)
+
+    brisc_pct = (total_brisc_work / total_work * 100) if total_work > 0 else 0
+    print(
+        f"{'Weight Streaming (BRISC)':<25} {total_brisc_span:<20.6f} {brisc_cores:<10} {total_brisc_work:<18.2f} {brisc_pct:<15.1f}%"
+    )
+
+    ncrisc_pct = (total_ncrisc_work / total_work * 100) if total_work > 0 else 0
+    print(
+        f"{'NoC Communication (NCRISC)':<25} {total_ncrisc_span:<20.6f} {ncrisc_cores:<10} {total_ncrisc_work:<18.2f} {ncrisc_pct:<15.1f}%"
+    )
+
+    trisc_pct = (total_trisc_work / total_work * 100) if total_work > 0 else 0
+    print(
+        f"{'Computation (TRISC)':<25} {total_trisc_span:<20.6f} {trisc_cores:<10} {total_trisc_work:<18.2f} {trisc_pct:<15.1f}%"
+    )
+
+    print("-" * 90)
+    print(f"{'TOTAL':<25} {'':<15} {'':<10} {total_work:<18.2f} {'100.0%':<15}")
+    print()
+
+    print(f"Total Effective Parallelism: {total_parallelism:.1f}x")
+    print(f"  (Total work {total_work:.1f} ms / Total wall clock {total_wall_clock:.3f} ms)")
+    print()
+
+    # Per-forward metrics
+    print("=" * 80)
+    print("PER-FORWARD AVERAGE METRICS")
+    print("=" * 80)
+    print()
+
+    per_fwd_wall_clock = analysis["per_fwd_wall_clock_ms"]
+    per_fwd_brisc_work = analysis.get("per_fwd_brisc_parallel_work_ms", 0)
+    per_fwd_ncrisc_work = analysis.get("per_fwd_ncrisc_parallel_work_ms", 0)
+    per_fwd_trisc_work = analysis.get("per_fwd_trisc_parallel_work_ms", 0)
+    per_fwd_total_work = analysis.get("per_fwd_total_parallel_work_ms", 0)
+    per_fwd_parallelism = analysis.get("per_fwd_parallelism", 0)
+
+    if python_total_ms is not None:
+        per_fwd_python_ms = python_total_ms / analysis["num_forwards"] if analysis["num_forwards"] > 0 else 0
+        print(f"Per-forward Python Measurement: {per_fwd_python_ms:.6f} ms")
+
+    print(f"Per-forward Device Wall Clock: {per_fwd_wall_clock:.6f} ms")
+    print()
+    print(f"{'Component':<25} {'Per-Forward Work (ms)':<25} {'% of Total':<15}")
+    print("-" * 65)
+
+    per_fwd_brisc_pct = (per_fwd_brisc_work / per_fwd_total_work * 100) if per_fwd_total_work > 0 else 0
+    print(f"{'Weight Streaming (BRISC)':<25} {per_fwd_brisc_work:<25.2f} {per_fwd_brisc_pct:<15.1f}%")
+
+    per_fwd_ncrisc_pct = (per_fwd_ncrisc_work / per_fwd_total_work * 100) if per_fwd_total_work > 0 else 0
+    print(f"{'NoC Communication (NCRISC)':<25} {per_fwd_ncrisc_work:<25.2f} {per_fwd_ncrisc_pct:<15.1f}%")
+
+    per_fwd_trisc_pct = (per_fwd_trisc_work / per_fwd_total_work * 100) if per_fwd_total_work > 0 else 0
+    print(f"{'Computation (TRISC)':<25} {per_fwd_trisc_work:<25.2f} {per_fwd_trisc_pct:<15.1f}%")
+
+    print("-" * 65)
+    print(f"{'TOTAL':<25} {per_fwd_total_work:<25.2f} {'100.0%':<15}")
+    print()
+
+    print(f"Per-forward Effective Parallelism: {per_fwd_parallelism:.1f}x")
+    print(f"  (Per-forward work {per_fwd_total_work:.1f} ms / Per-forward wall clock {per_fwd_wall_clock:.3f} ms)")
+    print()
+
+    max_theoretical = 130 * 5
+    total_efficiency = (total_parallelism / max_theoretical * 100) if max_theoretical > 0 else 0
+    per_fwd_efficiency = (per_fwd_parallelism / max_theoretical * 100) if max_theoretical > 0 else 0
+    print(f"Theoretical Maximum: {max_theoretical}x (130 cores × 5 RISCs)")
+    print(f"Total Sequence Efficiency: {total_efficiency:.1f}%")
+    print(f"Per-forward Efficiency: {per_fwd_efficiency:.1f}%")
+
+    if total_parallelism > max_theoretical or per_fwd_parallelism > max_theoretical:
         print()
         print("⚠️  WARNING: Parallelism exceeds theoretical maximum!")
         print("    This indicates an error in calculation or data.")
@@ -584,38 +914,95 @@ def main():
         print_single_forward_analysis(analysis, python_ms)
 
     else:  # mini-batch
-        # For mini-batch, analyze the LAST measurement forward pass (excludes warmup)
-        # This represents one forward pass from the measurement sequences
-        last_forward_run_id = measurement_forward_run_ids[-1]
+        # For mini-batch, analyze ONE SEQUENCE (8 forward passes) to match weight_loading_test.py
+        # weight_loading_test.py runs measure_iters sequences but CSV stores average time for ONE sequence
+        # Therefore, we analyze only ONE sequence (the last one) to match the CSV measurement
+        if len(measurement_forward_run_ids) >= minibatches:
+            # Select the last sequence (last minibatches forward passes)
+            # This matches what weight_loading_test.py measures: one sequence's average time
+            one_sequence_forward_run_ids = measurement_forward_run_ids[-minibatches:]
+            total_measurement_sequences = len(measurement_forward_run_ids) // minibatches if minibatches > 0 else 0
+            print(f"Analyzing ONE SEQUENCE ({minibatches} forward passes) to match weight_loading_test.py measurement")
+            print(f"  weight_loading_test.py runs {measure_iters} sequences but CSV stores average for ONE sequence")
+            print(f"  Total measurement sequences available: {total_measurement_sequences}")
+            print(
+                f"  Selected: Last sequence (forward passes {len(measurement_forward_run_ids) - minibatches + 1} to {len(measurement_forward_run_ids)})"
+            )
+            print(f"  This excludes {warmup_iters} warmup sequences")
+        else:
+            # Fallback: use all available forward passes
+            one_sequence_forward_run_ids = measurement_forward_run_ids
+            print(
+                f"WARNING: Only {len(measurement_forward_run_ids)} forward passes available, expected at least {minibatches}"
+            )
+            print(f"Analyzing available {len(one_sequence_forward_run_ids)} forward passes")
+        print()
+
+        # Analyze one sequence (8 forward passes)
+        full_sequence_analysis = analyze_full_sequence(
+            zones,
+            one_sequence_forward_run_ids,
+            f"Mini-batch One Sequence Analysis (b=32, {len(one_sequence_forward_run_ids)} forwards) - Measurement Only",
+            freq_hz,
+            unmatched_starts,
+        )
+
+        # Also analyze a single forward pass for comparison
+        last_forward_run_id = one_sequence_forward_run_ids[-1]
         forward_zones = [z for z in zones if z.run_host_id == last_forward_run_id]
         forward_unmatched = {k: v for k, v in unmatched_starts.items() if k[2] == last_forward_run_id}
 
-        print(f"Analyzing LAST measurement forward pass (run_host_id={last_forward_run_id})")
-        print(f"  This excludes {warmup_iters} warmup sequences")
+        print(
+            f"\nAlso analyzing LAST forward pass from this sequence (run_host_id={last_forward_run_id}) for comparison"
+        )
         print(f"  Zones: {len(forward_zones)}")
-        print(f"  Note: This is ONE forward pass from the measurement sequences")
         print()
 
-        analysis = analyze_single_forward_pass(
+        single_forward_analysis = analyze_single_forward_pass(
             forward_zones, f"Mini-batch Single Forward Pass (b=32) - Measurement Only", freq_hz, forward_unmatched
         )
 
-        # For mini-batch, Python time is total for all measurement forwards
-        # We need per-forward Python time
+        # For mini-batch, Python time from CSV is for ONE SEQUENCE (matches our analysis)
+        # weight_loading_test.py runs measure_iters sequences and averages them,
+        # but CSV stores the average time for ONE sequence
         python_total_ms = extract_python_time_from_benchmark("mini")
         if python_total_ms is not None:
-            # python_total_ms (from CSV) is the average time for ONE SEQUENCE (e.g., 8 minibatches)
-            # We need the average time PER-FORWARD pass
-            if minibatches > 0:
-                python_ms = python_total_ms / minibatches
-            else:
-                python_ms = None  # Avoid division by zero
+            # python_total_ms from CSV is the average time for ONE SEQUENCE (e.g., 8 minibatches)
+            # This exactly matches our analysis: we analyze one sequence (8 forward passes)
+            python_per_fwd_ms = python_total_ms / minibatches if minibatches > 0 else None
 
-            print(f"Python time per sequence (from CSV): {python_total_ms:.6f} ms")
-            if python_ms is not None:
-                print(f"Python per-forward pass (calculated): {python_ms:.6f} ms")
+            print(f"Python time per sequence (from CSV, matches our analysis): {python_total_ms:.6f} ms")
+            print(f"  (This is the average of {measure_iters} sequences from weight_loading_test.py)")
+            if python_per_fwd_ms is not None:
+                print(f"Python per-forward pass (calculated): {python_per_fwd_ms:.6f} ms")
+        else:
+            python_per_fwd_ms = None
 
-            print_single_forward_analysis(analysis, python_ms)
+        # Print full sequence analysis (one sequence = 8 forwards)
+        print_full_sequence_analysis(full_sequence_analysis, python_total_ms)
+
+        # Also print single forward analysis for comparison
+        print_single_forward_analysis(single_forward_analysis, python_per_fwd_ms)
+
+        # Note about wall clock time discrepancy
+        per_fwd_wall_from_sequence = full_sequence_analysis.get("per_fwd_wall_clock_ms", 0)
+        single_fwd_wall = single_forward_analysis.get("wall_clock_ms", 0)
+        if abs(per_fwd_wall_from_sequence - single_fwd_wall) > 0.01:  # Significant difference
+            print(f"\n{'='*80}")
+            print("NOTE: Wall Clock Time Discrepancy")
+            print(f"{'='*80}")
+            print(f"Per-forward average (from sequence): {per_fwd_wall_from_sequence:.6f} ms")
+            print(f"Single forward pass (last one): {single_fwd_wall:.6f} ms")
+            print(f"Difference: {abs(per_fwd_wall_from_sequence - single_fwd_wall):.6f} ms")
+            print()
+            print("This difference may be due to:")
+            print("  - Variation in execution time across forward passes")
+            print("  - Different zones captured for different forward passes")
+            print("  - The last forward pass may not be representative of the average")
+            print()
+            print("For accurate per-forward metrics, the single forward pass analysis")
+            print("above shows the actual wall clock time for one forward pass.")
+            print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":
