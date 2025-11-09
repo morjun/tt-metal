@@ -45,12 +45,12 @@ Forward (ms): 0.239
 
 | Component | Parallel Work | % of Total |
 |-----------|---------------|------------|
-| **Weight Streaming (BRISC)** | 21.38 ms | 35.2% |
-| **NoC Communication (NCRISC)** | 19.64 ms | 32.3% |
-| **Computation (TRISC)** | 19.76 ms | 32.5% |
-| **TOTAL** | **60.78 ms** | 100.0% |
+| **Weight Streaming (BRISC)** | 21.33 ms | 35.2% |
+| **NoC Communication (NCRISC)** | 19.61 ms | 32.3% |
+| **Computation (TRISC)** | 19.74 ms | 32.5% |
+| **TOTAL** | **60.68 ms** | 100.0% |
 
-**Effective Parallelism**: 363.9x (60.78 ms / 0.167 ms)
+**Effective Parallelism**: 364.2x (60.68 ms / 0.167 ms)
 - Theoretical maximum: 650x
 - **Efficiency: 56.0%**
 
@@ -72,25 +72,25 @@ Per-forward: 0.180 ms
 ### Device Profile Results
 
 **Operation Analysis**:
-- Total wall clock time: **1.862 ms** (timeline span, includes overlaps)
+- Total wall clock time: **1.874 ms** (timeline span, includes overlaps)
 - Cores used: **130 cores** (100% utilization!)
 
 ### Parallel Work Breakdown (8 forwards total)
 
 | Component | Parallel Work (total) | Parallel Work (per forward) | % of Total |
 |-----------|----------------------|---------------------------|------------|
-| **Weight Streaming (BRISC)** | 242.12 ms | 30.27 ms | 271.6% |
-| **NoC Communication (NCRISC)** | 241.85 ms | 30.23 ms | 271.3% |
-| **Computation (TRISC)** | 229.10 ms | 28.64 ms | 257.0% |
-| **TOTAL** | **89.13 ms** | **89.13 ms** | 100.0% |
+| **Weight Streaming (BRISC)** | 243.66 ms | 30.46 ms | 271.7% |
+| **NoC Communication (NCRISC)** | 243.39 ms | 30.42 ms | 271.4% |
+| **Computation (TRISC)** | 230.37 ms | 28.80 ms | 256.9% |
+| **TOTAL** | **89.68 ms** | **89.68 ms** | 100.0% |
 
-**Effective Parallelism**: 382.9x (total), 480.5x (per forward)
+**Effective Parallelism**: 382.8x (total), 479.8x (per forward)
 - Theoretical maximum: 650x
-- **Efficiency: 58.9% (total), 73.9% (per forward)**
+- **Efficiency: 58.9% (total), 73.8% (per forward)**
 
 **Interpretation**:
 - Mini-batch uses **MORE cores** than large batch (130 vs 128)
-- Higher parallelism efficiency per forward (73.9% vs 56.0%)
+- Higher parallelism efficiency per forward (73.8% vs 56.0%)
 - But requires 8 forwards to process same amount of data
 
 ---
@@ -101,14 +101,14 @@ Per-forward: 0.180 ms
 
 | Component | Large Batch | Mini-batch (per fwd) | Ratio |
 |-----------|-------------|---------------------|-------|
-| **Weight Streaming** | 21.38 ms | 30.27 ms | 1.42x |
-| **NoC Communication** | 19.64 ms | 30.23 ms | 1.54x |
-| **Computation** | 19.76 ms | 28.64 ms | 1.45x |
-| **TOTAL WORK** | 60.78 ms | 89.13 ms | **1.47x** |
-| **Wall Clock** | 0.167 ms | 0.185 ms | 1.11x |
-| **Parallelism** | 363.9x | 480.5x | 1.32x |
+| **Weight Streaming** | 21.33 ms | 30.46 ms | 1.43x |
+| **NoC Communication** | 19.61 ms | 30.42 ms | 1.55x |
+| **Computation** | 19.74 ms | 28.80 ms | 1.46x |
+| **TOTAL WORK** | 60.68 ms | 89.68 ms | **1.48x** |
+| **Wall Clock** | 0.167 ms | 0.187 ms | 1.12x |
+| **Parallelism** | 364.2x | 479.8x | 1.32x |
 
-**Key Finding**: Mini-batch performs **46.6% more work per forward** despite having:
+**Key Finding**: Mini-batch performs **47.8% more work per forward** despite having:
 - Batch size 1/8 of large batch (32 vs 256)
 - Same or more cores used (130 vs 128)
 
@@ -132,9 +132,9 @@ Actual behavior:
 
 | Metric | Large Batch | Mini-batch (×8) | Ratio |
 |--------|-------------|-----------------|-------|
-| **Device time** | 0.167 ms | 1.484 ms | **8.9x slower** |
+| **Device time** | 0.167 ms | 1.495 ms | **9.0x slower** |
 | **Python time** | 0.239 ms | 1.439 ms | **6.0x slower** |
-| **Total Work** | 60.78 ms | 713.04 ms | **11.7x more work** |
+| **Total Work** | 60.68 ms | 717.44 ms | **11.8x more work** |
 
 ---
 
@@ -147,8 +147,8 @@ Actual behavior:
 - Actual: 32 samples → 130 cores (with 0.25 samples/core!)
 
 This causes:
-- 46.6% more work per forward
-- 8.9x slower total time for same amount of data
+- 47.8% more work per forward
+- 9.0x slower total time for same amount of data
 
 ### 2. Work Distribution is Consistent
 
@@ -161,8 +161,8 @@ This indicates **balanced parallel execution**, not a weight streaming bottlenec
 
 ### 3. Parallelism Efficiency
 
-- Large batch: 56.0% efficiency (363.9x / 650x)
-- Mini-batch per-forward: 73.9% efficiency (480.5x / 650x)
+- Large batch: 56.0% efficiency (364.2x / 650x)
+- Mini-batch per-forward: 73.8% efficiency (479.8x / 650x)
 
 Mini-batch is actually **more efficient per-forward** when normalized by work, but performs unnecessary work due to over-parallelization.
 
@@ -187,9 +187,9 @@ The real bottleneck is the **inefficient resource allocation strategy** that use
 - Should use ~16 cores for 32 samples = 2 samples/core (same as large batch)
 
 This causes:
-- **46.6% more work per forward** (89.13 ms vs 60.78 ms)
-- **8.9x slower total time** (1.484 ms vs 0.167 ms)
-- **11.7x more total work** (713.0 ms vs 60.8 ms)
+- **47.8% more work per forward** (89.68 ms vs 60.68 ms)
+- **9.0x slower total time** (1.495 ms vs 0.167 ms)
+- **11.8x more total work** (717.4 ms vs 60.7 ms)
 
 ### Weight Streaming is Well-Optimized
 
@@ -217,13 +217,13 @@ To make mini-batch efficient, ttnn should:
 ### Large Batch
 ```json
 {
-  "wall_clock_ms": 0.167012,
+  "wall_clock_ms": 0.166607,
   "python_ms": 0.239,
-  "weight_streaming_ms": 21.38,
-  "noc_communication_ms": 19.64,
-  "computation_ms": 19.76,
-  "total_work_ms": 60.78,
-  "parallelism": 363.9,
+  "weight_streaming_ms": 21.33,
+  "noc_communication_ms": 19.61,
+  "computation_ms": 19.74,
+  "total_work_ms": 60.68,
+  "parallelism": 364.2,
   "efficiency_pct": 56.0
 }
 ```
@@ -231,18 +231,18 @@ To make mini-batch efficient, ttnn should:
 ### Mini-batch
 ```json
 {
-  "wall_clock_ms": 1.862499,
-  "weight_streaming_ms": 242.12,
-  "noc_communication_ms": 241.85,
-  "computation_ms": 229.1,
-  "total_work_ms": 89.13,
-  "parallelism": 382.9,
+  "wall_clock_ms": 1.874287,
+  "weight_streaming_ms": 243.66,
+  "noc_communication_ms": 243.39,
+  "computation_ms": 230.37,
+  "total_work_ms": 89.68,
+  "parallelism": 382.8,
   "efficiency_pct": 58.9,
-  "per_fwd_wall_ms": 0.185497,
+  "per_fwd_wall_ms": 0.1869,
   "per_fwd_python_ms": 0.179875,
-  "per_fwd_work_ms": 89.13,
-  "per_fwd_parallelism": 480.5,
-  "per_fwd_efficiency_pct": 73.9,
+  "per_fwd_work_ms": 89.68,
+  "per_fwd_parallelism": 479.8,
+  "per_fwd_efficiency_pct": 73.8,
   "python_ms": 0.179875
 }
 ```

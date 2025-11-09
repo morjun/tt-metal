@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Device Profile Analysis - Compare Large Batch vs Mini-batch
+Device Profile Analysis - Analyze Single Forward Pass
 
-Analyzes device profiler output to measure:
-- Weight streaming overhead (GDDR6 → L1 SRAM)
-- NoC communication
-- Compute time
-- Synchronization overhead
+This script analyzes device profiler output to measure a SINGLE forward pass,
+matching the structure of weight_loading_test.py exactly.
 
-Uses cycle-accurate device profiling (no Python overhead in device measurements).
+Key insight: A single forward pass = one call to linear(x_tt) + device_synchronize()
+The device profile log captures zones for each forward pass execution.
+
+Python time = device execution + device_synchronize() overhead
+Device time = device execution only (should be <= Python time)
 """
 
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Dict
-
-
-TT_FREQ_HZ = 1_350_000_000  # Blackhole P150A frequency
+from typing import List, Dict, Tuple, Optional
 
 
 @dataclass
@@ -33,6 +31,140 @@ class DeviceZone:
     duration_cycles: int
 
 
+def extract_device_info(csv_path: Path) -> Tuple[str, int]:
+    """Extract architecture and frequency from CSV header
+
+    Returns:
+        (arch, freq_mhz) - Architecture name and frequency in MHz
+    """
+    with open(csv_path, "r") as f:
+        line = f.readline()
+
+    if "Chip clock is at " in line:
+        # Grayskull format
+        return "grayskull", 1200
+    elif "ARCH" in line and "CHIP_FREQ" in line:
+        # Modern format: "ARCH: blackhole, CHIP_FREQ[MHz]: 1350"
+        arch_part = None
+        freq_part = None
+        for part in line.split(","):
+            part = part.strip()
+            if part.startswith("ARCH:"):
+                arch_part = part.split(":")[-1].strip()
+            elif "CHIP_FREQ" in part:
+                freq_part = part.split(":")[-1].strip()
+
+        if arch_part is None or freq_part is None:
+            raise ValueError(f"Could not parse ARCH or CHIP_FREQ from: {line}")
+
+        freq_mhz = int(freq_part)
+        return arch_part, freq_mhz
+    else:
+        raise ValueError(f"Could not parse device info from CSV header: {line}")
+
+
+def extract_benchmark_config() -> dict:
+    """Extract benchmark configuration from CSV file
+
+    Returns:
+        Dictionary with config values, or empty dict if not found
+    """
+    import csv
+    from pathlib import Path
+
+    csv_paths = [
+        Path("research_codes/benchmark_results.csv"),
+        Path("benchmark_results.csv"),
+    ]
+
+    for csv_path in csv_paths:
+        if not csv_path.exists():
+            continue
+
+        try:
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if not rows:
+                    continue
+
+                latest_row = rows[-1]
+                config = {}
+                if "minibatches" in latest_row:
+                    try:
+                        config["minibatches"] = int(latest_row["minibatches"])
+                    except (ValueError, TypeError):
+                        pass
+                if "small_batch_size" in latest_row:
+                    try:
+                        config["small_batch_size"] = int(latest_row["small_batch_size"])
+                    except (ValueError, TypeError):
+                        pass
+                if "large_batch_size" in latest_row:
+                    try:
+                        config["large_batch_size"] = int(latest_row["large_batch_size"])
+                    except (ValueError, TypeError):
+                        pass
+                if "measure_iters" in latest_row:
+                    try:
+                        config["measure_iters"] = int(latest_row["measure_iters"])
+                    except (ValueError, TypeError):
+                        pass
+                if "warmup_iters" in latest_row:
+                    try:
+                        config["warmup_iters"] = int(latest_row["warmup_iters"])
+                    except (ValueError, TypeError):
+                        pass
+
+                return config
+        except (ValueError, KeyError, IndexError):
+            continue
+
+    return {}
+
+
+def extract_python_time_from_benchmark(scenario: str) -> float | None:
+    """Try to extract Python measurement time from benchmark results CSV
+
+    Args:
+        scenario: "large" or "mini"
+
+    Returns:
+        Python time in ms, or None if not found
+    """
+    import csv
+    from pathlib import Path
+
+    csv_paths = [
+        Path("research_codes/benchmark_results.csv"),
+        Path("benchmark_results.csv"),
+    ]
+
+    for csv_path in csv_paths:
+        if not csv_path.exists():
+            continue
+
+        try:
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if not rows:
+                    continue
+
+                latest_row = rows[-1]
+
+                if scenario == "large":
+                    if "large_forward_compute_ms" in latest_row:
+                        return float(latest_row["large_forward_compute_ms"])
+                elif scenario == "mini":
+                    if "mini_forward_compute_ms" in latest_row:
+                        return float(latest_row["mini_forward_compute_ms"])
+        except (ValueError, KeyError, IndexError):
+            continue
+
+    return None
+
+
 def normalize_risc_type(risc_type: str) -> str:
     """Normalize RISC type names"""
     if "BRISC" in risc_type:
@@ -44,16 +176,21 @@ def normalize_risc_type(risc_type: str) -> str:
     return risc_type
 
 
-def parse_device_profile(csv_path: Path) -> List[DeviceZone]:
-    """Parse device profile CSV file"""
+def parse_device_profile(csv_path: Path) -> Tuple[List[DeviceZone], dict]:
+    """Parse device profile CSV file
+
+    Returns:
+        (zones, unmatched_starts) - List of complete zones and dict of unmatched zone starts
+    """
     zones = []
     zone_starts = {}
+    unmatched_starts = {}
 
     with open(csv_path, "r") as f:
         lines = f.readlines()
 
         if len(lines) < 2:
-            return zones
+            return zones, unmatched_starts
 
         for line in lines[2:]:
             parts = line.strip().split(",")
@@ -96,35 +233,51 @@ def parse_device_profile(csv_path: Path) -> List[DeviceZone]:
             except (ValueError, IndexError):
                 continue
 
-    return zones
+    unmatched_starts = zone_starts.copy()
+    return zones, unmatched_starts
 
 
-def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
-    """Analyze a single operation's device profile
+def analyze_single_forward_pass(
+    zones: List[DeviceZone], description: str, freq_hz: float, unmatched_starts: Optional[dict] = None
+) -> Dict:
+    """Analyze a SINGLE forward pass operation
 
-    CORRECT calculation method:
-    - Parallel work = timeline_span × num_cores (not sum of all zone durations!)
-    - This accounts for zones running in parallel on different cores
+    This matches the structure of weight_loading_test.py:
+    - A single forward pass = one call to linear(x_tt) + device_synchronize()
+    - Python time includes device execution + sync overhead
+    - Device time should be <= Python time
+
+    Args:
+        zones: List of device zones for ONE forward pass
+        description: Description of the operation
+        freq_hz: Device frequency in Hz
+        unmatched_starts: Dict of unmatched zone starts
     """
 
     if not zones:
         return {}
 
-    # Calculate wall clock time
+    # Calculate wall clock time - actual device execution time
     min_start = min(z.start_cycle for z in zones)
     max_end = max(z.end_cycle for z in zones)
+
+    if unmatched_starts:
+        for key, start_cycle in unmatched_starts.items():
+            core_id, risc_type, run_host_id, zone_name = key
+            if any(z.run_host_id == run_host_id for z in zones):
+                if start_cycle < min_start:
+                    min_start = start_cycle
+
     wall_cycles = max_end - min_start
-    wall_ms = (wall_cycles / TT_FREQ_HZ) * 1000.0
+    wall_ms = (wall_cycles / freq_hz) * 1000.0
 
-    # RISC breakdown
+    # RISC breakdown - calculate parallel work correctly
     risc_zones_by_type = defaultdict(list)
-
     for z in zones:
         risc_type = normalize_risc_type(z.risc_type)
         risc_zones_by_type[risc_type].append(z)
 
-    # Calculate CORRECT parallel work (timeline span × num_cores)
-    # This is the actual amount of work done, accounting for parallelism
+    # Parallel work = timeline span × num_cores (NOT sum of durations)
     risc_parallel_work = {}
     risc_timeline_spans = {}
     risc_num_cores = {}
@@ -132,16 +285,10 @@ def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
     for risc_type in ["BRISC", "NCRISC", "TRISC"]:
         if risc_type in risc_zones_by_type:
             zones_list = risc_zones_by_type[risc_type]
-
-            # Timeline span
             earliest_start = min(z.start_cycle for z in zones_list)
             latest_end = max(z.end_cycle for z in zones_list)
-            span_ms = ((latest_end - earliest_start) / TT_FREQ_HZ) * 1000.0
-
-            # Number of unique cores
+            span_ms = ((latest_end - earliest_start) / freq_hz) * 1000.0
             num_cores = len(set(z.core_id for z in zones_list))
-
-            # Parallel work = span × cores
             parallel_work = span_ms * num_cores
 
             risc_timeline_spans[risc_type] = span_ms
@@ -152,13 +299,11 @@ def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
             risc_num_cores[risc_type] = 0
             risc_parallel_work[risc_type] = 0.0
 
-    # Get values
     brisc_work = risc_parallel_work.get("BRISC", 0)
     ncrisc_work = risc_parallel_work.get("NCRISC", 0)
     trisc_work = risc_parallel_work.get("TRISC", 0)
     total_work = brisc_work + ncrisc_work + trisc_work
 
-    # Calculate parallelism (should be <= max theoretical: 130 cores × 5 RISCs = 650x)
     parallelism = total_work / wall_ms if wall_ms > 0 else 0
 
     return {
@@ -182,19 +327,26 @@ def analyze_operation(zones: List[DeviceZone], description: str) -> Dict:
     }
 
 
-def print_analysis(analysis: Dict, python_ms: float | None = None):
-    """Print analysis results with CORRECT parallel work calculation"""
+def print_single_forward_analysis(analysis: Dict, python_ms: float | None = None):
+    """Print analysis for a SINGLE forward pass"""
     print(f"\n{'='*80}")
     print(f"{analysis['description']}")
     print(f"{'='*80}")
     print(f"Zones: {analysis['num_zones']}")
-    print(f"Device Wall Clock: {analysis['wall_clock_ms']:.6f} ms")
+    print(f"Device Wall Clock (device execution only): {analysis['wall_clock_ms']:.6f} ms")
 
     if python_ms is not None:
         sync_overhead = python_ms - analysis["wall_clock_ms"]
         sync_pct = (sync_overhead / python_ms * 100) if python_ms > 0 else 0
-        print(f"Python Measurement: {python_ms:.6f} ms")
-        print(f"Sync Overhead: {sync_overhead:.6f} ms ({sync_pct:.1f}%)")
+        print(f"Python Measurement (device + sync overhead): {python_ms:.6f} ms")
+        if sync_overhead > 0:
+            print(f"Sync Overhead: {sync_overhead:.6f} ms ({sync_pct:.1f}%)")
+            print("  ✓ Device time < Python time (expected: sync overhead included in Python)")
+        else:
+            print(f"⚠️  Device time exceeds Python: {abs(sync_overhead):.6f} ms ({abs(sync_pct):.1f}%)")
+            print("  This may indicate:")
+            print("    - Device profiler captures overlapping work Python timer misses")
+            print("    - Or measurement timing mismatch")
 
     print()
     print("=" * 80)
@@ -239,8 +391,7 @@ def print_analysis(analysis: Dict, python_ms: float | None = None):
     print(f"  (Total work {total_work:.1f} ms / Wall clock {wall_clock:.3f} ms)")
     print()
 
-    # Validation
-    max_theoretical = 130 * 5  # 130 Tensix cores × 5 RISC processors
+    max_theoretical = 130 * 5
     efficiency = (parallelism / max_theoretical * 100) if max_theoretical > 0 else 0
     print(f"Theoretical Maximum: {max_theoretical}x (130 cores × 5 RISCs)")
     print(f"Efficiency: {efficiency:.1f}%")
@@ -252,107 +403,216 @@ def print_analysis(analysis: Dict, python_ms: float | None = None):
     print()
 
 
+def identify_forward_pass_operations(
+    zones: List[DeviceZone], config: dict, is_minibatch: bool
+) -> Tuple[List[int], List[int]]:
+    """
+    Identify run_host_ids that correspond to forward pass operations.
+
+    Following weight_loading_test.py structure:
+    - Setup: weight loading, kernel compilation (few zones)
+    - Warmup: warmup_iters forward passes (excluded from measurement)
+    - Measurement: measure_iters forward passes (these we want to analyze)
+
+    Returns:
+        (all_forward_run_ids, measurement_forward_run_ids)
+        - all_forward_run_ids: All forward pass operations (warmup + measurement)
+        - measurement_forward_run_ids: Only measurement forward passes (excludes warmup)
+    """
+    zones_by_run_id = defaultdict(list)
+    for z in zones:
+        zones_by_run_id[z.run_host_id].append(z)
+
+    run_host_ids = sorted(set(z.run_host_id for z in zones))
+    zone_counts = [(rid, len(zones_by_run_id[rid])) for rid in run_host_ids]
+
+    # Forward passes have significant zones (at least 5)
+    # Setup/compilation typically has fewer zones
+    all_forward_run_ids = []
+    for rid, count in reversed(zone_counts):
+        if count >= 5:  # Significant operation
+            all_forward_run_ids.append(rid)
+
+    # Get configuration
+    warmup_iters = config.get("warmup_iters", 2)
+    measure_iters = config.get("measure_iters", 5)
+    minibatches = config.get("minibatches", 8)
+
+    if is_minibatch:
+        # Mini-batch structure:
+        # - Each sequence has minibatches forward passes
+        # - Total sequences = warmup_iters + measure_iters
+        # - Measurement sequences = last measure_iters sequences
+        # - Measurement forward passes = last (measure_iters × minibatches) forward passes
+        total_expected_forwards = (warmup_iters + measure_iters) * minibatches
+        measurement_expected_forwards = measure_iters * minibatches
+    else:
+        # Large batch structure:
+        # - Total forward passes = warmup_iters + measure_iters
+        # - Measurement forward passes = last measure_iters forward passes
+        total_expected_forwards = warmup_iters + measure_iters
+        measurement_expected_forwards = measure_iters
+
+    # Validate total
+    expected_min_ops = total_expected_forwards
+    expected_max_ops = total_expected_forwards * 3
+
+    if len(all_forward_run_ids) < expected_min_ops:
+        print(
+            f"WARNING: Found {len(all_forward_run_ids)} forward operations, expected at least {expected_min_ops} (warmup + measurement)"
+        )
+    elif len(all_forward_run_ids) > expected_max_ops:
+        print(f"WARNING: Found {len(all_forward_run_ids)} forward operations, expected at most {expected_max_ops}")
+        print(f"  Trimming to most recent {expected_max_ops} operations")
+        all_forward_run_ids = all_forward_run_ids[:expected_max_ops]
+
+    # Extract only measurement forward passes (exclude warmup)
+    # Take the last measurement_expected_forwards forward passes
+    if len(all_forward_run_ids) >= measurement_expected_forwards:
+        measurement_forward_run_ids = all_forward_run_ids[-measurement_expected_forwards:]
+        print(f"  Total forward passes: {len(all_forward_run_ids)}")
+        print(f"  Warmup passes: {len(all_forward_run_ids) - len(measurement_forward_run_ids)}")
+        print(f"  Measurement passes: {len(measurement_forward_run_ids)}")
+    else:
+        print(f"WARNING: Not enough forward passes to separate warmup from measurement")
+        print(f"  Using all {len(all_forward_run_ids)} forward passes as measurement")
+        measurement_forward_run_ids = all_forward_run_ids
+
+    return all_forward_run_ids, measurement_forward_run_ids
+
+
 def main():
-    """Main analysis routine"""
+    """Main analysis routine - analyzes SINGLE forward pass"""
 
     print("\n" + "=" * 80)
-    print("DEVICE PROFILE ANALYSIS: Large Batch vs Mini-batch")
+    print("DEVICE PROFILE ANALYSIS: Single Forward Pass")
     print("=" * 80)
     print()
-    print("Configuration:")
-    print("  - Hardware: Tenstorrent Blackhole P150A @ 1.35 GHz")
-    print("  - Tensix cores: 130 (13×10 grid)")
-    print("  - Max parallelism: 130 cores × 5 RISCs = 650x")
-    print("  - Matrix: 4096×4096 @ bfloat16")
-    print("  - Large batch: B=256 (1 forward)")
-    print("  - Mini-batch: b=32 (8 forwards)")
-    print("  - Profiling: TT_METAL_DEVICE_PROFILER=1 (cycle-accurate)")
+    print("This script analyzes a SINGLE forward pass execution,")
+    print("matching the structure of weight_loading_test.py exactly.")
+    print()
+    print("Key insight:")
+    print("  - Python time = device execution + device_synchronize() overhead")
+    print("  - Device time = device execution only (should be <= Python time)")
     print()
 
-    # Parse device profile
     csv_path = Path("generated/profiler/.logs/profile_log_device.csv")
-
     if not csv_path.exists():
         print(f"ERROR: Device profile not found at {csv_path}")
         print("Please run with TT_METAL_DEVICE_PROFILER=1 first!")
         return
 
-    zones = parse_device_profile(csv_path)
+    try:
+        arch, freq_mhz = extract_device_info(csv_path)
+        freq_hz = freq_mhz * 1_000_000
+        print(f"Detected device: {arch} @ {freq_mhz} MHz ({freq_hz / 1_000_000_000:.2f} GHz)")
+    except (ValueError, IndexError) as e:
+        print(f"WARNING: Could not extract frequency from CSV header: {e}")
+        print("Using default frequency: 1350 MHz (1.35 GHz)")
+        arch = "blackhole"
+        freq_mhz = 1350
+        freq_hz = 1_350_000_000
+
+    zones, unmatched_starts = parse_device_profile(csv_path)
     run_host_ids = sorted(set(z.run_host_id for z in zones))
 
-    print(f"Device profile loaded: {len(zones)} zones, {len(run_host_ids)} operations")
+    print(f"Device profile loaded: {len(zones)} complete zones, {len(unmatched_starts)} unmatched zone starts")
+    print(f"Total operations (run_host_ids): {len(run_host_ids)}")
     print()
 
-    # Detect scenario
+    # Get benchmark configuration
+    config = extract_benchmark_config()
+    warmup_iters = config.get("warmup_iters", 2)
+    measure_iters = config.get("measure_iters", 5)
+    minibatches = config.get("minibatches", 8)
+
+    print(f"Benchmark configuration:")
+    print(f"  Warmup iterations: {warmup_iters}")
+    print(f"  Measurement iterations: {measure_iters}")
+    if minibatches:
+        print(f"  Minibatches per sequence: {minibatches}")
+    print()
+
+    # Detect scenario based on number of operations
+    # Large batch: fewer operations (setup + warmup + measure_iters forwards)
+    # Mini-batch: many operations (setup + warmup + measure_iters × minibatches forwards)
     if len(run_host_ids) <= 10:
-        # Large batch
+        scenario = "large"
         print("Detected: LARGE BATCH scenario")
-        print()
-
-        last_run_id = run_host_ids[-1]
-        last_op_zones = [z for z in zones if z.run_host_id == last_run_id]
-
-        analysis = analyze_operation(last_op_zones, "Large Batch Forward (B=256)")
-        python_ms = 0.239  # From Python measurement
-        print_analysis(analysis, python_ms)
-
+        print(f"  Structure: setup + {warmup_iters} warmup + {measure_iters} measurement forward passes")
     else:
-        # Mini-batch
-        print("Detected: MINI-BATCH scenario (8 forwards)")
+        scenario = "mini"
+        print("Detected: MINI-BATCH scenario")
+        print(f"  Structure: setup + {warmup_iters} warmup sequences + {measure_iters} measurement sequences")
+        print(f"  Each sequence has {minibatches} forward passes")
+        print(f"  Total measurement forward passes: {measure_iters * minibatches}")
+
+    print()
+
+    # Identify forward pass operations (separate warmup from measurement)
+    all_forward_run_ids, measurement_forward_run_ids = identify_forward_pass_operations(
+        zones, config, scenario == "mini"
+    )
+    print()
+
+    if not measurement_forward_run_ids:
+        print("ERROR: No measurement forward pass operations found!")
+        return
+
+    if scenario == "large":
+        # Analyze the LAST measurement forward pass (most recent, excludes warmup)
+        # This matches the measurement iterations in weight_loading_test.py
+        last_forward_run_id = measurement_forward_run_ids[-1]
+        forward_zones = [z for z in zones if z.run_host_id == last_forward_run_id]
+        forward_unmatched = {k: v for k, v in unmatched_starts.items() if k[2] == last_forward_run_id}
+
+        print(f"Analyzing LAST measurement forward pass (run_host_id={last_forward_run_id})")
+        print(f"  This excludes {warmup_iters} warmup passes")
+        print(f"  Zones: {len(forward_zones)}")
         print()
 
-        # Analyze last 16 operations (8 forwards × 2 ops each)
-        mini_run_ids = run_host_ids[-16:]
+        analysis = analyze_single_forward_pass(
+            forward_zones, f"Large Batch Single Forward Pass (B=256) - Measurement Only", freq_hz, forward_unmatched
+        )
 
-        # Calculate total wall clock
-        total_wall_ms = 0.0
-        for i in range(8):
-            fwd_run_ids = [mini_run_ids[i * 2], mini_run_ids[i * 2 + 1]]
-            fwd_zones = [z for z in zones if z.run_host_id in fwd_run_ids]
+        # Python time from CSV is already averaged over measure_iters
+        python_ms = extract_python_time_from_benchmark("large")
+        if python_ms is None:
+            print("WARNING: Could not extract Python time from benchmark CSV")
+            python_ms = None
 
-            if fwd_zones:
-                fwd_wall = (
-                    (max(z.end_cycle for z in fwd_zones) - min(z.start_cycle for z in fwd_zones)) / TT_FREQ_HZ
-                ) * 1000
-                total_wall_ms += fwd_wall
+        print_single_forward_analysis(analysis, python_ms)
 
-        python_total_ms = 1.439  # From Python measurement
+    else:  # mini-batch
+        # For mini-batch, analyze the LAST measurement forward pass (excludes warmup)
+        # This represents one forward pass from the measurement sequences
+        last_forward_run_id = measurement_forward_run_ids[-1]
+        forward_zones = [z for z in zones if z.run_host_id == last_forward_run_id]
+        forward_unmatched = {k: v for k, v in unmatched_starts.items() if k[2] == last_forward_run_id}
 
-        print("Mini-batch Summary:")
-        print(f"  Total device time (8 forwards): {total_wall_ms:.6f} ms")
-        print(f"  Total Python time (8 forwards): {python_total_ms:.6f} ms")
-        print(f"  Per-forward device: {(total_wall_ms / 8):.6f} ms")
-        print(f"  Per-forward Python: {(python_total_ms / 8):.6f} ms")
+        print(f"Analyzing LAST measurement forward pass (run_host_id={last_forward_run_id})")
+        print(f"  This excludes {warmup_iters} warmup sequences")
+        print(f"  Zones: {len(forward_zones)}")
+        print(f"  Note: This is ONE forward pass from the measurement sequences")
         print()
 
-        # Analyze all 8 forwards together
-        all_mini_zones = [z for z in zones if z.run_host_id in mini_run_ids]
-        analysis = analyze_operation(all_mini_zones, "Mini-batch Total (8 forwards)")
-        # Don't compare timeline span to python sum - they measure different things!
-        # Timeline span includes overlaps, python sum is sequential
-        print_analysis(analysis, python_ms=None)
+        analysis = analyze_single_forward_pass(
+            forward_zones, f"Mini-batch Single Forward Pass (b=32) - Measurement Only", freq_hz, forward_unmatched
+        )
 
-        print()
-        print("=" * 80)
-        print("Per-forward Average:")
-        print("=" * 80)
-        per_fwd_work = analysis["total_parallel_work_ms"] / 8
-        per_fwd_wall = total_wall_ms / 8
-        per_fwd_python = python_total_ms / 8
-        per_fwd_parallelism = per_fwd_work / per_fwd_wall if per_fwd_wall > 0 else 0
-        per_fwd_sync = per_fwd_python - per_fwd_wall
-        per_fwd_sync_pct = (per_fwd_sync / per_fwd_python * 100) if per_fwd_python > 0 else 0
-
-        print(f"  Device wall clock: {per_fwd_wall:.6f} ms")
-        print(f"  Python measurement: {per_fwd_python:.6f} ms")
-        if per_fwd_sync >= 0:
-            print(f"  Sync overhead: {per_fwd_sync:.6f} ms ({per_fwd_sync_pct:.1f}%)")
+        # For mini-batch, Python time is total for all measurement forwards
+        # We need per-forward Python time
+        python_total_ms = extract_python_time_from_benchmark("mini")
+        if python_total_ms is not None:
+            # Python time is total for measure_iters sequences × minibatches forwards
+            python_ms = python_total_ms / (measure_iters * minibatches)
+            print(f"Python total time (all measurement forwards): {python_total_ms:.6f} ms")
+            print(f"Python per-forward time: {python_ms:.6f} ms")
         else:
-            print(f"  Python underestimate: {abs(per_fwd_sync):.6f} ms ({abs(per_fwd_sync_pct):.1f}%)")
-            print("    (Device profiler captures work Python timer misses)")
-        print(f"  Total work: {per_fwd_work:.2f} ms")
-        print(f"  Parallelism: {per_fwd_parallelism:.1f}x ({(per_fwd_parallelism / 650 * 100):.1f}% efficiency)")
-        print()
+            print("WARNING: Could not extract Python time from benchmark CSV")
+            python_ms = None
+
+        print_single_forward_analysis(analysis, python_ms)
 
 
 if __name__ == "__main__":

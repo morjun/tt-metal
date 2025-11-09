@@ -6,13 +6,17 @@ This script:
 1. Runs large batch profiling
 2. Runs mini-batch profiling
 3. Analyzes both profiles
-4. Generates comprehensive comparison document
+4. Appends comparison data to CSV for cumulative collection
 """
 
 import subprocess
 import sys
 from pathlib import Path
 import json
+import csv
+from datetime import datetime
+import argparse
+import os
 
 
 def run_command(cmd: str, description: str) -> tuple[int, str, str]:
@@ -33,23 +37,65 @@ def run_command(cmd: str, description: str) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
+def extract_minibatches_from_benchmark_csv() -> int | None:
+    """Extract minibatches count from benchmark CSV file
+
+    Returns:
+        Number of minibatches, or None if not found
+    """
+    csv_paths = [
+        Path("research_codes/benchmark_results.csv"),
+        Path("benchmark_results.csv"),
+    ]
+
+    for csv_path in csv_paths:
+        if not csv_path.exists():
+            continue
+
+        try:
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if not rows:
+                    continue
+
+                # Get the most recent row
+                latest_row = rows[-1]
+
+                if "minibatches" in latest_row:
+                    try:
+                        return int(latest_row["minibatches"])
+                    except (ValueError, TypeError):
+                        pass
+        except (ValueError, KeyError, IndexError):
+            continue
+
+    return None
+
+
 def parse_analysis_output(output: str) -> dict:
     """Parse device_profile_analysis.py output to extract key metrics"""
     lines = output.split("\n")
     data = {}
 
     for i, line in enumerate(lines):
-        # Wall clock time
-        if "Device Wall Clock:" in line:
+        # Wall clock time - handle both old and new formats
+        if "Device Wall Clock" in line and ":" in line:
             parts = line.split(":")
             if len(parts) >= 2:
-                data["wall_clock_ms"] = float(parts[1].strip().split()[0])
+                try:
+                    data["wall_clock_ms"] = float(parts[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
 
-        # Python measurement
-        if "Python measurement:" in line or "Python Measurement:" in line:
+        # Python measurement - handle both old and new formats
+        if "Python measurement:" in line or "Python Measurement:" in line or "Python per-forward time:" in line:
             parts = line.split(":")
             if len(parts) >= 2:
-                data["python_ms"] = float(parts[1].strip().split()[0])
+                try:
+                    data["python_ms"] = float(parts[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
 
         # Component breakdown - parse table format more carefully
         # Format: Component  Span  Cores  WORK  Percentage%
@@ -137,34 +183,139 @@ def parse_analysis_output(output: str) -> dict:
                     data["cores_used"] = int(p)
                     break
 
-        # Per-forward metrics (mini-batch)
-        if "Per-forward Average:" in line:
-            # Look ahead for per-forward metrics
-            for k in range(i + 1, min(i + 10, len(lines))):
-                fwd_line = lines[k]
-                if "Device wall clock:" in fwd_line:
-                    parts = fwd_line.split(":")
-                    if len(parts) >= 2:
-                        data["per_fwd_wall_ms"] = float(parts[1].strip().split()[0])
-                if "Python measurement:" in fwd_line:
-                    parts = fwd_line.split(":")
-                    if len(parts) >= 2:
-                        data["per_fwd_python_ms"] = float(parts[1].strip().split()[0])
-                if "Total work:" in fwd_line:
-                    parts = fwd_line.split(":")
-                    if len(parts) >= 2:
+        # For mini-batch: the new format analyzes a single forward pass directly
+        # So all metrics are already per-forward - we just need to detect mini-batch scenario
+        # and copy the metrics to per_fwd_* fields
+        if "Mini-batch" in line or "mini-batch" in line.lower():
+            # This is a mini-batch analysis - all metrics are per-forward
+            # We'll copy them at the end if they exist
+            data["_is_minibatch"] = True
+
+        # Also look for "Total work:" which appears in the output
+        if "Total work:" in line and "per_fwd_work_ms" not in data:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                try:
+                    # Check if this is in a mini-batch context
+                    if data.get("_is_minibatch", False):
                         data["per_fwd_work_ms"] = float(parts[1].strip().split()[0])
-                if "Parallelism:" in fwd_line and "efficiency" in fwd_line:
-                    parts = fwd_line.split(":")
-                    if len(parts) >= 2:
-                        val_str = parts[1].strip().split("x")[0]
-                        data["per_fwd_parallelism"] = float(val_str)
-                        # Extract efficiency
-                        if "(" in fwd_line:
-                            eff_str = fwd_line.split("(")[1].split("%")[0]
-                            data["per_fwd_efficiency_pct"] = float(eff_str)
+                    else:
+                        data["total_work_ms"] = float(parts[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
+
+    # For mini-batch scenario: copy metrics to per_fwd_* fields if not already set
+    # The new format analyzes a single forward pass, so all metrics are per-forward
+    if data.get("_is_minibatch", False):
+        if "per_fwd_wall_ms" not in data and "wall_clock_ms" in data:
+            data["per_fwd_wall_ms"] = data["wall_clock_ms"]
+        if "per_fwd_python_ms" not in data and "python_ms" in data:
+            data["per_fwd_python_ms"] = data["python_ms"]
+        if "per_fwd_work_ms" not in data and "total_work_ms" in data:
+            data["per_fwd_work_ms"] = data["total_work_ms"]
+        if "per_fwd_parallelism" not in data and "parallelism" in data:
+            data["per_fwd_parallelism"] = data["parallelism"]
+        if "per_fwd_efficiency_pct" not in data and "efficiency_pct" in data:
+            data["per_fwd_efficiency_pct"] = data["efficiency_pct"]
+        # Component work (weight_streaming_ms, etc.) is already per-forward in mini-batch
+
+    # Clean up temporary flag
+    if "_is_minibatch" in data:
+        del data["_is_minibatch"]
 
     return data
+
+
+def append_comparison_to_csv(large_data: dict, mini_data: dict, csv_path: Path):
+    """Append comparison data to CSV file for cumulative collection"""
+
+    # Calculate comparison metrics
+    large_wall = large_data.get("wall_clock_ms", 0)
+    large_python = large_data.get("python_ms", 0)
+    large_work = large_data.get("total_work_ms", 0)
+    large_parallelism = large_data.get("parallelism", 0)
+    large_efficiency = large_data.get("efficiency_pct", 0)
+    large_weight = large_data.get("weight_streaming_ms", 0)
+    large_noc = large_data.get("noc_communication_ms", 0)
+    large_compute = large_data.get("computation_ms", 0)
+    large_cores = large_data.get("cores_used", 0)
+
+    mini_per_fwd_wall = mini_data.get("per_fwd_wall_ms", 0)
+    mini_per_fwd_python = mini_data.get("per_fwd_python_ms", 0)
+    mini_per_fwd_work = mini_data.get("per_fwd_work_ms", 0)
+    mini_per_fwd_parallelism = mini_data.get("per_fwd_parallelism", 0)
+    mini_per_fwd_efficiency = mini_data.get("per_fwd_efficiency_pct", 0)
+    mini_total_weight = mini_data.get("weight_streaming_ms", 0)
+    mini_total_noc = mini_data.get("noc_communication_ms", 0)
+    mini_total_compute = mini_data.get("computation_ms", 0)
+    mini_cores = mini_data.get("cores_used", 0)
+
+    # In the new format, mini-batch analysis is already per-forward (single forward pass)
+    # So component work is already per-forward, no need to divide
+    # But we still need to check if we have per_fwd_* fields set
+    if mini_per_fwd_work == 0 and mini_data.get("total_work_ms", 0) > 0:
+        # Fallback: use total_work_ms if per_fwd_work_ms not set
+        mini_per_fwd_work = mini_data.get("total_work_ms", 0)
+
+    # Component work is already per-forward in new format
+    # Only divide if it looks like total (very large values)
+    if mini_total_weight > 100:  # Likely total, not per-forward
+        # Get actual minibatches count from benchmark CSV
+        actual_minibatches = extract_minibatches_from_benchmark_csv()
+        if actual_minibatches is None:
+            actual_minibatches = 8  # Default fallback
+        mini_per_fwd_weight = mini_total_weight / actual_minibatches
+        mini_per_fwd_noc = mini_total_noc / actual_minibatches
+        mini_per_fwd_compute = mini_total_compute / actual_minibatches
+    else:
+        # Already per-forward
+        mini_per_fwd_weight = mini_total_weight
+        mini_per_fwd_noc = mini_total_noc
+        mini_per_fwd_compute = mini_total_compute
+
+    # Calculate overhead percentages
+    work_overhead_pct = ((mini_per_fwd_work / large_work) - 1) * 100 if large_work > 0 else 0
+    wall_clock_overhead_pct = ((mini_per_fwd_wall / large_wall) - 1) * 100 if large_wall > 0 else 0
+
+    # Prepare row data
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "large_wall_clock_ms": f"{large_wall:.6f}",
+        "large_python_ms": f"{large_python:.6f}",
+        "large_total_work_ms": f"{large_work:.2f}",
+        "large_parallelism": f"{large_parallelism:.1f}",
+        "large_efficiency_pct": f"{large_efficiency:.1f}",
+        "large_weight_streaming_ms": f"{large_weight:.2f}",
+        "large_noc_communication_ms": f"{large_noc:.2f}",
+        "large_computation_ms": f"{large_compute:.2f}",
+        "mini_per_fwd_wall_clock_ms": f"{mini_per_fwd_wall:.6f}",
+        "mini_per_fwd_python_ms": f"{mini_per_fwd_python:.6f}",
+        "mini_per_fwd_total_work_ms": f"{mini_per_fwd_work:.2f}",
+        "mini_per_fwd_parallelism": f"{mini_per_fwd_parallelism:.1f}",
+        "mini_per_fwd_efficiency_pct": f"{mini_per_fwd_efficiency:.1f}",
+        "mini_per_fwd_weight_streaming_ms": f"{mini_per_fwd_weight:.2f}",
+        "mini_per_fwd_noc_communication_ms": f"{mini_per_fwd_noc:.2f}",
+        "mini_per_fwd_computation_ms": f"{mini_per_fwd_compute:.2f}",
+        "work_overhead_pct": f"{work_overhead_pct:.1f}",
+        "wall_clock_overhead_pct": f"{wall_clock_overhead_pct:.1f}",
+        "cores_used_large": str(large_cores),
+        "cores_used_mini": str(mini_cores),
+    }
+
+    # Field names (column headers)
+    fieldnames = list(row.keys())
+
+    # Check if file exists and has content
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+
+    # Write CSV (append mode)
+    with open(csv_path, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print(f"\n✓ Comparison data appended to: {csv_path}")
 
 
 def generate_markdown_report(large_data: dict, mini_data: dict, output_path: Path):
@@ -180,9 +331,27 @@ def generate_markdown_report(large_data: dict, mini_data: dict, output_path: Pat
     large_compute = large_data.get("computation_ms", 0)
     large_total = large_data.get("total_work_ms", 0)
 
-    mini_weight = mini_data.get("weight_streaming_ms", 0) / 8  # Per forward
-    mini_noc = mini_data.get("noc_communication_ms", 0) / 8
-    mini_compute = mini_data.get("computation_ms", 0) / 8
+    # Get actual minibatches count from benchmark CSV
+    actual_minibatches = extract_minibatches_from_benchmark_csv()
+
+    if actual_minibatches is None:
+        # Fallback: Estimate number of forwards from total work vs per-forward work
+        mini_total_work = mini_data.get("total_work_ms", 0)
+        mini_per_fwd_work = mini_data.get("per_fwd_work_ms", 0)
+        estimated_forwards = int(mini_total_work / mini_per_fwd_work) if mini_per_fwd_work > 0 else 8
+        estimated_forwards = max(1, estimated_forwards)  # At least 1 forward
+        print(f"WARNING: Could not read minibatches from CSV, estimated: {estimated_forwards}")
+    else:
+        estimated_forwards = actual_minibatches
+        print(f"Using actual minibatches count from CSV: {estimated_forwards}")
+
+    # Calculate per-forward component work
+    mini_total_work = mini_data.get("total_work_ms", 0)
+    mini_per_fwd_work = mini_data.get("per_fwd_work_ms", 0)
+
+    mini_weight = mini_data.get("weight_streaming_ms", 0) / estimated_forwards if estimated_forwards > 0 else 0
+    mini_noc = mini_data.get("noc_communication_ms", 0) / estimated_forwards if estimated_forwards > 0 else 0
+    mini_compute = mini_data.get("computation_ms", 0) / estimated_forwards if estimated_forwards > 0 else 0
     mini_total = mini_data.get("per_fwd_work_ms", 0)
 
     large_cores = large_data.get("cores_used", 128)  # Default to 128 if not found
@@ -212,7 +381,7 @@ This document contains device-level profiling analysis for weight loading scenar
 - **Model**: Single linear layer (4096 → 4096)
 - **Weight**: 64 MB (4096 × 4096 × FP32)
 - **Large batch**: B=256 (1 forward pass)
-- **Mini-batch**: b=32 (8 forward passes)
+- **Mini-batch**: b=32 ({estimated_forwards} forward passes)
 
 ---
 
@@ -251,11 +420,11 @@ Forward (ms): {large_data.get('python_ms', 'N/A'):.3f}
 
 ---
 
-## Mini-batch Scenario (b=32, 8 forward passes)
+## Mini-batch Scenario (b=32, {estimated_forwards} forward passes)
 
-### Python-level Timing (8 forwards total)
+### Python-level Timing ({estimated_forwards} forwards total)
 ```
-Total: {mini_data.get('python_ms', 0) * 8:.3f} ms
+Total: {mini_data.get('python_ms', 0) * estimated_forwards:.3f} ms
 Per-forward: {mini_data.get('per_fwd_python_ms', 0):.3f} ms
 ```
 
@@ -265,7 +434,7 @@ Per-forward: {mini_data.get('per_fwd_python_ms', 0):.3f} ms
 - Total wall clock time: **{mini_data.get('wall_clock_ms', 0):.3f} ms** (timeline span, includes overlaps)
 - Cores used: **{mini_cores} cores** (100% utilization!)
 
-### Parallel Work Breakdown (8 forwards total)
+### Parallel Work Breakdown ({estimated_forwards} forwards total)
 
 | Component | Parallel Work (total) | Parallel Work (per forward) | % of Total |
 |-----------|----------------------|---------------------------|------------|
@@ -281,7 +450,7 @@ Per-forward: {mini_data.get('per_fwd_python_ms', 0):.3f} ms
 **Interpretation**:
 - Mini-batch uses **MORE cores** than large batch ({mini_cores} vs {large_cores})
 - Higher parallelism efficiency per forward ({mini_data.get('per_fwd_efficiency_pct', 0):.1f}% vs {large_data.get('efficiency_pct', 0):.1f}%)
-- But requires 8 forwards to process same amount of data
+- But requires {estimated_forwards} forwards to process same amount of data
 
 ---
 
@@ -320,11 +489,11 @@ Actual behavior:
 
 ### Total Time Comparison (256 elements)
 
-| Metric | Large Batch | Mini-batch (×8) | Ratio |
-|--------|-------------|-----------------|-------|
-| **Device time** | {large_data.get('wall_clock_ms', 0):.3f} ms | {mini_data.get('per_fwd_wall_ms', 0)*8:.3f} ms | **{(mini_data.get('per_fwd_wall_ms', 1)*8/large_data.get('wall_clock_ms', 1)):.1f}x slower** |
-| **Python time** | {large_data.get('python_ms', 0):.3f} ms | {mini_data.get('per_fwd_python_ms', 0)*8:.3f} ms | **{(mini_data.get('per_fwd_python_ms', 1)*8/large_data.get('python_ms', 1)):.1f}x slower** |
-| **Total Work** | {large_total:.2f} ms | {mini_total*8:.2f} ms | **{(mini_total*8/large_total):.1f}x more work** |
+| Metric | Large Batch | Mini-batch (×{estimated_forwards}) | Ratio |
+|--------|-------------|-----------------------------------|-------|
+| **Device time** | {large_data.get('wall_clock_ms', 0):.3f} ms | {mini_data.get('per_fwd_wall_ms', 0)*estimated_forwards:.3f} ms | **{(mini_data.get('per_fwd_wall_ms', 1)*estimated_forwards/large_data.get('wall_clock_ms', 1)):.1f}x slower** |
+| **Python time** | {large_data.get('python_ms', 0):.3f} ms | {mini_data.get('per_fwd_python_ms', 0)*estimated_forwards:.3f} ms | **{(mini_data.get('per_fwd_python_ms', 1)*estimated_forwards/large_data.get('python_ms', 1)):.1f}x slower** |
+| **Total Work** | {large_total:.2f} ms | {mini_total*estimated_forwards:.2f} ms | **{(mini_total*estimated_forwards/large_total):.1f}x more work** |
 
 ---
 
@@ -378,8 +547,8 @@ The real bottleneck is the **inefficient resource allocation strategy** that use
 
 This causes:
 - **{((work_ratio - 1) * 100):.1f}% more work per forward** ({mini_total:.2f} ms vs {large_total:.2f} ms)
-- **{(mini_data.get('per_fwd_wall_ms', 1)*8/large_data.get('wall_clock_ms', 1)):.1f}x slower total time** ({mini_data.get('per_fwd_wall_ms', 0)*8:.3f} ms vs {large_data.get('wall_clock_ms', 0):.3f} ms)
-- **{(mini_total*8/large_total):.1f}x more total work** ({mini_total*8:.1f} ms vs {large_total:.1f} ms)
+- **{(mini_data.get('per_fwd_wall_ms', 1)*estimated_forwards/large_data.get('wall_clock_ms', 1)):.1f}x slower total time** ({mini_data.get('per_fwd_wall_ms', 0)*estimated_forwards:.3f} ms vs {large_data.get('wall_clock_ms', 0):.3f} ms)
+- **{(mini_total*estimated_forwards/large_total):.1f}x more total work** ({mini_total*estimated_forwards:.1f} ms vs {large_total:.1f} ms)
 
 ### Weight Streaming is Well-Optimized
 
@@ -422,6 +591,20 @@ To make mini-batch efficient, ttnn should:
 def main():
     """Main workflow"""
 
+    parser = argparse.ArgumentParser(description="Run full device profile analysis workflow")
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default="research_codes/device_profile_comparison.csv",
+        help="Path to CSV file for cumulative comparison data (default: research_codes/device_profile_comparison.csv)",
+    )
+    parser.add_argument(
+        "--generate-markdown",
+        action="store_true",
+        help="Generate markdown report (disabled by default)",
+    )
+    args = parser.parse_args()
+
     print("=" * 80)
     print("AUTOMATED DEVICE PROFILE ANALYSIS WORKFLOW")
     print("=" * 80)
@@ -432,7 +615,9 @@ def main():
     print("  3. Analyze and save large batch results")
     print("  4. Run mini-batch profiling")
     print("  5. Analyze and save mini-batch results")
-    print("  6. Generate comprehensive comparison document")
+    print("  6. Append comparison data to CSV for cumulative collection")
+    if args.generate_markdown:
+        print("  7. Generate markdown report")
     print()
 
     # Step 1: Clear old profile data
@@ -500,9 +685,15 @@ def main():
     mini_json_path.write_text(json.dumps(mini_data, indent=2))
     print(f"  Data saved to: {mini_json_path}")
 
-    # Step 6: Generate comparison report
-    output_path = Path("research_codes/DEVICE_PROFILE_RESULTS.md")
-    generate_markdown_report(large_data, mini_data, output_path)
+    # Step 6: Append comparison data to CSV
+    csv_path = Path(args.output_csv)
+    append_comparison_to_csv(large_data, mini_data, csv_path)
+
+    # Step 7: Generate markdown report (optional)
+    output_path = None
+    if args.generate_markdown:
+        output_path = Path("research_codes/DEVICE_PROFILE_RESULTS.md")
+        generate_markdown_report(large_data, mini_data, output_path)
 
     print("\n" + "=" * 80)
     print("✅ WORKFLOW COMPLETE")
@@ -511,7 +702,9 @@ def main():
     print("Results:")
     print(f"  - Large batch data: {large_json_path}")
     print(f"  - Mini-batch data: {mini_json_path}")
-    print(f"  - Comparison report: {output_path}")
+    print(f"  - Comparison CSV: {csv_path}")
+    if args.generate_markdown and output_path:
+        print(f"  - Markdown report: {output_path}")
     print()
     print("Summary:")
     work_ratio = mini_data.get("per_fwd_work_ms", 0) / large_data.get("total_work_ms", 1)
@@ -519,6 +712,8 @@ def main():
     print(f"  - Mini-batch work (per fwd): {mini_data.get('per_fwd_work_ms', 0):.2f} ms")
     print(f"  - Mini-batch overhead: {((work_ratio - 1) * 100):.1f}% more work per forward")
     print(f"  - Root cause: Over-parallelization ({mini_data.get('cores_used', 'N/A')} cores for 32 samples)")
+    print()
+    print(f"💡 Tip: Run this script multiple times to build cumulative data in {csv_path}")
     print()
 
 

@@ -3,9 +3,13 @@
 
 from device_profile_analysis import *
 from pathlib import Path
+import os
 
-csv_path = Path("../generated/profiler/.logs/profile_log_device.csv")
-zones = parse_device_profile(csv_path)
+# Get the correct path to the CSV file
+script_dir = os.path.dirname(os.path.abspath(__file__))
+tt_metal_root = os.path.abspath(os.path.join(script_dir, ".."))
+csv_path = Path(tt_metal_root) / "generated/profiler/.logs/profile_log_device.csv"
+zones, unmatched_starts = parse_device_profile(csv_path)
 run_host_ids = sorted(set(z.run_host_id for z in zones))
 
 print("=" * 80)
