@@ -1,10 +1,10 @@
 {
-  "wall_clock_ms": 0.191962,
-  "python_ms": 0.242582,
-  "weight_streaming_ms": 24.96,
-  "noc_communication_ms": 24.87,
-  "computation_ms": 24.87,
-  "total_work_ms": 74.7,
+  "wall_clock_ms": 0.194604,
+  "python_ms": 0.238065,
+  "weight_streaming_ms": 25.3,
+  "noc_communication_ms": 25.22,
+  "computation_ms": 25.22,
+  "total_work_ms": 75.73,
   "parallelism": 389.2,
   "efficiency_pct": 59.9
 }
