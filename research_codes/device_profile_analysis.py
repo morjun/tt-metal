@@ -604,15 +604,18 @@ def main():
         # We need per-forward Python time
         python_total_ms = extract_python_time_from_benchmark("mini")
         if python_total_ms is not None:
-            # Python time is total for measure_iters sequences × minibatches forwards
-            python_ms = python_total_ms / (measure_iters * minibatches)
-            print(f"Python total time (all measurement forwards): {python_total_ms:.6f} ms")
-            print(f"Python per-forward time: {python_ms:.6f} ms")
-        else:
-            print("WARNING: Could not extract Python time from benchmark CSV")
-            python_ms = None
+            # python_total_ms (from CSV) is the average time for ONE SEQUENCE (e.g., 8 minibatches)
+            # We need the average time PER-FORWARD pass
+            if minibatches > 0:
+                python_ms = python_total_ms / minibatches
+            else:
+                python_ms = None  # Avoid division by zero
 
-        print_single_forward_analysis(analysis, python_ms)
+            print(f"Python time per sequence (from CSV): {python_total_ms:.6f} ms")
+            if python_ms is not None:
+                print(f"Python per-forward pass (calculated): {python_ms:.6f} ms")
+
+            print_single_forward_analysis(analysis, python_ms)
 
 
 if __name__ == "__main__":
