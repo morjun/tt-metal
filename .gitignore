@@ -4,6 +4,7 @@
 .vscode
 .idea
 runtime
+*.tracy
 *.log
 *.csv
 *.xlsx
