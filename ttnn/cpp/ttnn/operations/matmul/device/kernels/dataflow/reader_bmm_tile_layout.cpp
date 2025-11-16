@@ -70,45 +70,30 @@ void kernel_main() {
     const auto s1 = TensorAccessor(in1_args, in1_tensor_addr, in1_single_tile_size_bytes);
 
     for (uint32_t b = 0; b < batch; b++) {
-        // ✅ ADD THIS: Profile each batch iteration
-        DeviceZoneScopedN("BATCH-ITERATION");
-
         uint32_t in0_tensor_current_block_start_tile_id = in0_tensor_start_tile_id;
         uint32_t in1_tensor_current_block_start_tile_id = in1_tensor_start_tile_id;
 
         for (uint32_t block = 0; block < num_blocks; block++) {
-            // ✅ ADD THIS: Profile each block
-            DeviceZoneScopedN("BLOCK-ITERATION");
-
-            {
-                // ✅ ADD THIS: Measure CB reservation time
-                DeviceZoneScopedN("CB-RESERVE");
-                cb_reserve_back(cb_id_in0, in0_block_num_tiles);
-                cb_reserve_back(cb_id_in1, in1_block_num_tiles);
-            }
+            cb_reserve_back(cb_id_in0, in0_block_num_tiles);
+            cb_reserve_back(cb_id_in1, in1_block_num_tiles);
 
             l1_write_addr_in0 = get_write_ptr(cb_id_in0);
             l1_write_addr_in1 = get_write_ptr(cb_id_in1);
 
-            {
-                // ✅ ADD THIS: Measure IN0 (activation) reading
-                DeviceZoneScopedN("READ-IN0-ACTIVATION");
-
-                uint32_t in0_tensor_row_start_tile_id = in0_tensor_current_block_start_tile_id;
-                for (uint32_t h = 0; h < in0_block_h; h++) {
-                    uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
-                    for (uint32_t w = 0; w < in0_block_w; w++) {
-                        noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_in0);
-                        l1_write_addr_in0 += in0_single_tile_size_bytes;
-                        in0_tensor_tile_id += in0_tensor_stride_w;
-                    }
-                    in0_tensor_row_start_tile_id += in0_tensor_stride_h;
+            uint32_t in0_tensor_row_start_tile_id = in0_tensor_current_block_start_tile_id;
+            for (uint32_t h = 0; h < in0_block_h; h++) {
+                uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
+                for (uint32_t w = 0; w < in0_block_w; w++) {
+                    noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_in0);
+                    l1_write_addr_in0 += in0_single_tile_size_bytes;
+                    in0_tensor_tile_id += in0_tensor_stride_w;
                 }
-                in0_tensor_current_block_start_tile_id += in0_tensor_next_block_stride;
+                in0_tensor_row_start_tile_id += in0_tensor_stride_h;
             }
+            in0_tensor_current_block_start_tile_id += in0_tensor_next_block_stride;
 
             {
-                // ✅ ADD THIS: Measure IN1 (weight) reading
+                // ✅ ADD THIS: Measure IN1 (weight) reading (DRAM -> SRAM)
                 DeviceZoneScopedN("READ-IN1-WEIGHT");
 
                 uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_block_start_tile_id;
@@ -125,17 +110,13 @@ void kernel_main() {
             }
 
             {
-                // ✅ ADD THIS: Measure NOC barrier wait time (THIS IS THE IDLE TIME!)
+                // ✅ ADD THIS: Measure NOC barrier wait time (NoC communication)
                 DeviceZoneScopedN("NOC-BARRIER-WAIT");
                 noc_async_read_barrier();
             }
 
-            {
-                // ✅ ADD THIS: Measure CB push time
-                DeviceZoneScopedN("CB-PUSH");
-                cb_push_back(cb_id_in0, in0_block_num_tiles);
-                cb_push_back(cb_id_in1, in1_block_num_tiles);
-            }
+            cb_push_back(cb_id_in0, in0_block_num_tiles);
+            cb_push_back(cb_id_in1, in1_block_num_tiles);
         }
 
         if (bcast_B == 0) {

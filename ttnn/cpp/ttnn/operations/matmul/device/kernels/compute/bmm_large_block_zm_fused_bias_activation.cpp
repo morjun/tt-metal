@@ -15,6 +15,9 @@
 
 #include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
 
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
+
 // Please update
 // tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/bmm_large_block_zm_fused_bias_activation_copy.cpp
 // when making any changes to this file.
@@ -80,6 +83,9 @@ inline void reblock_and_untilize(
 }
 
 void MAIN {
+    // ✅ ADD THIS: Main profiling scope - must be at function start
+    DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
+
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
     const bool is_worker_core = get_arg_val<uint32_t>(0) == 1;
@@ -199,6 +205,7 @@ void MAIN {
                             }
 
 #ifndef SKIP_COMPUTE
+                            // ✅ COMPUTE zone temporarily disabled to reduce profiler buffer usage
                             // Compute output sub-block
                             uint32_t dst_index =
                                 0;  // start at 0, each call to matmul_block internally increments dst_index
@@ -224,7 +231,6 @@ void MAIN {
                                 in1_index += in1_block_w;  // to stride down by 1 need to stride by in_per_core_w
                                                            // (should be called in1_block_w)
                             }
-
 #endif  // SKIP_COMPUTE
 
                             if (last_out) {
