@@ -83,8 +83,8 @@ inline void reblock_and_untilize(
 }
 
 void MAIN {
-    // ✅ ADD THIS: Main profiling scope - must be at function start
-    DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow even with 130+ cores × 1 zone
+    // DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
 
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
@@ -144,9 +144,11 @@ void MAIN {
 
     constexpr bool spill = num_blocks_inner_dim > 1;
 
+    // MM-BLOCK-INIT zone removed to reduce profiler buffer usage
     mm_block_init(
         in0_cb_id, in1_cb_id, mm_partials_cb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
     for (uint32_t b = 0; b < batch; b++) {
+        // DeviceZoneScopedN("BATCH-ITERATION");
         if constexpr (get_batch_from_reader) {
             // Check whether this batch is valid
             bool is_batch_valid = false;
@@ -184,8 +186,11 @@ void MAIN {
                     }
 #endif
 
-                    cb_wait_front(in0_cb_id, in0_block_num_tiles);
-                    cb_wait_front(in1_cb_id, in1_block_num_tiles);
+                    {
+                        // DeviceZoneScopedN("CB-WAIT-FRONT");
+                        cb_wait_front(in0_cb_id, in0_block_num_tiles);
+                        cb_wait_front(in1_cb_id, in1_block_num_tiles);
+                    }
 
                     int in0_index_subblock_offset = 0;
                     for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -325,8 +330,11 @@ void MAIN {
                     }
 #endif
 
-                    cb_pop_front(in0_cb_id, in0_block_num_tiles);
-                    cb_pop_front(in1_cb_id, in1_block_num_tiles);
+                    {
+                        // DeviceZoneScopedN("CB-POP-FRONT");
+                        cb_pop_front(in0_cb_id, in0_block_num_tiles);
+                        cb_pop_front(in1_cb_id, in1_block_num_tiles);
+                    }
                 }
 
 #ifdef FUSE_BIAS
@@ -341,23 +349,25 @@ void MAIN {
                 PACK((llk_pack_reconfig_l1_acc(0)));
 #endif
 
-                reconfig_data_format(in1_cb_id, mm_partials_cb_id, in0_cb_id, bias_cb_id);
-                add_bcast_rows_init_short(mm_partials_cb_id, bias_cb_id);
-                // reconfigure unpacker df for src B
-                cb_wait_front(bias_cb_id, in1_block_w);
-                for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
-                    int in1_index_subblock_offset = 0;
-                    for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
-                        // Redundant wait since we know data was just pushed
-                        cb_wait_front(mm_partials_cb_id, out_subblock_num_tiles);
-                        tile_regs_acquire();
-                        for (uint32_t i = 0, j = 0; j < out_subblock_h; j++) {
-                            uint32_t bcast_tile_idx = in1_index_subblock_offset;
-                            for (uint32_t k = 0; k < out_subblock_w; k++, i++) {
-                                add_tiles_bcast_rows(mm_partials_cb_id, bias_cb_id, i, bcast_tile_idx, i);
-                                bcast_tile_idx++;
+                {
+                    // DeviceZoneScopedN("FUSE-BIAS");
+                    reconfig_data_format(in1_cb_id, mm_partials_cb_id, in0_cb_id, bias_cb_id);
+                    add_bcast_rows_init_short(mm_partials_cb_id, bias_cb_id);
+                    // reconfigure unpacker df for src B
+                    cb_wait_front(bias_cb_id, in1_block_w);
+                    for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
+                        int in1_index_subblock_offset = 0;
+                        for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
+                            // Redundant wait since we know data was just pushed
+                            cb_wait_front(mm_partials_cb_id, out_subblock_num_tiles);
+                            tile_regs_acquire();
+                            for (uint32_t i = 0, j = 0; j < out_subblock_h; j++) {
+                                uint32_t bcast_tile_idx = in1_index_subblock_offset;
+                                for (uint32_t k = 0; k < out_subblock_w; k++, i++) {
+                                    add_tiles_bcast_rows(mm_partials_cb_id, bias_cb_id, i, bcast_tile_idx, i);
+                                    bcast_tile_idx++;
+                                }
                             }
-                        }
 // if there's no SFPU fusion, we commit the regs so packer can start packing
 #ifndef SFPU_OP_INIT_ACTIVATION
                         tile_regs_commit();
@@ -383,11 +393,12 @@ void MAIN {
                         cb_push_back(untilize_mode_out_cb_id, out_subblock_num_tiles);
 
                         in1_index_subblock_offset += out_subblock_w;
+                        }
                     }
-                }
                 if constexpr (num_blocks_w_dim > 1) {
                     cb_pop_front(bias_cb_id, in1_block_w);
                 }
+                }  // End FUSE-BIAS zone
 #endif  // FUSE_BIAS
                 if constexpr (untilize_out) {
 #ifdef PACK_RELU

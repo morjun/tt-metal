@@ -16,8 +16,8 @@
 #include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
-    // ✅ ADD THIS: Main profiling scope (replaces BRISC-KERNEL)
-    DeviceZoneScopedMainChildN("BRISC-MATMUL-READER");
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER");
 
     bool one_time_profile = true;
 
@@ -93,7 +93,7 @@ void kernel_main() {
             in0_tensor_current_block_start_tile_id += in0_tensor_next_block_stride;
 
             {
-                // ✅ ADD THIS: Measure IN1 (weight) reading (DRAM -> SRAM)
+                // ✅ DISABLED: Measure IN1 (weight) reading - causes buffer overflow
                 DeviceZoneScopedN("READ-IN1-WEIGHT");
 
                 uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_block_start_tile_id;
@@ -110,7 +110,7 @@ void kernel_main() {
             }
 
             {
-                // ✅ ADD THIS: Measure NOC barrier wait time (NoC communication)
+                // ✅ DISABLED: Measure NOC barrier wait time - causes buffer overflow
                 DeviceZoneScopedN("NOC-BARRIER-WAIT");
                 noc_async_read_barrier();
             }

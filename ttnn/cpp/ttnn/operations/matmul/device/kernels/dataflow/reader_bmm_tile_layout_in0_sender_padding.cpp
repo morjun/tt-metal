@@ -10,8 +10,12 @@
 #include "pad_tile.hpp"
 #include "ckernel.h"
 #include "ckernel_defs.h"
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-IN0-SENDER");
     uint32_t rt_args_idx = 0;
     // in0 tensor args
     const uint32_t in0_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
@@ -218,42 +222,51 @@ void kernel_main() {
                             l1_write_addr_in0;  // copy start address of block, to be used for mcasting
 #endif                                          // SKIP_MCAST
 
-                        // Copy in0 block into CB, as the default kernel
-                        uint32_t in0_tensor_row_start_tile_id = in0_tensor_current_inner_dim_block_start_tile_id;
-                        for (uint32_t h = 0; h < in0_block_h; ++h) {
-                            uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
-                            for (uint32_t w = 0; w < in0_block_w; ++w) {
-                                if (bh < num_blocks_h_dim - 1 || h < last_block_h) {
+                        {
+                            // ✅ DISABLED: Measure IN0 (input) reading - causes buffer overflow
+                            DeviceZoneScopedN("READ-IN0-DRAM-TO-SRAM-PADDING");
+
+                            // Copy in0 block into CB, as the default kernel
+                            uint32_t in0_tensor_row_start_tile_id = in0_tensor_current_inner_dim_block_start_tile_id;
+                            for (uint32_t h = 0; h < in0_block_h; ++h) {
+                                uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
+                                for (uint32_t w = 0; w < in0_block_w; ++w) {
+                                    if (bh < num_blocks_h_dim - 1 || h < last_block_h) {
 #ifndef INTERMEDIATE_CB_READ
-                                    noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_in0);
+                                        noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_in0);
 #else
-                                    noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_helper);
-                                    noc_async_read_barrier();
-                                    memcpy(
-                                        /*dst=*/reinterpret_cast<void*>(l1_write_addr_in0),
-                                        /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
-                                        /*size=*/in0_single_tile_size_bytes);
-#endif  // INTERMEDIATE_CB_READ
-                                }
-
-                                // Zero out padded regions for the very last tile
-                                if constexpr (in0_last_ktile_w > 0) {
-                                    if ((block == num_blocks_inner_dim - 1) && (w == in0_block_w - 1)) {
+                                        noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_helper);
                                         noc_async_read_barrier();
-                                        const DataFormat in0_data_format = get_dataformat(cb_id_in0);
-                                        pad_last_ktile<in0_data_format, in0_last_ktile_w>(l1_write_addr_in0);
+                                        memcpy(
+                                            /*dst=*/reinterpret_cast<void*>(l1_write_addr_in0),
+                                            /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
+                                            /*size=*/in0_single_tile_size_bytes);
+#endif  // INTERMEDIATE_CB_READ
                                     }
+
+                                    // Zero out padded regions for the very last tile
+                                    if constexpr (in0_last_ktile_w > 0) {
+                                        if ((block == num_blocks_inner_dim - 1) && (w == in0_block_w - 1)) {
+                                            noc_async_read_barrier();
+                                            const DataFormat in0_data_format = get_dataformat(cb_id_in0);
+                                            pad_last_ktile<in0_data_format, in0_last_ktile_w>(l1_write_addr_in0);
+                                        }
+                                    }
+
+                                    l1_write_addr_in0 += in0_single_tile_size_bytes;
+                                    in0_tensor_tile_id += in0_tensor_stride_w;
                                 }
-
-                                l1_write_addr_in0 += in0_single_tile_size_bytes;
-                                in0_tensor_tile_id += in0_tensor_stride_w;
+                                in0_tensor_row_start_tile_id += in0_tensor_stride_h;
                             }
-                            in0_tensor_row_start_tile_id += in0_tensor_stride_h;
+                            in0_tensor_current_inner_dim_block_start_tile_id += in0_tensor_next_inner_dim_block_stride;
                         }
-                        in0_tensor_current_inner_dim_block_start_tile_id += in0_tensor_next_inner_dim_block_stride;
 
-                        // Barrier! make sure the reads are done
-                        noc_async_read_barrier();
+                        {
+                            // ✅ DISABLED: Measure NOC barrier wait time - causes buffer overflow
+                            DeviceZoneScopedN("NOC-BARRIER-WAIT-IN0-PADDING");
+                            // Barrier! make sure the reads are done
+                            noc_async_read_barrier();
+                        }
 #else
                         if constexpr (extract_shard_sub_blocks) {
                             uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);

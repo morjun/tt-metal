@@ -8,8 +8,12 @@
 #include "hostdevcommon/common_values.hpp"
 #include "ckernel.h"
 #include "ckernel_defs.h"
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-IN0-RECEIVER");
     // in0 mcast args
     const uint32_t in0_mcast_sender_noc_x = get_arg_val<uint32_t>(0);
     const uint32_t in0_mcast_sender_noc_y = get_arg_val<uint32_t>(1);
@@ -76,8 +80,12 @@ void kernel_main() {
                     // Atomic increment source core counter
                     noc_semaphore_inc(in0_mcast_sender_semaphore_noc_addr, 1);
 
-                    // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
-                    noc_semaphore_wait(in0_mcast_receiver_semaphore_addr_ptr, VALID);
+                    {
+                        // ✅ DISABLED: Measure NoC multicast wait time - causes buffer overflow
+                        // DeviceZoneScopedN("NOC-MCAST-WAIT");
+                        // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
+                        noc_semaphore_wait(in0_mcast_receiver_semaphore_addr_ptr, VALID);
+                    }
 
                     cb_push_back(cb_id_in0, in0_block_num_tiles);
                 }

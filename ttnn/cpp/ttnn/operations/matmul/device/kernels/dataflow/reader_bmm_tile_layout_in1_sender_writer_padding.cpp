@@ -7,8 +7,12 @@
 #include "dataflow_api.h"
 #include "hostdevcommon/common_values.hpp"
 #include "ttnn/operations/ccl/kernel_common/worker_sync_utils.hpp"
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-WRITER-IN1-SENDER");
     // READER
     uint32_t rt_args_idx = 0;
     // in1 tensor args
@@ -308,32 +312,41 @@ void kernel_main() {
                         uint64_t in1_start_address =
                             l1_write_addr_in1;  // copy start address of block, to be used for mcasting
 
-                        // Copy in1 block into CB, as the default kernel
-                        uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
-                        for (uint32_t h = 0; h < in1_block_h; ++h) {
-                            uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
-                            for (uint32_t w = 0; w < in1_block_w; ++w) {
-                                if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
-#ifndef INTERMEDIATE_CB_READ
-                                    noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
-#else
-                                    noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_helper);
-                                    noc_async_read_barrier();
-                                    memcpy(
-                                        /*dst=*/reinterpret_cast<void*>(l1_write_addr_in1),
-                                        /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
-                                        /*size=*/in1_single_tile_size_bytes);
-#endif  // INTERMEDIATE_CB_READ
-                                }
-                                l1_write_addr_in1 += in1_single_tile_size_bytes;
-                                in1_tensor_tile_id += in1_tensor_stride_w;
-                            }
-                            in1_tensor_row_start_tile_id += in1_tensor_stride_h;
-                        }
-                        in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+                        {
+                            // ✅ DISABLED: Measure IN1 (weight) reading - causes buffer overflow
+                            DeviceZoneScopedN("READ-WEIGHT-DRAM-TO-SRAM-IN1-PADDING");
 
-                        // Barrier! make sure the reads are done
-                        noc_async_read_barrier();
+                            // Copy in1 block into CB, as the default kernel
+                            uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
+                            for (uint32_t h = 0; h < in1_block_h; ++h) {
+                                uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
+                                for (uint32_t w = 0; w < in1_block_w; ++w) {
+                                    if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
+#ifndef INTERMEDIATE_CB_READ
+                                        noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
+#else
+                                        noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_helper);
+                                        noc_async_read_barrier();
+                                        memcpy(
+                                            /*dst=*/reinterpret_cast<void*>(l1_write_addr_in1),
+                                            /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
+                                            /*size=*/in1_single_tile_size_bytes);
+#endif  // INTERMEDIATE_CB_READ
+                                    }
+                                    l1_write_addr_in1 += in1_single_tile_size_bytes;
+                                    in1_tensor_tile_id += in1_tensor_stride_w;
+                                }
+                                in1_tensor_row_start_tile_id += in1_tensor_stride_h;
+                            }
+                            in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+                        }
+
+                        {
+                            // ✅ DISABLED: Measure NOC barrier wait time - causes buffer overflow
+                            DeviceZoneScopedN("NOC-BARRIER-WAIT-IN1-PADDING");
+                            // Barrier! make sure the reads are done
+                            noc_async_read_barrier();
+                        }
 #endif  // IN1_SHARDED
 #endif  // IN1_DRAM_SHARDED
 

@@ -7,8 +7,12 @@
 #include "dataflow_api.h"
 #include "hostdevcommon/common_values.hpp"
 #include "ttnn/operations/ccl/kernel_common/worker_sync_utils.hpp"
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-WRITER-IN1-RECEIVER");
     // READER
     uint32_t rt_args_idx = 0;
     // in1 mcast args
@@ -118,8 +122,12 @@ void kernel_main() {
                     // Atomic increment source core counter
                     noc_semaphore_inc(in1_mcast_sender_semaphore_noc_addr, 1);
 
-                    // wait on in1 semaphore value to become VALID (set by mcast sender after it multicasts data)
-                    noc_semaphore_wait(in1_mcast_receiver_semaphore_addr_ptr, VALID);
+                    {
+                        // ✅ DISABLED: Measure NoC multicast wait time - causes buffer overflow
+                        DeviceZoneScopedN("NOC-MCAST-WAIT-PADDING");
+                        // wait on in1 semaphore value to become VALID (set by mcast sender after it multicasts data)
+                        noc_semaphore_wait(in1_mcast_receiver_semaphore_addr_ptr, VALID);
+                    }
 
                     cb_push_back(cb_id_in1, in1_block_num_tiles);
                 }
