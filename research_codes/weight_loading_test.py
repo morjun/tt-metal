@@ -28,8 +28,6 @@ from typing import Optional, Tuple, Dict, List, Any
 import torch
 import ttnn
 
-from models.common.helper_funcs import Linear as TtLinear
-
 
 @dataclass
 class BenchmarkConfig:
@@ -213,6 +211,75 @@ def parse_args() -> BenchmarkConfig:
     )
 
 
+class LinearWrapper:
+    """
+    Lightweight wrapper for linear operations using ttnn.matmul directly.
+    Compatible with both DRAM and L1-sharded weights.
+
+    This replaces TtLinear to avoid compatibility issues with sharded weights.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight: ttnn.Tensor,
+        bias: Optional[ttnn.Tensor] = None,
+        output_mem_config=None,
+    ):
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = weight  # Expected shape: [1, 1, out_features, in_features]
+        self.bias = bias  # Expected shape: [out_features] or [1, 1, 1, out_features]
+        self.output_mem_config = output_mem_config or ttnn.DRAM_MEMORY_CONFIG
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        """
+        Perform linear transformation: y = x @ W^T + b
+
+        Args:
+            x: Input tensor of shape [1, 1, batch_size, in_features]
+
+        Returns:
+            Output tensor of shape [1, 1, batch_size, out_features]
+        """
+        # Weight is [1, 1, out_features, in_features]
+        # Input is [1, 1, batch, in_features]
+        # We need output [1, 1, batch, out_features]
+        #
+        # Formula: output = input @ weight^T
+        # This is  equivalent to: output^T = weight @ input^T
+        #
+        # To avoid transposing the (potentially sharded) weight, we use:
+        # output = (weight @ input^T)^T
+
+        # Transpose input: [1, 1, batch, in_features] -> [1, 1, in_features, batch]
+        x_transposed = ttnn.transpose(x, -2, -1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+        # Perform weight @ input^T: [1, 1, out_features, in_features] @ [1, 1, in_features, batch]
+        # Result: [1, 1, out_features, batch]
+        intermediate = ttnn.matmul(
+            self.weight,
+            x_transposed,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # Transpose result: [1, 1, out_features, batch] -> [1, 1, batch, out_features]
+        output = ttnn.transpose(intermediate, -2, -1, memory_config=self.output_mem_config)
+
+        # Add bias if provided
+        if self.bias is not None:
+            # Ensure bias is broadcastable
+            # If bias is [out_features], reshape to [1, 1, 1, out_features]
+            if len(self.bias.shape) == 1:
+                bias_reshaped = ttnn.reshape(self.bias, (1, 1, 1, self.out_features))
+            else:
+                bias_reshaped = self.bias
+            output = ttnn.add(output, bias_reshaped, memory_config=self.output_mem_config)
+
+        return output
+
+
 def resolve_dtype(dtype_str: str):
     if dtype_str == "bfloat16":
         return ttnn.bfloat16
@@ -242,25 +309,87 @@ def create_weight_memory_config(
     if not enable_sharding:
         return ttnn.DRAM_MEMORY_CONFIG
 
-    # Use WIDTH_SHARDED strategy for weights
-    # Shard across available cores for parallel access
+    # Get available compute grid
     compute_grid_size = device.compute_with_storage_grid_size()
+    total_available_cores = compute_grid_size.x * compute_grid_size.y
 
-    # Use a reasonable number of cores (up to 8x8 = 64 cores for weights)
-    # Weights are [1, 1, out_features, in_features] in 4D
-    max_cores = min(compute_grid_size.x * compute_grid_size.y, 64)
+    print(f"[INFO] Available cores: {compute_grid_size.x}x{compute_grid_size.y} = {total_available_cores}")
+    print(f"[INFO] Weight dimensions: [{out_features}, {in_features}]")
 
-    # For WIDTH_SHARDED: shard the width (in_features) dimension
-    # Each core gets a portion of the input features
-    num_cores_x = min(compute_grid_size.x, 8)
-    num_cores_y = min(max_cores // num_cores_x, compute_grid_size.y, 8)
+    # For WIDTH_SHARDED: each core gets a portion of the width (in_features)
+    # We want to maximize core usage while ensuring weight fits in L1
+
+    # Calculate weight size per element (2 bytes for bfloat16)
+    weight_size_bytes = out_features * in_features * 2
+    bank_size_bytes = 1470080  # ~1.47MB per bank (from error message)
+
+    # Calculate minimum cores needed
+    min_cores_needed = (weight_size_bytes + bank_size_bytes - 1) // bank_size_bytes
+
+    print(f"[INFO] Total weight size: {weight_size_bytes / 1024 / 1024:.2f} MB")
+    print(f"[INFO] Minimum cores needed: {min_cores_needed}")
+
+    # Use all available cores, but ensure it divides in_features evenly for WIDTH sharding
+    # Find the largest grid that:
+    # 1. Fits within available cores
+    # 2. Evenly divides in_features (for WIDTH sharding)
+
+    best_num_cores = 1
+    for num_cores_x in range(1, compute_grid_size.x + 1):
+        for num_cores_y in range(1, compute_grid_size.y + 1):
+            total_cores = num_cores_x * num_cores_y
+            if total_cores <= total_available_cores:
+                # Check if in_features is divisible by total_cores (for WIDTH sharding)
+                if in_features % total_cores == 0:
+                    # Check if shard size fits in L1
+                    shard_size = out_features * (in_features // total_cores) * 2
+                    if shard_size <= bank_size_bytes:
+                        best_num_cores = max(best_num_cores, total_cores)
+
+    # If no perfect division found, use approximation and round up
+    if best_num_cores == 1:
+        # Try to use as many cores as possible even without perfect division
+        for target_cores in range(min_cores_needed, total_available_cores + 1):
+            # Try different grid configurations
+            for num_cores_x in range(1, compute_grid_size.x + 1):
+                if target_cores % num_cores_x == 0:
+                    num_cores_y = target_cores // num_cores_x
+                    if num_cores_y <= compute_grid_size.y:
+                        # Calculate shard width with rounding
+                        shard_width = (in_features + target_cores - 1) // target_cores
+                        shard_width = ((shard_width + 31) // 32) * 32  # Tile align
+                        shard_size = out_features * shard_width * 2
+
+                        if shard_size <= bank_size_bytes:
+                            best_num_cores = target_cores
+                            break
+                if best_num_cores > 1:
+                    break
+            if best_num_cores >= min_cores_needed:
+                break
+
+    # Find grid configuration for best_num_cores
+    num_cores_x = 1
+    num_cores_y = 1
+    for x in range(1, compute_grid_size.x + 1):
+        if best_num_cores % x == 0:
+            y = best_num_cores // x
+            if y <= compute_grid_size.y:
+                num_cores_x = x
+                num_cores_y = y
+
     total_cores = num_cores_x * num_cores_y
 
-    # Calculate shard shape: [out_features, in_features // total_cores]
-    # The shard shape must tile-align (multiple of 32)
+    # Calculate shard shape for WIDTH_SHARDED
     shard_width = (in_features + total_cores - 1) // total_cores
-    shard_width = ((shard_width + 31) // 32) * 32  # Round up to tile boundary
-    shard_height = out_features  # Full output dimension per shard
+    shard_width = ((shard_width + 31) // 32) * 32  # Round up to tile boundary (32)
+    shard_height = out_features
+
+    shard_size_mb = (shard_height * shard_width * 2) / 1024 / 1024
+
+    print(f"[INFO] Using {num_cores_x}x{num_cores_y} = {total_cores} cores")
+    print(f"[INFO] Shard shape per core: [{shard_height}, {shard_width}]")
+    print(f"[INFO] Shard size per core: {shard_size_mb:.2f} MB")
 
     # Create core grid
     core_grid = ttnn.CoreGrid(y=num_cores_y, x=num_cores_x)
@@ -274,6 +403,7 @@ def create_weight_memory_config(
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
+        print(f"[INFO] Successfully created WIDTH_SHARDED L1 memory config")
         return memory_config
     except Exception as e:
         # If sharding fails, fall back to DRAM
@@ -414,7 +544,7 @@ def time_forward(
 
     # Measure kernel compilation time (first execution compiles kernels)
     t_compile_start = time.perf_counter()
-    linear = TtLinear(in_features, out_features, w_tt, b_tt, output_mem_config=ttnn.DRAM_MEMORY_CONFIG)
+    linear = LinearWrapper(in_features, out_features, w_tt, b_tt, output_mem_config=ttnn.DRAM_MEMORY_CONFIG)
     device_synchronize(device)
     t_compile_end = time.perf_counter()
     timings.kernel_compilation_ms = (t_compile_end - t_compile_start) * 1000.0
@@ -530,7 +660,7 @@ def time_minibatch_sequence(
 
     # Measure kernel compilation
     t_compile_start = time.perf_counter()
-    linear = TtLinear(in_features, out_features, w_tt, b_tt, output_mem_config=ttnn.DRAM_MEMORY_CONFIG)
+    linear = LinearWrapper(in_features, out_features, w_tt, b_tt, output_mem_config=ttnn.DRAM_MEMORY_CONFIG)
     device_synchronize(device)
     t_compile_end = time.perf_counter()
     timings.kernel_compilation_ms = (t_compile_end - t_compile_start) * 1000.0
@@ -777,7 +907,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             timings=None,
             enable_weight_sharding=cfg.enable_weight_sharding,
         )
-        pre_linear_large = TtLinear(
+        pre_linear_large = LinearWrapper(
             cfg.in_features, cfg.out_features, pre_w_large, pre_b_large, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
         )
         pre_x_large = make_tt_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 9998, timings=None)
@@ -821,7 +951,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             timings=None,
             enable_weight_sharding=cfg.enable_weight_sharding,
         )
-        pre_linear_small = TtLinear(
+        pre_linear_small = LinearWrapper(
             cfg.in_features, cfg.out_features, pre_w_small, pre_b_small, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
         )
         pre_x_small = make_tt_input(device, cfg.small_batch_size, cfg.in_features, dtype, cfg.seed + 9996, timings=None)
