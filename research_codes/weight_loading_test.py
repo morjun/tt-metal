@@ -46,6 +46,7 @@ class BenchmarkConfig:
     append_csv: bool = False
     only_large: bool = False  # Run only large batch scenario
     only_mini: bool = False  # Run only mini-batch scenario
+    enable_weight_sharding: bool = False  # Enable weight sharding to SRAM (L1)
 
 
 @dataclass
@@ -187,6 +188,11 @@ def parse_args() -> BenchmarkConfig:
         action="store_true",
         help="Run only mini-batch scenario (for device profiling comparison)",
     )
+    parser.add_argument(
+        "--enable-weight-sharding",
+        action="store_true",
+        help="Enable weight sharding to SRAM (L1) for improved performance",
+    )
 
     args = parser.parse_args()
     return BenchmarkConfig(
@@ -203,6 +209,7 @@ def parse_args() -> BenchmarkConfig:
         append_csv=args.append_csv,
         only_large=args.only_large,
         only_mini=args.only_mini,
+        enable_weight_sharding=args.enable_weight_sharding,
     )
 
 
@@ -214,6 +221,67 @@ def resolve_dtype(dtype_str: str):
     raise ValueError(f"Unsupported dtype: {dtype_str}")
 
 
+def create_weight_memory_config(
+    device: ttnn.Device,
+    out_features: int,
+    in_features: int,
+    enable_sharding: bool = False,
+) -> ttnn.MemoryConfig:
+    """
+    Create memory config for weights, optionally using L1 sharding.
+
+    Args:
+        device: Device to check grid size
+        out_features: Output dimension of weight matrix
+        in_features: Input dimension of weight matrix
+        enable_sharding: If True, create sharded L1 config; otherwise use DRAM
+
+    Returns:
+        Memory config for weight tensor
+    """
+    if not enable_sharding:
+        return ttnn.DRAM_MEMORY_CONFIG
+
+    # Use WIDTH_SHARDED strategy for weights
+    # Shard across available cores for parallel access
+    compute_grid_size = device.compute_with_storage_grid_size()
+
+    # Use a reasonable number of cores (up to 8x8 = 64 cores for weights)
+    # Weights are [1, 1, out_features, in_features] in 4D
+    max_cores = min(compute_grid_size.x * compute_grid_size.y, 64)
+
+    # For WIDTH_SHARDED: shard the width (in_features) dimension
+    # Each core gets a portion of the input features
+    num_cores_x = min(compute_grid_size.x, 8)
+    num_cores_y = min(max_cores // num_cores_x, compute_grid_size.y, 8)
+    total_cores = num_cores_x * num_cores_y
+
+    # Calculate shard shape: [out_features, in_features // total_cores]
+    # The shard shape must tile-align (multiple of 32)
+    shard_width = (in_features + total_cores - 1) // total_cores
+    shard_width = ((shard_width + 31) // 32) * 32  # Round up to tile boundary
+    shard_height = out_features  # Full output dimension per shard
+
+    # Create core grid
+    core_grid = ttnn.CoreGrid(y=num_cores_y, x=num_cores_x)
+
+    # Create sharded memory config
+    try:
+        memory_config = ttnn.create_sharded_memory_config(
+            shape=(shard_height, shard_width),
+            core_grid=core_grid,
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        return memory_config
+    except Exception as e:
+        # If sharding fails, fall back to DRAM
+        print(f"[WARN] Failed to create sharded memory config for weights: {e}")
+        print(f"[WARN] Falling back to DRAM_MEMORY_CONFIG")
+        return ttnn.DRAM_MEMORY_CONFIG
+
+
 def make_tt_weight_and_bias(
     device: ttnn.Device,
     in_features: int,
@@ -221,6 +289,7 @@ def make_tt_weight_and_bias(
     dtype,
     seed: int,
     timings: Optional[PhaseTimings] = None,
+    enable_weight_sharding: bool = False,
 ) -> Tuple[ttnn.Tensor, Optional[ttnn.Tensor], Optional[PhaseTimings]]:
     """
     Create weight and bias tensors on device, measuring weight loading time.
@@ -232,14 +301,17 @@ def make_tt_weight_and_bias(
     # Bias optional; include to stress more movement
     b_pt = torch.randn((out_features,), dtype=torch.float32, generator=g)
 
-    # Measure weight loading from Host DRAM to Device GDDR6
+    # Create memory config for weights (DRAM or sharded L1)
+    weight_memory_config = create_weight_memory_config(device, out_features, in_features, enable_weight_sharding)
+
+    # Measure weight loading from Host DRAM to Device memory (DRAM or L1)
     t_weight_load_start = time.perf_counter()
     w_tt = ttnn.from_torch(
         w_pt,
         dtype=dtype,
         layout=ttnn.TILE_LAYOUT,
         device=device,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        memory_config=weight_memory_config,
     )
     device_synchronize(device)
     t_weight_load_end = time.perf_counter()
@@ -248,7 +320,7 @@ def make_tt_weight_and_bias(
     # Ensure expected 4D shape [1, 1, out, in] for helper's assertion (metadata-only)
     w_tt = ttnn.reshape(w_tt, ttnn.Shape([1, 1, out_features, in_features]))
 
-    # Measure bias loading
+    # Measure bias loading (bias typically stays in DRAM as it's small)
     t_bias_load_start = time.perf_counter()
     b_tt = ttnn.from_torch(
         b_pt,
@@ -325,17 +397,20 @@ def time_forward(
     warmup_iters: int,
     measure_iters: int,
     pre_measured_compile_ms: Optional[float] = None,
+    enable_weight_sharding: bool = False,
 ) -> Tuple[PhaseTimings, float, float, float]:
     """
     Measure forward pass with fine-grained timing.
     Returns: (avg_phase_timings, avg_total_ms, avg_weight_load_ms, avg_forward_ms)
     """
-    # Prepare weights once: they persist in device DRAM across all passes
+    # Prepare weights once: they persist in device memory across all passes
     timings = PhaseTimings()
     t_prep_start = time.perf_counter()
 
     # Measure weight loading and sharding
-    w_tt, b_tt, timings = make_tt_weight_and_bias(device, in_features, out_features, dtype, seed, timings)
+    w_tt, b_tt, timings = make_tt_weight_and_bias(
+        device, in_features, out_features, dtype, seed, timings, enable_weight_sharding
+    )
 
     # Measure kernel compilation time (first execution compiles kernels)
     t_compile_start = time.perf_counter()
@@ -441,14 +516,17 @@ def time_minibatch_sequence(
     warmup_iters: int,
     measure_iters: int,
     pre_measured_compile_ms: Optional[float] = None,
+    enable_weight_sharding: bool = False,
 ) -> Tuple[PhaseTimings, float, float, float]:
     """
     Measure minibatch sequence with fine-grained timing.
     Returns: (avg_phase_timings, avg_total_ms, avg_weight_load_ms, avg_forward_ms)
     """
-    # Prepare weights once in device DRAM
+    # Prepare weights once in device memory
     timings = PhaseTimings()
-    w_tt, b_tt, timings = make_tt_weight_and_bias(device, in_features, out_features, dtype, seed, timings)
+    w_tt, b_tt, timings = make_tt_weight_and_bias(
+        device, in_features, out_features, dtype, seed, timings, enable_weight_sharding
+    )
 
     # Measure kernel compilation
     t_compile_start = time.perf_counter()
@@ -614,6 +692,7 @@ def _save_results_to_csv(
         "warmup_iters": cfg.warmup_iters,
         "measure_iters": cfg.measure_iters,
         "seed": cfg.seed,
+        "enable_weight_sharding": cfg.enable_weight_sharding,
         # Timing metrics
         "large_total_ms": f"{large_total_ms:.6f}",
         "mini_total_ms": f"{mini_total_ms:.6f}",
@@ -690,7 +769,13 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
     if not cfg.only_mini:
         # Measure large batch kernel compilation
         pre_w_large, pre_b_large, _ = make_tt_weight_and_bias(
-            device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9999, timings=None
+            device,
+            cfg.in_features,
+            cfg.out_features,
+            dtype,
+            cfg.seed + 9999,
+            timings=None,
+            enable_weight_sharding=cfg.enable_weight_sharding,
         )
         pre_linear_large = TtLinear(
             cfg.in_features, cfg.out_features, pre_w_large, pre_b_large, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
@@ -721,13 +806,20 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             cfg.warmup_iters,
             cfg.measure_iters,
             pre_measured_compile_ms=large_batch_compile_ms,
+            enable_weight_sharding=cfg.enable_weight_sharding,
         )
 
     # Run mini-batch scenario
     if not cfg.only_large:
         # Measure small batch kernel compilation
         pre_w_small, pre_b_small, _ = make_tt_weight_and_bias(
-            device, cfg.in_features, cfg.out_features, dtype, cfg.seed + 9997, timings=None
+            device,
+            cfg.in_features,
+            cfg.out_features,
+            dtype,
+            cfg.seed + 9997,
+            timings=None,
+            enable_weight_sharding=cfg.enable_weight_sharding,
         )
         pre_linear_small = TtLinear(
             cfg.in_features, cfg.out_features, pre_w_small, pre_b_small, output_mem_config=ttnn.DRAM_MEMORY_CONFIG
@@ -760,6 +852,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             cfg.warmup_iters,
             cfg.measure_iters,
             pre_measured_compile_ms=small_batch_compile_ms,
+            enable_weight_sharding=cfg.enable_weight_sharding,
         )
 
     # Overhead assessment
@@ -797,6 +890,7 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
         f"Small batch        : b={cfg.small_batch_size} x {cfg.minibatches} (total={cfg.small_batch_size * cfg.minibatches})"
     )
     print(f"Warmup/Measure     : {cfg.warmup_iters}/{cfg.measure_iters} iters per case")
+    print(f"Weight Sharding    : {'Enabled (L1/SRAM)' if cfg.enable_weight_sharding else 'Disabled (DRAM)'}")
     print("\n-- Single pass: LARGE batch --")
     print(f"Total avg (ms)     : {results.large_total_ms:8.3f}")
     print(f"  Weight load (from host DRAM to device GDDR6 DRAM) (ms) : {results.large_weight_load_ms:8.3f}")
