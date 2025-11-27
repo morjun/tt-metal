@@ -416,14 +416,21 @@ def create_matmul_program_config(
     # Use same grid selection logic as weight memory config
     num_cores_x, num_cores_y = get_optimal_grid_size(device, in_features, out_features)
 
-    # Calculate tiles
-    M_tiles = math.ceil(batch_size / 32)
+    # For matmul(weight, x.T):
+    # M = out_features (4096)
+    # K = in_features (4096)
+    # N = batch_size (32 or 256)
+
+    M_tiles = math.ceil(out_features / 32)
     K_tiles = math.ceil(in_features / 32)
-    N_tiles = math.ceil(out_features / 32)
+    N_tiles = math.ceil(batch_size / 32)
 
     # Calculate per-core work
-    per_core_M = math.ceil(M_tiles / num_cores_y)
-    per_core_N = math.ceil(N_tiles / num_cores_x)
+    # For WIDTH_SHARDED weights (K-sharding), each core has full M but partial K.
+    # So per_core_M must be full M (M_tiles).
+    # We parallelize across K (using the grid).
+    per_core_M = M_tiles
+    per_core_N = math.ceil(N_tiles)
 
     # in0_block_w: how many K tiles to process at once
     # Should divide K_tiles evenly if possible
@@ -447,7 +454,7 @@ def create_matmul_program_config(
         per_core_N=per_core_N,
         fuse_batch=True,  # Required for L1 sharded weights
         fused_activation=None,
-        mcast_in0=True,  # Multicast input activation
+        mcast_in0=False,  # Disable multicast for sharded weights
     )
 
 
@@ -517,7 +524,7 @@ def create_weight_memory_config(
         memory_config = ttnn.create_sharded_memory_config(
             shape=(shard_height, shard_width),
             core_grid=core_grid,
-            strategy=ttnn.ShardStrategy.WIDTH,
+            strategy=ttnn.ShardStrategy.HEIGHT,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
@@ -672,7 +679,7 @@ def time_forward(
         w_tt,
         b_tt,
         output_mem_config=ttnn.DRAM_MEMORY_CONFIG,
-        program_config=program_config,
+        # program_config=program_config,
         enable_optimized_matmul=False,  # Use transpose path for compatibility
     )
     device_synchronize(device)

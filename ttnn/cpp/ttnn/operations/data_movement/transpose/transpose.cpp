@@ -10,6 +10,7 @@
 #include "ttnn/operations/data_movement/permute/device/permute_device_operation.hpp"
 #include "ttnn/operations/data_movement/transpose/transpose.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/util/timer.hpp"
 
 #include <tt-metalium/hal.hpp>
 
@@ -85,6 +86,7 @@ ttnn::Tensor ExecuteTranspose::invoke(
     const int64_t& dim2,
     const std::optional<MemoryConfig>& memory_config_arg,
     const std::optional<float>& pad_value) {
+    ttnn::Timer timer("transpose");
     const auto& input_shape = input_tensor.logical_shape();
     uint32_t normalized_dim1 = input_shape.get_normalized_index(dim1);
     uint32_t normalized_dim2 = input_shape.get_normalized_index(dim2);
