@@ -387,6 +387,7 @@ list(
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/pytensor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/reports.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/tensor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/timer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/types.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/operations/copy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn-${PY_BINDING}/operations/core.cpp

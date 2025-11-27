@@ -13,6 +13,7 @@ from types import ModuleType
 from loguru import logger
 
 import ttnn._ttnn
+from . import timer
 
 
 Config = ttnn._ttnn.core.Config
