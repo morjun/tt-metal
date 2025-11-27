@@ -15,7 +15,7 @@
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/run_operation.hpp"
 #include "ttnn/types.hpp"
-#include "ttnn/util/timer.hpp"
+#include <tt-logger/tt-logger.hpp>
 
 using namespace tt;
 using namespace tt::constants;
@@ -1154,12 +1154,11 @@ inline MatmulProgramConfig get_program_config(
     if (matmul->program_config.has_value()) {
         auto config = matmul->program_config.value();
         if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
-            std::cout << "Matmul Program Config (User): MatmulMultiCoreReuseMultiCast1DProgramConfig" << std::endl;
+            log_debug(tt::LogOp, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCast1DProgramConfig");
         } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-            std::cout << "Matmul Program Config (User): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig"
-                      << std::endl;
+            log_debug(tt::LogOp, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
         } else {
-            std::cout << "Matmul Program Config (User): Other" << std::endl;
+            log_debug(tt::LogOp, "Matmul Program Config (User): Other");
         }
         return config;
     }
@@ -1176,20 +1175,23 @@ inline MatmulProgramConfig get_program_config(
 
     if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
         auto c = std::get<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config);
-        std::cout << "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCast1DProgramConfig" << std::endl;
-        std::cout << "  mcast_in0: " << c.mcast_in0 << std::endl;
-        std::cout << "  gather_in0: " << c.gather_in0 << std::endl;
-        std::cout << "  per_core_M: " << c.per_core_M << std::endl;
-        std::cout << "  per_core_N: " << c.per_core_N << std::endl;
-        std::cout << "  in0_block_w: " << c.in0_block_w << std::endl;
-        std::cout << "  out_subblock_h: " << c.out_subblock_h << std::endl;
-        std::cout << "  out_subblock_w: " << c.out_subblock_w << std::endl;
-        std::cout << "  compute_with_storage_grid_size: " << c.compute_with_storage_grid_size.x << ", "
-                  << c.compute_with_storage_grid_size.y << std::endl;
+        log_debug(tt::LogOp, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCast1DProgramConfig");
+        log_debug(tt::LogOp, "  mcast_in0: {}", c.mcast_in0);
+        log_debug(tt::LogOp, "  gather_in0: {}", c.gather_in0);
+        log_debug(tt::LogOp, "  per_core_M: {}", c.per_core_M);
+        log_debug(tt::LogOp, "  per_core_N: {}", c.per_core_N);
+        log_debug(tt::LogOp, "  in0_block_w: {}", c.in0_block_w);
+        log_debug(tt::LogOp, "  out_subblock_h: {}", c.out_subblock_h);
+        log_debug(tt::LogOp, "  out_subblock_w: {}", c.out_subblock_w);
+        log_debug(
+            tt::LogOp,
+            "  compute_with_storage_grid_size: {}, {}",
+            c.compute_with_storage_grid_size.x,
+            c.compute_with_storage_grid_size.y);
     } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-        std::cout << "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig" << std::endl;
+        log_debug(tt::LogOp, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
     } else {
-        std::cout << "Matmul Program Config (Auto): Other" << std::endl;
+        log_debug(tt::LogOp, "Matmul Program Config (Auto): Other");
     }
 
     log_debug(tt::LogOp, "Auto generated program config: {}", config);
@@ -1493,15 +1495,12 @@ Tensor matmul(
         optional_input_tensors.push_back(std::nullopt);
     }
 
-    ttnn::Timer timer("matmul");
-    auto output = operation::run(
-                      create_matmul_struct(input_tensor_a, input_tensor_b, parameters, {optional_output_tensor}),
-                      {input_tensor_a, input_tensor_b},
-                      optional_input_tensors,
-                      {optional_output_tensor})
-                      .at(0);
-    timer.stop();
-    return output;
+    return operation::run(
+               create_matmul_struct(input_tensor_a, input_tensor_b, parameters, {optional_output_tensor}),
+               {input_tensor_a, input_tensor_b},
+               optional_input_tensors,
+               {optional_output_tensor})
+        .at(0);
 }
 
 std::vector<Tensor> matmul_batched_weights(

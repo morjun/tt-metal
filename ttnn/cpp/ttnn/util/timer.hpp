@@ -2,7 +2,7 @@
 
 #include <chrono>
 #include <string>
-#include <iostream>
+#include <tt-logger/tt-logger.hpp>
 
 namespace ttnn {
 
@@ -18,7 +18,7 @@ public:
         }
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start_).count();
-        std::cout << "[Timer] " << name_ << ": " << duration << " us" << std::endl;
+        log_info(tt::LogOp, "[Timer] {}: {} us", name_, duration);
         stopped_ = true;
     }
 

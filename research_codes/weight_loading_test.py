@@ -55,8 +55,14 @@ class PhaseTimings:
     """
 
     kernel_compilation_ms: float = 0.0  # Time to compile kernels (one-time cost, amortized)
+    # Not able to measure in C++ level yet.
+
     weight_load_host_to_gddr6_ms: float = 0.0  # Time to transfer weights from Host DRAM to Device GDDR6
+    # Not able to measure in C++ level yet.
+
     forward_compute_ms: float = 0.0  # Total forward pass time (includes compute, weight streaming, communication)
+    # Not able to measure in C++ level yet.
+
     pure_matmul_compute_ms: float = 0.0  # New field for pure matmul time
     total_ms: float = 0.0  # Total time including all phases
 
@@ -285,7 +291,6 @@ class LinearWrapper:
         # Transpose input: [1, 1, batch, in_features] -> [1, 1, in_features, batch]
         t0 = time.perf_counter()
         x_transposed = ttnn.transpose(x, -2, -1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.synchronize_device(device)
         t1 = time.perf_counter()
         self.last_transpose_time += (t1 - t0) * 1000.0
 
@@ -301,7 +306,6 @@ class LinearWrapper:
         # Transpose result: [1, 1, out_features, batch] -> [1, 1, batch, out_features]
         t2 = time.perf_counter()
         output = ttnn.transpose(intermediate, -2, -1, memory_config=self.output_mem_config)
-        ttnn.synchronize_device(device)
         t3 = time.perf_counter()
         self.last_transpose_time += (t3 - t2) * 1000.0
 
@@ -341,7 +345,7 @@ def get_optimal_grid_size(device: ttnn.Device, in_features: int, out_features: i
 
     # Find the largest grid that:
     # 1. Fits within available cores
-    # 2. Evenly divides in_features (for WIDTH sharding)
+    # 2. Evenly divides out_features (for HEIGHT sharding)
     # 3. Shard size fits in L1
     best_num_cores = 1
     for num_cores_x in range(1, compute_grid_size.x + 1):
@@ -352,7 +356,7 @@ def get_optimal_grid_size(device: ttnn.Device, in_features: int, out_features: i
                 if out_features % total_cores == 0:
                     # Check if shard size fits in L1
                     # Shard shape: [out_features / cores, in_features]
-                    shard_size = (out_features // total_cores) * in_features * 2
+                    shard_size = (out_features // total_cores) * in_features * 2  # What is 2 for
                     if shard_size <= bank_size_bytes:
                         best_num_cores = max(best_num_cores, total_cores)
 
@@ -377,6 +381,7 @@ def get_optimal_grid_size(device: ttnn.Device, in_features: int, out_features: i
                 break
 
     # Find grid configuration for best_num_cores
+    # 64 -> 8x8
     num_cores_x = 1
     num_cores_y = 1
     for x in range(1, compute_grid_size.x + 1):
@@ -466,7 +471,7 @@ def create_weight_memory_config(
     print(f"[INFO] Using HEIGHT_SHARDED L1 with grid: {num_cores_x}x{num_cores_y}")
 
     # Calculate shard shape for HEIGHT_SHARDED
-    shard_height = (out_features + total_cores - 1) // total_cores
+    shard_height = (out_features + total_cores - 1) // total_cores  # Ceiling division
     shard_height = ((shard_height + 31) // 32) * 32  # Round up to tile boundary (32)
     shard_width = in_features
 
@@ -528,7 +533,6 @@ def make_tt_weight_and_bias(
         device=device,
         memory_config=weight_memory_config,
     )
-    device_synchronize(device)
     t_weight_load_end = time.perf_counter()
     weight_load_time = (t_weight_load_end - t_weight_load_start) * 1000.0
 
@@ -544,7 +548,6 @@ def make_tt_weight_and_bias(
         device=device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
-    device_synchronize(device)
     t_bias_load_end = time.perf_counter()
     bias_load_time = (t_bias_load_end - t_bias_load_start) * 1000.0
 
@@ -578,7 +581,6 @@ def make_tt_input(
     )
 
     if timings is not None:
-        device_synchronize(device)
         t_load_end = time.perf_counter()
         timings.weight_load_host_to_gddr6_ms += (t_load_end - t_load_start) * 1000.0
 
@@ -588,18 +590,6 @@ def make_tt_input(
 def make_staged_input(device: ttnn.Device, total_batch_size: int, in_features: int, dtype, seed: int) -> ttnn.Tensor:
     """Create a single large input tensor on device DRAM to be sliced per minibatch."""
     return make_tt_input(device, total_batch_size, in_features, dtype, seed)
-
-
-def device_synchronize(device: ttnn.Device):
-    # Best-effort sync to ensure timing accuracy; core ops enqueue work
-    try:
-        ttnn.synchronize_device(device)
-    except Exception:
-        # Fallback: some builds expose this under ttnn.device
-        try:
-            device.synchronize()
-        except Exception:
-            pass
 
 
 def time_forward(
@@ -642,7 +632,6 @@ def time_forward(
         # program_config=program_config,
         enable_optimized_matmul=False,  # Use transpose path for compatibility
     )
-    device_synchronize(device)
     t_compile_end = time.perf_counter()
     timings.kernel_compilation_ms = (t_compile_end - t_compile_start) * 1000.0
 
@@ -654,12 +643,10 @@ def time_forward(
         timings.kernel_compilation_ms = pre_measured_compile_ms
         print(f"[PROFILE] Warmup forward 0 (kernel already compiled)")
         _ = linear(x_tt)
-        device_synchronize(device)
     else:
         t_warmup_compile_start = time.perf_counter()
         print(f"[PROFILE] Warmup forward 0 (compiling kernels)")
         _ = linear(x_tt)
-        device_synchronize(device)
         t_warmup_compile_end = time.perf_counter()
         if timings.kernel_compilation_ms < 1.0:
             timings.kernel_compilation_ms = (t_warmup_compile_end - t_warmup_compile_start) * 1000.0
@@ -668,7 +655,6 @@ def time_forward(
     for i in range(1, warmup_iters):
         print(f"[PROFILE] Warmup forward {i}")
         _ = linear(x_tt)
-        device_synchronize(device)
 
     # Measure with fine-grained timing
     phase_timings_list = []
@@ -694,7 +680,6 @@ def time_forward(
         t_f0 = time.perf_counter()
         print(f"[PROFILE] Measurement forward {iter_idx}")
         _ = linear(x_tt)
-        device_synchronize(device)
         t_f1 = time.perf_counter()
         fwd_ms = (t_f1 - t_f0) * 1000.0
 
@@ -782,7 +767,6 @@ def time_minibatch_sequence(
         program_config=program_config,
         enable_optimized_matmul=False,  # Use transpose path for compatibility
     )
-    device_synchronize(device)
     t_compile_end = time.perf_counter()
     timings.kernel_compilation_ms = (t_compile_end - t_compile_start) * 1000.0
 
@@ -817,7 +801,6 @@ def time_minibatch_sequence(
             # (all happen during kernel execution, measured as total forward time)
             t_f0 = time.perf_counter()
             _ = linear(x_slice)
-            device_synchronize(device)
             fwd_ms = (time.perf_counter() - t_f0) * 1000.0
             seq_fwd_ms += fwd_ms
             seq_transpose_ms += linear.last_transpose_time
@@ -869,17 +852,14 @@ def time_minibatch_sequence(
     )  # Don't track timing here
 
     # Ensure any tensor creation overhead is complete before measuring compilation
-    device_synchronize(device)
 
     # Use pre-measured compile time if provided; otherwise measure once
     if pre_measured_compile_ms is not None:
         timings.kernel_compilation_ms = pre_measured_compile_ms
         _ = linear(dummy_input_tt)
-        device_synchronize(device)
     else:
         t_warmup_compile_start = time.perf_counter()
         _ = linear(dummy_input_tt)
-        device_synchronize(device)
         t_warmup_compile_end = time.perf_counter()
         if timings.kernel_compilation_ms < 1.0:
             timings.kernel_compilation_ms = (t_warmup_compile_end - t_warmup_compile_start) * 1000.0
@@ -1053,7 +1033,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         pre_x_large = make_tt_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 9998, timings=None)
         t_compile_large_start = time.perf_counter()
         _ = pre_linear_large(pre_x_large)
-        device_synchronize(device)
         t_compile_large_end = time.perf_counter()
         large_batch_compile_ms = (t_compile_large_end - t_compile_large_start) * 1000.0
 
@@ -1062,7 +1041,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         pre_w_large.deallocate()
         if pre_b_large is not None:
             pre_b_large.deallocate()
-        device_synchronize(device)
         time.sleep(0.05)
 
         # Run large batch benchmark
@@ -1107,7 +1085,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         pre_x_small = make_tt_input(device, cfg.small_batch_size, cfg.in_features, dtype, cfg.seed + 9996, timings=None)
         t_compile_small_start = time.perf_counter()
         _ = pre_linear_small(pre_x_small)
-        device_synchronize(device)
         t_compile_small_end = time.perf_counter()
         small_batch_compile_ms = (t_compile_small_end - t_compile_small_start) * 1000.0
 
@@ -1116,7 +1093,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         pre_w_small.deallocate()
         if pre_b_small is not None:
             pre_b_small.deallocate()
-        device_synchronize(device)
         time.sleep(0.1)
 
         # Run mini-batch benchmark

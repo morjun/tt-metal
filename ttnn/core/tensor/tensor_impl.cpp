@@ -27,6 +27,7 @@
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/distributed/api.hpp"
+#include "ttnn/util/timer.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -685,6 +686,7 @@ Tensor to_device(
     distributed::MeshDevice* mesh_device,
     ttsl::optional_reference<const MemoryConfig> memory_config,
     std::optional<tt::tt_metal::QueueId> cq_id) {
+    ttnn::Timer timer("to_device");
     if (tensor.storage_type() == StorageType::DEVICE) {
         return tensor;  // Tensor already on device
     }
@@ -702,6 +704,7 @@ Tensor to_device(
     auto mesh_buffer = allocate_device_buffer(mesh_device, *tensor_spec);
     auto [mesh_storage, topology] = to_device_mesh_buffer<T>(
         tensor.storage(), mesh_buffer, *tensor_spec, *tensor.tensor_attributes, tensor.tensor_topology(), cq_id);
+    tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
     return Tensor(std::move(mesh_storage), *tensor_spec, topology);
 }
 
