@@ -516,7 +516,7 @@ def make_tt_weight_and_bias(
     seed: int,
     timings: Optional[PhaseTimings] = None,
     enable_weight_sharding: bool = False,
-) -> Tuple[ttnn.Tensor, Optional[ttnn.Tensor], Optional[PhaseTimings]]:
+) -> Tuple[ttnn.Tensor, Optional[ttnn.Tensor], float]:
     """
     Create weight and bias tensors on device, measuring weight loading time.
     Returns: (weight_tensor, bias_tensor, updated_timings)
@@ -529,6 +529,9 @@ def make_tt_weight_and_bias(
 
     # Create memory config for weights (DRAM or sharded L1)
     weight_memory_config = create_weight_memory_config(device, out_features, in_features, enable_weight_sharding)
+
+    # Reset timers to capture only weight loading time
+    ttnn.timer.reset_all()
 
     w_tt = ttnn.from_torch(
         w_pt,
@@ -549,11 +552,10 @@ def make_tt_weight_and_bias(
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
 
-    # The timings for weight/bias loading will now be captured by the C++ timers
-    # and aggregated in run_benchmark.
-    # So, we don't need to update `timings` here directly.
+    # Capture weight loading time from C++ timer
+    weight_load_time = ttnn.timer.get_duration("to_device") / 1000.0
 
-    return w_tt, b_tt, timings
+    return w_tt, b_tt, weight_load_time
 
 
 def make_tt_input(
@@ -604,7 +606,7 @@ def time_forward(
     timings = PhaseTimings()
 
     # Measure weight loading and sharding
-    w_tt, b_tt, _ = make_tt_weight_and_bias(
+    w_tt, b_tt, initial_weight_load_ms = make_tt_weight_and_bias(
         device, in_features, out_features, dtype, seed, timings, enable_weight_sharding
     )
 
@@ -649,7 +651,6 @@ def time_forward(
     # One-time costs that should be included in total time and weight load time
     # These will be captured by C++ timers.
     initial_kernel_compilation_ms = 0.0  # Will be set by C++ timer
-    initial_weight_load_ms = 0.0  # Will be set by C++ timer
 
     for iter_idx in range(measure_iters):
         iter_timings = PhaseTimings()
@@ -718,9 +719,11 @@ def time_forward(
 
     # Average phase timings
     avg_phase_timings = PhaseTimings.average_list(phase_timings_list)
+    # Override write_tensor_time to show the actual one-time load cost, not amortized
+    avg_phase_timings.write_tensor_time = initial_weight_load_ms
 
     avg_total = sum(total_times) / len(total_times)
-    avg_w = sum(weight_load_times) / len(weight_load_times) if weight_load_times else 0.0
+    avg_w = initial_weight_load_ms  # Report the one-time cost
     avg_f = sum(fwd_times) / len(fwd_times) if fwd_times else 0.0
     return avg_phase_timings, avg_total, avg_w, avg_f
 
@@ -745,7 +748,7 @@ def time_minibatch_sequence(
     """
     # Prepare weights once in device memory
     timings = PhaseTimings()
-    w_tt, b_tt, _ = make_tt_weight_and_bias(
+    w_tt, b_tt, initial_weight_load_ms = make_tt_weight_and_bias(
         device, in_features, out_features, dtype, seed, timings, enable_weight_sharding
     )
 
@@ -769,7 +772,6 @@ def time_minibatch_sequence(
 
     # One-time costs that should be included in total time and weight load time
     initial_kernel_compilation_ms = timings.compile_time
-    initial_weight_load_ms = 0.0  # Will be set by C++ timers.
 
     def run_one_sequence(sequence_idx: int, include_one_time_costs: bool) -> Tuple[PhaseTimings, float, float, float]:
         seq_timings = PhaseTimings()
@@ -899,9 +901,11 @@ def time_minibatch_sequence(
 
     # Average phase timings
     avg_phase_timings = PhaseTimings.average_list(phase_timings_list)
+    # Override write_tensor_time to show the actual one-time load cost
+    avg_phase_timings.write_tensor_time = initial_weight_load_ms
 
     avg_total = sum(totals) / len(totals)
-    avg_weight_load = sum(weight_loads) / len(weight_loads)
+    avg_weight_load = initial_weight_load_ms
     avg_fwd = sum(fwds) / len(fwds)
     return avg_phase_timings, avg_total, avg_weight_load, avg_fwd
 
@@ -1122,38 +1126,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             pre_measured_compile_ms=small_batch_compile_ms,
             enable_weight_sharding=cfg.enable_weight_sharding,
         )
-        # Wait for all operations to complete
-        ttnn.synchronize_device(device)
-
-        # Get durations from C++ timers
-        compile_time = ttnn.timer.get_duration("compile_and_cache_program") / 1000.0
-        write_tensor_time = ttnn.timer.get_duration("to_device") / 1000.0
-        run_program_time = ttnn.timer.get_duration("matmul") / 1000.0  # Using matmul as main compute
-
-        # Calculate overheads (assuming these are the main components)
-        # Note: This is an approximation as we don't have exact "overhead" timers in C++ yet
-        # We use the measured times directly.
-        compile_overhead = 0  # Implicit in compile_time
-        write_tensor_overhead = 0  # Implicit in write_tensor_time
-        run_program_overhead = 0  # Implicit in run_program_time
-
-        phase_timing = PhaseTimings(
-            compile_time=compile_time,
-            write_tensor_time=write_tensor_time,
-            run_program_time=run_program_time,
-            pure_matmul_time=run_program_time,  # Assuming pure matmul is dominant
-            compile_overhead=compile_overhead,
-            write_tensor_overhead=write_tensor_overhead,
-            run_program_overhead=run_program_overhead,
-            total=compile_time + write_tensor_time + run_program_time,
-        )
-        # The above `phase_timing` is likely intended to replace `mini_phase_timings`
-        # and the other `mini_` variables should be derived from it.
-        # Assuming `run_program_time` is the forward compute time for mini-batches.
-        mini_phase_timings = phase_timing
-        mini_total = compile_time + write_tensor_time + run_program_time  # Sum of measured C++ times
-        mini_w = write_tensor_time  # Assuming this maps to weight load
-        mini_f = run_program_time  # Assuming this maps to forward compute
 
     # Overhead assessment
     overhead = mini_f - large_f
