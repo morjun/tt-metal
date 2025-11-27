@@ -14,6 +14,7 @@
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
 #include "ttnn/operations/creation.hpp"
+#include <tt-logger/tt-logger.hpp>
 
 namespace ttnn {
 
@@ -237,9 +238,9 @@ Tensor MatmulOperation::invoke(
             : false;
 
     if (program_config.has_value()) {
-        std::cout << "MatmulOperation::invoke: program_config has value" << std::endl;
+        log_debug(tt::LogOp, "MatmulOperation::invoke: program_config has value");
     } else {
-        std::cout << "MatmulOperation::invoke: program_config is nullopt" << std::endl;
+        log_debug(tt::LogOp, "MatmulOperation::invoke: program_config is nullopt");
     }
 
     auto output = bound_matmul(

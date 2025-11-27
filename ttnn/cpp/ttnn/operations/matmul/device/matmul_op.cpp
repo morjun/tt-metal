@@ -129,14 +129,14 @@ operation::OpPerformanceModel create_op_performance_model_for_matmul(
 
     operation::OpPerformanceModel result(input_tensors, output_tensors, ideal_dev_clock_cycles);
 #if 0
-    log_info(tt::LogOp, "Matmul PerfModel:");
+    log_debug(tt::LogOp, "Matmul PerfModel:");
     for (auto i = 0; i < out_shape.rank() - 2; i++) {
-        log_info(tt::LogOp, "\t Batch Values: (Index: {}, Value: {})", i, out_shape[i]);
+        log_debug(tt::LogOp, "\t Batch Values: (Index: {}, Value: {})", i, out_shape[i]);
     }
-    log_info(tt::LogOp, "\t In A (H, W): ({}, {})", in_a_shape[-2], in_a_shape[-1]);
-    log_info(tt::LogOp, "\t In B (H, W): ({}, {})", in_b_shape[-2], in_b_shape[-1]);
-    log_info(tt::LogOp, "\t Out (H, W): ({}, {})", out_shape[-2], out_shape[-1]);
-    log_info(tt::LogOp, "\t ideal_dev_clock_cycles: {}", ideal_dev_clock_cycles);
+    log_debug(tt::LogOp, "\t In A (H, W): ({}, {})", in_a_shape[-2], in_a_shape[-1]);
+    log_debug(tt::LogOp, "\t In B (H, W): ({}, {})", in_b_shape[-2], in_b_shape[-1]);
+    log_debug(tt::LogOp, "\t Out (H, W): ({}, {})", out_shape[-2], out_shape[-1]);
+    log_debug(tt::LogOp, "\t ideal_dev_clock_cycles: {}", ideal_dev_clock_cycles);
 #endif
     return result;
 }
@@ -1154,11 +1154,12 @@ inline MatmulProgramConfig get_program_config(
     if (matmul->program_config.has_value()) {
         auto config = matmul->program_config.value();
         if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
-            log_debug(tt::LogOp, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCast1DProgramConfig");
+            log_debug(tt::LogMetal, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCast1DProgramConfig");
         } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-            log_debug(tt::LogOp, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
+            log_debug(
+                tt::LogMetal, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
         } else {
-            log_debug(tt::LogOp, "Matmul Program Config (User): Other");
+            log_debug(tt::LogMetal, "Matmul Program Config (User): Other");
         }
         return config;
     }
@@ -1175,26 +1176,26 @@ inline MatmulProgramConfig get_program_config(
 
     if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
         auto c = std::get<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config);
-        log_debug(tt::LogOp, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCast1DProgramConfig");
-        log_debug(tt::LogOp, "  mcast_in0: {}", c.mcast_in0);
-        log_debug(tt::LogOp, "  gather_in0: {}", c.gather_in0);
-        log_debug(tt::LogOp, "  per_core_M: {}", c.per_core_M);
-        log_debug(tt::LogOp, "  per_core_N: {}", c.per_core_N);
-        log_debug(tt::LogOp, "  in0_block_w: {}", c.in0_block_w);
-        log_debug(tt::LogOp, "  out_subblock_h: {}", c.out_subblock_h);
-        log_debug(tt::LogOp, "  out_subblock_w: {}", c.out_subblock_w);
+        log_debug(tt::LogMetal, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCast1DProgramConfig");
+        log_debug(tt::LogMetal, "  mcast_in0: {}", c.mcast_in0);
+        log_debug(tt::LogMetal, "  gather_in0: {}", c.gather_in0);
+        log_debug(tt::LogMetal, "  per_core_M: {}", c.per_core_M);
+        log_debug(tt::LogMetal, "  per_core_N: {}", c.per_core_N);
+        log_debug(tt::LogMetal, "  in0_block_w: {}", c.in0_block_w);
+        log_debug(tt::LogMetal, "  out_subblock_h: {}", c.out_subblock_h);
+        log_debug(tt::LogMetal, "  out_subblock_w: {}", c.out_subblock_w);
         log_debug(
-            tt::LogOp,
+            tt::LogMetal,
             "  compute_with_storage_grid_size: {}, {}",
             c.compute_with_storage_grid_size.x,
             c.compute_with_storage_grid_size.y);
     } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-        log_debug(tt::LogOp, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
+        log_debug(tt::LogMetal, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
     } else {
-        log_debug(tt::LogOp, "Matmul Program Config (Auto): Other");
+        log_debug(tt::LogMetal, "Matmul Program Config (Auto): Other");
     }
 
-    log_debug(tt::LogOp, "Auto generated program config: {}", config);
+    log_debug(tt::LogMetal, "Auto generated program config: {}", config);
 
     // Sanity checks for matmul program configs
     std::visit(
