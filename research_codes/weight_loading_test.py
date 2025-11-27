@@ -55,14 +55,12 @@ class PhaseTimings:
     """
 
     compile_time: float = 0.0  # Time to compile kernels (one-time cost)
-    write_tensor_time: float = 0.0  # Time to transfer weights from Host to Device
-    run_program_time: float = 0.0  # Total forward pass time
+    forward_pass_time: float = 0.0  # Total forward pass time
     pure_matmul_time: float = 0.0  # Pure matmul time (excluding transpose/add)
 
     # Overhead metrics (optional, for detailed analysis)
     compile_overhead: float = 0.0
-    write_tensor_overhead: float = 0.0
-    run_program_overhead: float = 0.0
+    forward_pass_overhead: float = 0.0
 
     total: float = 0.0  # Total time including all phases
 
@@ -70,12 +68,10 @@ class PhaseTimings:
         """Convert to dictionary for CSV export."""
         return {
             "compile_time": self.compile_time,
-            "write_tensor_time": self.write_tensor_time,
-            "run_program_time": self.run_program_time,
+            "forward_pass_time": self.forward_pass_time,
             "pure_matmul_time": self.pure_matmul_time,
             "compile_overhead": self.compile_overhead,
-            "write_tensor_overhead": self.write_tensor_overhead,
-            "run_program_overhead": self.run_program_overhead,
+            "forward_pass_overhead": self.forward_pass_overhead,
             "total": self.total,
         }
 
@@ -83,12 +79,10 @@ class PhaseTimings:
         """Create average of two PhaseTimings."""
         return PhaseTimings(
             compile_time=(self.compile_time + other.compile_time) / 2.0,
-            write_tensor_time=(self.write_tensor_time + other.write_tensor_time) / 2.0,
-            run_program_time=(self.run_program_time + other.run_program_time) / 2.0,
+            forward_pass_time=(self.forward_pass_time + other.forward_pass_time) / 2.0,
             pure_matmul_time=(self.pure_matmul_time + other.pure_matmul_time) / 2.0,
             compile_overhead=(self.compile_overhead + other.compile_overhead) / 2.0,
-            write_tensor_overhead=(self.write_tensor_overhead + other.write_tensor_overhead) / 2.0,
-            run_program_overhead=(self.run_program_overhead + other.run_program_overhead) / 2.0,
+            forward_pass_overhead=(self.forward_pass_overhead + other.forward_pass_overhead) / 2.0,
             total=(self.total + other.total) / 2.0,
         )
 
@@ -100,12 +94,10 @@ class PhaseTimings:
         n = len(timings_list)
         return cls(
             compile_time=sum(t.compile_time for t in timings_list) / n,
-            write_tensor_time=sum(t.write_tensor_time for t in timings_list) / n,
-            run_program_time=sum(t.run_program_time for t in timings_list) / n,
+            forward_pass_time=sum(t.forward_pass_time for t in timings_list) / n,
             pure_matmul_time=sum(t.pure_matmul_time for t in timings_list) / n,
             compile_overhead=sum(t.compile_overhead for t in timings_list) / n,
-            write_tensor_overhead=sum(t.write_tensor_overhead for t in timings_list) / n,
-            run_program_overhead=sum(t.run_program_overhead for t in timings_list) / n,
+            forward_pass_overhead=sum(t.forward_pass_overhead for t in timings_list) / n,
             total=sum(t.total for t in timings_list) / n,
         )
 
@@ -645,7 +637,6 @@ def time_forward(
     # Measure with fine-grained timing
     phase_timings_list = []
     total_times = []
-    weight_load_times = []
     fwd_times = []
 
     # One-time costs that should be included in total time and weight load time
@@ -655,14 +646,6 @@ def time_forward(
     for iter_idx in range(measure_iters):
         iter_timings = PhaseTimings()
         ttnn.timer.reset_all()
-
-        # For the first iteration, include initial weight loading time
-        # For subsequent iterations, weight is already loaded (no additional cost)
-        if iter_idx == 0:
-            # These will be captured by C++ timers.
-            weight_ms = 0.0
-        else:
-            weight_ms = 0.0  # No host->device reload for subsequent passes
 
         # Forward pass - measure compute time
         print(f"[PROFILE] Measurement forward {iter_idx}")
@@ -693,34 +676,29 @@ def time_forward(
         )
 
         fwd_times.append(fwd_ms)
-        iter_timings.run_program_time = fwd_ms
+        iter_timings.forward_pass_time = fwd_ms
         iter_timings.pure_matmul_time = pure_matmul_ms
 
         # Set phase timings for this iteration
         # For first iteration, include one-time costs; for others, only forward pass
         if iter_idx == 0:
             iter_timings.compile_time = initial_kernel_compilation_ms
-            iter_timings.write_tensor_time = initial_weight_load_ms
         else:
             iter_timings.compile_time = 0.0  # Already compiled
-            iter_timings.write_tensor_time = 0.0  # Already loaded
 
         # Total time excludes kernel compilation
-        if iter_idx == 0:
-            total = initial_weight_load_ms + fwd_ms
-        else:
-            total = fwd_ms
+        # if iter_idx == 0:
+        #     total = initial_weight_load_ms + fwd_ms
+        # else:
+        total = fwd_ms
 
         iter_timings.total = total
 
         total_times.append(total)
-        weight_load_times.append(weight_ms)
         phase_timings_list.append(iter_timings)
 
     # Average phase timings
     avg_phase_timings = PhaseTimings.average_list(phase_timings_list)
-    # Override write_tensor_time to show the actual one-time load cost, not amortized
-    avg_phase_timings.write_tensor_time = initial_weight_load_ms
 
     avg_total = sum(total_times) / len(total_times)
     avg_w = initial_weight_load_ms  # Report the one-time cost
@@ -773,7 +751,9 @@ def time_minibatch_sequence(
     # One-time costs that should be included in total time and weight load time
     initial_kernel_compilation_ms = timings.compile_time
 
-    def run_one_sequence(sequence_idx: int, include_one_time_costs: bool) -> Tuple[PhaseTimings, float, float, float]:
+    def run_one_sequence(
+        sequence_idx: int, include_one_time_costs: bool
+    ) -> Tuple[PhaseTimings, float, float, float, float]:
         seq_timings = PhaseTimings()
         seq_fwd_ms = 0.0
         seq_transpose_ms = 0.0
@@ -820,20 +800,14 @@ def time_minibatch_sequence(
         # Set phase timings
         if include_one_time_costs:
             seq_timings.compile_time = initial_kernel_compilation_ms
-            seq_timings.write_tensor_time = initial_weight_load_ms
-        # Set phase timings
-        if include_one_time_costs:
-            seq_timings.compile_time = initial_kernel_compilation_ms
-            seq_timings.write_tensor_time = initial_weight_load_ms
             # Total time excludes kernel compilation and sharding
             seq_total = initial_weight_load_ms + seq_fwd_ms
         else:
             seq_timings.compile_time = 0.0  # Already compiled
-            seq_timings.write_tensor_time = 0.0  # Already loaded
             # Total time excludes sharding
             seq_total = seq_fwd_ms
 
-        seq_timings.run_program_time = seq_fwd_ms
+        seq_timings.forward_pass_time = seq_fwd_ms
         seq_timings.total = seq_total
         seq_timings.pure_matmul_time = seq_pure_matmul_ms
 
@@ -891,7 +865,8 @@ def time_minibatch_sequence(
     fwds = []
     pure_matmul_ms = []
     for seq_idx in range(measure_iters):
-        include_one_time = seq_idx == 0  # Include one-time costs only for first sequence
+        # include_one_time = seq_idx == 0  # Include one-time costs only for first sequence
+        include_one_time = False
         ttnn.timer.reset_all()
         seq_timings, total, weight_load_ms, fwd_ms, pure_matmul_ms = run_one_sequence(seq_idx, include_one_time)
         totals.append(total)
@@ -901,8 +876,6 @@ def time_minibatch_sequence(
 
     # Average phase timings
     avg_phase_timings = PhaseTimings.average_list(phase_timings_list)
-    # Override write_tensor_time to show the actual one-time load cost
-    avg_phase_timings.write_tensor_time = initial_weight_load_ms
 
     avg_total = sum(totals) / len(totals)
     avg_weight_load = initial_weight_load_ms
@@ -955,11 +928,14 @@ def _save_results_to_csv(
         "overhead": f"{overhead:.6f}",
         "overhead_percentage": f"{(overhead / large_f * 100):.2f}" if large_f > 0 else "0.00",
         # Fine-grained phase timings for large batch
-        "large_write_tensor_time": f"{large_timings_dict['write_tensor_time']:.6f}",
-        "large_run_program_time": f"{large_timings_dict['run_program_time']:.6f}",
+        "large_forward_pass_time": f"{large_timings_dict['forward_pass_time']:.6f}",
+        "large_pure_matmul_time": f"{large_timings_dict['pure_matmul_time']:.6f}",
         # Fine-grained phase timings for minibatch
-        "mini_write_tensor_time": f"{mini_timings_dict['write_tensor_time']:.6f}",
-        "mini_run_program_time": f"{mini_timings_dict['run_program_time']:.6f}",
+        "mini_forward_pass_time": f"{mini_timings_dict['forward_pass_time']:.6f}",
+        "mini_pure_matmul_time": f"{mini_timings_dict['pure_matmul_time']:.6f}",
+        # Pure Matmul Overhead
+        "pure_matmul_overhead": f"{(mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']):.6f}",
+        "pure_matmul_overhead_percentage": f"{((mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']) / large_timings_dict['pure_matmul_time']) * 100:.2f}",
     }
 
     # Field names (column headers)
@@ -1111,7 +1087,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         time.sleep(0.1)
 
         # Run mini-batch benchmark
-        # Run mini-batch benchmark
         mini_phase_timings, mini_total, mini_w, mini_f = time_minibatch_sequence(
             device,
             cfg.in_features,
@@ -1173,30 +1148,28 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
 
     print(f"\n-- Single pass: LARGE batch --")
     print(f"Total avg (ms)     : {results.large_total:.3f}")
-    print(
-        f"  Weight load (from host DRAM to device GDDR6 DRAM) (ms) : {results.large_phase_timings.write_tensor_time:.3f}"
-    )
-    print(f"  Forward (ms)     : {results.large_phase_timings.run_program_time:.3f}")
+    print(f"  Weight load (from host DRAM to device GDDR6 DRAM) (ms) : {results.large_weight_load:.3f}")
+    print(f"  Forward (ms)     : {results.large_phase_timings.forward_pass_time:.3f}")
 
     # We need to capture the pure matmul time from the return values of time_forward/time_minibatch
     # But those functions return (time, timings), and timings is aggregated.
     # Let's assume the user wants to see the breakdown in the console output.
 
     print(f"\n  Fine-grained phase breakdown (average per iteration):")
-    print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.large_phase_timings.write_tensor_time:.3f}")
-    print(f"    Forward compute (ms)                     : {results.large_phase_timings.run_program_time:.3f}")
+    print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.large_weight_load:.3f}")
+    print(f"    Forward compute (ms)                     : {results.large_phase_timings.forward_pass_time:.3f}")
     print(f"    Pure Matmul (ms)                         : {results.large_phase_timings.pure_matmul_time:.3f}")
 
     print(f"\n-- Repeated passes: SMALL minibatch (same weights on device) --")
     print(f"Sequence total (ms) for {cfg.minibatches} passes : {results.mini_total:.3f}")
     print(
-        f"  Weight load sum (from host DRAM to device GDDR6 DRAM) (ms)                           : {results.mini_phase_timings.write_tensor_time:.3f}"
+        f"  Weight load sum (from host DRAM to device GDDR6 DRAM) (ms)                           : {results.mini_weight_load:.3f}"
     )
-    print(f"  Forward sum (ms)                               : {results.mini_phase_timings.run_program_time:.3f}")
+    print(f"  Forward sum (ms)                               : {results.mini_phase_timings.forward_pass_time:.3f}")
 
     print(f"\n  Fine-grained phase breakdown (average per sequence):")
-    print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.mini_phase_timings.write_tensor_time:.3f}")
-    print(f"    Forward compute (ms)                     : {results.mini_phase_timings.run_program_time:.3f}")
+    print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.mini_weight_load:.3f}")
+    print(f"    Forward compute (ms)                     : {results.mini_phase_timings.forward_pass_time:.3f}")
     print(f"    Pure Matmul (ms)                         : {results.mini_phase_timings.pure_matmul_time:.3f}")
 
     # Calculate overhead based on PURE MATMUL time as requested
