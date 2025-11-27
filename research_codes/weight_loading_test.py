@@ -252,10 +252,10 @@ class LinearWrapper:
         # Check if weight is L1 sharded (for IN1_SHARDED kernel path)
         is_l1_sharded = (
             weight.memory_config().buffer_type == ttnn.BufferType.L1
-            and weight.memory_config().memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+            and weight.memory_config().memory_layout == ttnn.TensorMemoryLayout.HEIGHT_SHARDED
         )
         if is_l1_sharded:
-            print(f"[INFO] Weight is L1 WIDTH_SHARDED - IN1_SHARDED kernel path will be enabled")
+            print(f"[INFO] Weight is L1 HEIGHT_SHARDED - Optimized kernel path will be enabled")
             print(f"[INFO] Weight will be reused across forward passes with zero L1→CB copy!")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
@@ -348,10 +348,11 @@ def get_optimal_grid_size(device: ttnn.Device, in_features: int, out_features: i
         for num_cores_y in range(1, compute_grid_size.y + 1):
             total_cores = num_cores_x * num_cores_y
             if total_cores <= total_available_cores:
-                # Check if in_features is divisible by total_cores (for WIDTH sharding)
-                if in_features % total_cores == 0:
+                # Check if out_features is divisible by total_cores (for HEIGHT sharding)
+                if out_features % total_cores == 0:
                     # Check if shard size fits in L1
-                    shard_size = out_features * (in_features // total_cores) * 2
+                    # Shard shape: [out_features / cores, in_features]
+                    shard_size = (out_features // total_cores) * in_features * 2
                     if shard_size <= bank_size_bytes:
                         best_num_cores = max(best_num_cores, total_cores)
 
@@ -362,10 +363,10 @@ def get_optimal_grid_size(device: ttnn.Device, in_features: int, out_features: i
                 if target_cores % num_cores_x == 0:
                     num_cores_y = target_cores // num_cores_x
                     if num_cores_y <= compute_grid_size.y:
-                        # Calculate shard width with rounding
-                        shard_width = (in_features + target_cores - 1) // target_cores
-                        shard_width = ((shard_width + 31) // 32) * 32  # Tile align
-                        shard_size = out_features * shard_width * 2
+                        # Calculate shard height with rounding
+                        shard_height = (out_features + target_cores - 1) // target_cores
+                        shard_height = ((shard_height + 31) // 32) * 32  # Tile align
+                        shard_size = shard_height * in_features * 2
 
                         if shard_size <= bank_size_bytes:
                             best_num_cores = target_cores
@@ -413,49 +414,8 @@ def create_matmul_program_config(
     if not enable_sharding:
         return None
 
-    # Use same grid selection logic as weight memory config
-    num_cores_x, num_cores_y = get_optimal_grid_size(device, in_features, out_features)
-
-    # For matmul(weight, x.T):
-    # M = out_features (4096)
-    # K = in_features (4096)
-    # N = batch_size (32 or 256)
-
-    M_tiles = math.ceil(out_features / 32)
-    K_tiles = math.ceil(in_features / 32)
-    N_tiles = math.ceil(batch_size / 32)
-
-    # Calculate per-core work
-    # For WIDTH_SHARDED weights (K-sharding), each core has full M but partial K.
-    # So per_core_M must be full M (M_tiles).
-    # We parallelize across K (using the grid).
-    per_core_M = M_tiles
-    per_core_N = math.ceil(N_tiles)
-
-    # in0_block_w: how many K tiles to process at once
-    # Should divide K_tiles evenly if possible
-    in0_block_w = 1
-    for divisor in [8, 4, 2, 1]:
-        if K_tiles % divisor == 0:
-            in0_block_w = divisor
-            break
-
-    print(
-        f"[INFO] Program Config: grid=({num_cores_x}, {num_cores_y}), "
-        f"per_core_M={per_core_M}, per_core_N={per_core_N}, in0_block_w={in0_block_w}"
-    )
-
-    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-        compute_with_storage_grid_size=(num_cores_x, num_cores_y),
-        in0_block_w=in0_block_w,
-        out_subblock_h=1,
-        out_subblock_w=1,
-        per_core_M=per_core_M,
-        per_core_N=per_core_N,
-        fuse_batch=True,  # Required for L1 sharded weights
-        fused_activation=None,
-        mcast_in0=False,  # Disable multicast for sharded weights
-    )
+    # Return None to let ttnn auto-generate the optimal config for HEIGHT_SHARDED
+    return None
 
 
 def create_weight_memory_config(
@@ -489,7 +449,7 @@ def create_weight_memory_config(
 
     print(f"[INFO] Available cores: {compute_grid_size.x}x{compute_grid_size.y} = {total_available_cores}")
     print(f"[INFO] Weight dimensions: [{out_features}, {in_features}]")
-    print(f"[INFO] Creating L1 WIDTH_SHARDED config for zero-copy weight access")
+    print(f"[INFO] Creating L1 HEIGHT_SHARDED config for zero-copy weight access")
 
     # Use same grid selection logic as program config to ensure compatibility
     num_cores_x, num_cores_y = get_optimal_grid_size(device, in_features, out_features)
@@ -503,12 +463,12 @@ def create_weight_memory_config(
     print(f"[INFO] Total weight size: {weight_size_bytes / 1024 / 1024:.2f} MB")
     print(f"[INFO] Minimum cores needed: {min_cores_needed}")
     print(f"[INFO] Selected grid: {num_cores_x}x{num_cores_y} = {total_cores} cores")
-    print(f"[INFO] Using WIDTH_SHARDED L1 with grid: {num_cores_x}x{num_cores_y}")
+    print(f"[INFO] Using HEIGHT_SHARDED L1 with grid: {num_cores_x}x{num_cores_y}")
 
-    # Calculate shard shape for WIDTH_SHARDED
-    shard_width = (in_features + total_cores - 1) // total_cores
-    shard_width = ((shard_width + 31) // 32) * 32  # Round up to tile boundary (32)
-    shard_height = out_features
+    # Calculate shard shape for HEIGHT_SHARDED
+    shard_height = (out_features + total_cores - 1) // total_cores
+    shard_height = ((shard_height + 31) // 32) * 32  # Round up to tile boundary (32)
+    shard_width = in_features
 
     shard_size_mb = (shard_height * shard_width * 2) / 1024 / 1024
 
@@ -528,7 +488,7 @@ def create_weight_memory_config(
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        print(f"[INFO] Successfully created WIDTH_SHARDED L1 memory config")
+        print(f"[INFO] Successfully created HEIGHT_SHARDED L1 memory config")
         return memory_config
     except Exception as e:
         # If sharding fails, fall back to DRAM
