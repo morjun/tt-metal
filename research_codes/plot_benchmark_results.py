@@ -40,7 +40,7 @@ data = {
 }
 
 # 2행 3열의 서브플롯 생성
-fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+fig, axes = plt.subplots(2, 3, figsize=(16, 12))
 
 # 시나리오 정의 (키 접두어, 그래프 제목)
 scenarios = [
