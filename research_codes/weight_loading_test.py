@@ -57,6 +57,8 @@ class PhaseTimings:
     compile_time: float = 0.0  # Time to compile kernels (one-time cost)
     forward_pass_time: float = 0.0  # Total forward pass time
     pure_matmul_time: float = 0.0  # Pure matmul time (excluding transpose/add)
+    add_time: float = 0.0  # Time for bias add
+    transpose_time: float = 0.0  # Time for transpose operations
 
     # Overhead metrics (optional, for detailed analysis)
     compile_overhead: float = 0.0
@@ -70,6 +72,8 @@ class PhaseTimings:
             "compile_time": self.compile_time,
             "forward_pass_time": self.forward_pass_time,
             "pure_matmul_time": self.pure_matmul_time,
+            "add_time": self.add_time,
+            "transpose_time": self.transpose_time,
             "compile_overhead": self.compile_overhead,
             "forward_pass_overhead": self.forward_pass_overhead,
             "total": self.total,
@@ -81,6 +85,8 @@ class PhaseTimings:
             compile_time=(self.compile_time + other.compile_time) / 2.0,
             forward_pass_time=(self.forward_pass_time + other.forward_pass_time) / 2.0,
             pure_matmul_time=(self.pure_matmul_time + other.pure_matmul_time) / 2.0,
+            add_time=(self.add_time + other.add_time) / 2.0,
+            transpose_time=(self.transpose_time + other.transpose_time) / 2.0,
             compile_overhead=(self.compile_overhead + other.compile_overhead) / 2.0,
             forward_pass_overhead=(self.forward_pass_overhead + other.forward_pass_overhead) / 2.0,
             total=(self.total + other.total) / 2.0,
@@ -96,6 +102,8 @@ class PhaseTimings:
             compile_time=sum(t.compile_time for t in timings_list) / n,
             forward_pass_time=sum(t.forward_pass_time for t in timings_list) / n,
             pure_matmul_time=sum(t.pure_matmul_time for t in timings_list) / n,
+            add_time=sum(t.add_time for t in timings_list) / n,
+            transpose_time=sum(t.transpose_time for t in timings_list) / n,
             compile_overhead=sum(t.compile_overhead for t in timings_list) / n,
             forward_pass_overhead=sum(t.forward_pass_overhead for t in timings_list) / n,
             total=sum(t.total for t in timings_list) / n,
@@ -678,6 +686,8 @@ def time_forward(
         fwd_times.append(fwd_ms)
         iter_timings.forward_pass_time = fwd_ms
         iter_timings.pure_matmul_time = pure_matmul_ms
+        iter_timings.add_time = add_ms
+        iter_timings.transpose_time = transpose_ms
 
         # Set phase timings for this iteration
         # For first iteration, include one-time costs; for others, only forward pass
@@ -758,6 +768,7 @@ def time_minibatch_sequence(
         seq_fwd_ms = 0.0
         seq_transpose_ms = 0.0
         seq_pure_matmul_ms = 0.0
+        seq_add_ms = 0.0
 
         # For first sequence, include initial weight loading time
         if include_one_time_costs:
@@ -796,6 +807,7 @@ def time_minibatch_sequence(
             seq_fwd_ms = fwd_ms
             seq_transpose_ms = transpose_ms
             seq_pure_matmul_ms = pure_matmul_ms
+            seq_add_ms = add_ms
 
         # Set phase timings
         if include_one_time_costs:
@@ -810,6 +822,8 @@ def time_minibatch_sequence(
         seq_timings.forward_pass_time = seq_fwd_ms
         seq_timings.total = seq_total
         seq_timings.pure_matmul_time = seq_pure_matmul_ms
+        seq_timings.add_time = seq_add_ms
+        seq_timings.transpose_time = seq_transpose_ms
 
         print(
             f"[DEBUG] Minibatch Seq - Total: {seq_fwd_ms:.3f}ms, Transpose: {seq_transpose_ms:.3f}ms, Pure Matmul: {seq_pure_matmul_ms:.3f}ms"
@@ -930,9 +944,18 @@ def _save_results_to_csv(
         # Fine-grained phase timings for large batch
         "large_forward_pass_time": f"{large_timings_dict['forward_pass_time']:.6f}",
         "large_pure_matmul_time": f"{large_timings_dict['pure_matmul_time']:.6f}",
+        "large_add_time": f"{large_timings_dict['add_time']:.6f}",
+        "large_transpose_time": f"{large_timings_dict['transpose_time']:.6f}",
         # Fine-grained phase timings for minibatch
         "mini_forward_pass_time": f"{mini_timings_dict['forward_pass_time']:.6f}",
         "mini_pure_matmul_time": f"{mini_timings_dict['pure_matmul_time']:.6f}",
+        "mini_add_time": f"{mini_timings_dict['add_time']:.6f}",
+        "mini_transpose_time": f"{mini_timings_dict['transpose_time']:.6f}",
+        # Per-forward timings for minibatch
+        "mini_per_fwd_time": f"{mini_timings_dict['forward_pass_time'] / cfg.minibatches:.6f}",
+        "mini_per_fwd_matmul_time": f"{mini_timings_dict['pure_matmul_time'] / cfg.minibatches:.6f}",
+        "mini_per_fwd_add_time": f"{mini_timings_dict['add_time'] / cfg.minibatches:.6f}",
+        "mini_per_fwd_transpose_time": f"{mini_timings_dict['transpose_time'] / cfg.minibatches:.6f}",
         # Pure Matmul Overhead
         "pure_matmul_overhead": f"{(mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']):.6f}",
         "pure_matmul_overhead_percentage": f"{((mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']) / large_timings_dict['pure_matmul_time']) * 100:.2f}",
@@ -1159,6 +1182,8 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
     print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.large_weight_load:.3f}")
     print(f"    Forward compute (ms)                     : {results.large_phase_timings.forward_pass_time:.3f}")
     print(f"    Pure Matmul (ms)                         : {results.large_phase_timings.pure_matmul_time:.3f}")
+    print(f"    Add (ms)                                 : {results.large_phase_timings.add_time:.3f}")
+    print(f"    Transpose (ms)                           : {results.large_phase_timings.transpose_time:.3f}")
 
     print(f"\n-- Repeated passes: SMALL minibatch (same weights on device) --")
     print(f"Sequence total (ms) for {cfg.minibatches} passes : {results.mini_total:.3f}")
@@ -1171,6 +1196,20 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
     print(f"    Weight load (Host DRAM -> GDDR6) (ms)      : {results.mini_weight_load:.3f}")
     print(f"    Forward compute (ms)                     : {results.mini_phase_timings.forward_pass_time:.3f}")
     print(f"    Pure Matmul (ms)                         : {results.mini_phase_timings.pure_matmul_time:.3f}")
+    print(f"    Add (ms)                                 : {results.mini_phase_timings.add_time:.3f}")
+    print(f"    Transpose (ms)                           : {results.mini_phase_timings.transpose_time:.3f}")
+
+    print(f"\n  Per-forward (average per minibatch):")
+    print(
+        f"    Forward compute (ms)                     : {results.mini_phase_timings.forward_pass_time / cfg.minibatches:.3f}"
+    )
+    print(
+        f"    Pure Matmul (ms)                         : {results.mini_phase_timings.pure_matmul_time / cfg.minibatches:.3f}"
+    )
+    print(f"    Add (ms)                                 : {results.mini_phase_timings.add_time / cfg.minibatches:.3f}")
+    print(
+        f"    Transpose (ms)                           : {results.mini_phase_timings.transpose_time / cfg.minibatches:.3f}"
+    )
 
     # Calculate overhead based on PURE MATMUL time as requested
     overhead = results.mini_phase_timings.pure_matmul_time - results.large_phase_timings.pure_matmul_time
