@@ -84,7 +84,7 @@ inline void reblock_and_untilize(
 
 void MAIN {
     // ✅ DISABLED: Main profiling scope - causes buffer overflow even with 130+ cores × 1 zone
-    // DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
+    DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
 
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
