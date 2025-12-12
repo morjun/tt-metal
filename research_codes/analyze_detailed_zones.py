@@ -265,6 +265,13 @@ def analyze_breakdown(cores, freq_mhz):
         print(f"--------------------------------------------------")
         print(f"[PRODUCER / BRISC] (Weights)")
         print(f"  > DRAM Read Issue         : {weight_issue:.4f} ms (Active DRAM BW)")
+
+        # Add context-aware note about sharded weights
+        if weight_issue > 0.5 and noc_mcast_exact > 0 and noc_mcast_exact < weight_issue:
+            print(f"    NOTE: With HEIGHT_SHARDED weights, this measures L1→CB copy, not DRAM read.")
+            print(f"          Higher value vs non-sharded is normal (gather vs sequential).")
+            print(f"          Check overall latency reduction for true performance impact.")
+
         print(f"  > DRAM Read Latency       : {weight_latency:.4f} ms (Wait for Return)")
         print(f"  > NoC Multicast (Stream)  : {noc_mcast_exact:.4f} ms (Active NoC BW)")
         print(f"--------------------------------------------------")

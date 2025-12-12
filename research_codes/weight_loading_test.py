@@ -48,6 +48,8 @@ class BenchmarkConfig:
     only_large: bool = False  # Run only large batch scenario
     only_mini: bool = False  # Run only mini-batch scenario
     enable_weight_sharding: bool = False  # Enable weight sharding to SRAM (L1)
+    use_program_config: bool = False  # Use explicit program config instead of auto-generated
+    enable_optimized_matmul: bool = False  # Use optimized matmul path (ttnn.linear)
 
 
 @dataclass
@@ -213,6 +215,16 @@ def parse_args() -> BenchmarkConfig:
         action="store_true",
         help="Enable weight sharding to SRAM (L1) for improved performance",
     )
+    parser.add_argument(
+        "--use-program-config",
+        action="store_true",
+        help="Use explicit program config instead of auto-generated (None). Useful for debugging kernel selection.",
+    )
+    parser.add_argument(
+        "--enable-optimized-matmul",
+        action="store_true",
+        help="Use optimized matmul path (ttnn.linear) instead of transpose-based path. Requires compatible sharding config.",
+    )
 
     args = parser.parse_args()
     return BenchmarkConfig(
@@ -230,6 +242,8 @@ def parse_args() -> BenchmarkConfig:
         only_large=args.only_large,
         only_mini=args.only_mini,
         enable_weight_sharding=args.enable_weight_sharding,
+        use_program_config=args.use_program_config,
+        enable_optimized_matmul=args.enable_optimized_matmul,
     )
 
 
@@ -599,6 +613,8 @@ def time_forward(
     measure_iters: int,
     pre_measured_compile_ms: Optional[float] = None,
     enable_weight_sharding: bool = False,
+    use_program_config: bool = False,
+    enable_optimized_matmul: bool = False,
 ) -> Tuple[PhaseTimings, float, float, float]:
     """
     Measure forward pass with fine-grained timing.
@@ -622,8 +638,8 @@ def time_forward(
         w_tt,
         b_tt,
         output_mem_config=ttnn.DRAM_MEMORY_CONFIG,
-        # program_config=program_config,
-        enable_optimized_matmul=False,  # Use transpose path for compatibility
+        program_config=program_config if use_program_config else None,
+        enable_optimized_matmul=enable_optimized_matmul,
     )
 
     # Prepare one input tensor to reuse (same input each iteration as requested)
@@ -731,6 +747,8 @@ def time_minibatch_sequence(
     measure_iters: int,
     pre_measured_compile_ms: Optional[float] = None,
     enable_weight_sharding: bool = False,
+    use_program_config: bool = False,
+    enable_optimized_matmul: bool = False,
 ) -> Tuple[PhaseTimings, float, float, float]:
     """
     Measure minibatch sequence with fine-grained timing.
@@ -754,8 +772,8 @@ def time_minibatch_sequence(
         w_tt,
         b_tt,
         output_mem_config=ttnn.DRAM_MEMORY_CONFIG,
-        program_config=program_config,
-        enable_optimized_matmul=False,  # Use transpose path for compatibility
+        program_config=program_config if use_program_config else None,
+        enable_optimized_matmul=enable_optimized_matmul,
     )
     # Compilation time will be captured by C++ timers.
     timings.compile_time = 0.0
@@ -1072,6 +1090,8 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             cfg.measure_iters,
             pre_measured_compile_ms=large_batch_compile_ms,
             enable_weight_sharding=cfg.enable_weight_sharding,
+            use_program_config=cfg.use_program_config,
+            enable_optimized_matmul=cfg.enable_optimized_matmul,
         )
 
     # Run mini-batch scenario
@@ -1125,6 +1145,8 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
             cfg.measure_iters,
             pre_measured_compile_ms=small_batch_compile_ms,
             enable_weight_sharding=cfg.enable_weight_sharding,
+            use_program_config=cfg.use_program_config,
+            enable_optimized_matmul=cfg.enable_optimized_matmul,
         )
 
     # Overhead assessment
