@@ -118,6 +118,8 @@ def classify_zone(zone_name, src_file):
 
     if "READ-WEIGHT" in zn:
         return f"WEIGHT_STREAM_{kernel_type}"
+    if "READ-IN0" in zn:
+        return f"ACT_STREAM_{kernel_type}"
     if "NOC" in zn or "BARRIER" in zn or "WAIT" in zn or "SYNC" in zn or "SEM-" in zn:
         # Check specific wait types
         if "CB-WAIT" in zn:
@@ -161,8 +163,10 @@ def analyze_breakdown(cores, freq_mhz):
     metrics = {
         "compute_loop": 0.0,
         "compute_stall": 0.0,
-        "weight_read_issue": 0.0,  # Active BW usage
-        "weight_read_wait": 0.0,  # Latency tail
+        "weight_read_issue": 0.0,  # Active BW usage (BRISC)
+        "weight_read_wait": 0.0,  # Latency tail (BRISC)
+        "act_read_issue": 0.0,  # Active BW usage (NCRISC)
+        "act_read_wait": 0.0,  # Latency tail (NCRISC)
     }
 
     for risc in sorted(zone_data.keys()):
@@ -194,11 +198,17 @@ def analyze_breakdown(cores, freq_mhz):
             if "CB-WAIT" in z_name:
                 metrics["compute_stall"] = max(metrics["compute_stall"], max_ms)
 
-            # BRISC Side
+            # BRISC Side (Weights)
             if "READ-WEIGHT" in z_name:
                 metrics["weight_read_issue"] = max(metrics["weight_read_issue"], max_ms)
-            if "NOC-BARRIER" in z_name:
+            if "NOC-BARRIER-WAIT-IN1" in z_name:  # Specific to IN1 (Weights)
                 metrics["weight_read_wait"] = max(metrics["weight_read_wait"], max_ms)
+
+            # NCRISC Side (Activations)
+            if "READ-IN0" in z_name:
+                metrics["act_read_issue"] = max(metrics["act_read_issue"], max_ms)
+            if "NOC-BARRIER-WAIT-IN0" in z_name:  # Specific to IN0 (Activations)
+                metrics["act_read_wait"] = max(metrics["act_read_wait"], max_ms)
 
         # Sort by Category
         items.sort(key=lambda x: (x["cat"], -x["max_ms"]))
@@ -208,15 +218,15 @@ def analyze_breakdown(cores, freq_mhz):
                 f"{item['cat']:<25} {item['name']:<45} {item['src']:<35} {item['max_ms']:<10.4f} {item['avg_ms']:<10.4f}"
             )
 
-    # Inferred Breakdown
-    # Model: Total Latency = Pure Compute + Total Stall
-    #        Total Stall = DRAM Fetch (Issue+Wait) + NoC/Sync Overhead
+    # Component Breakdown
+    # Present raw metrics for Producer (BRISC) and Consumer (TRISC)
+    # Avoid inferring overlap efficiency or hidden overheads.
 
     if metrics["compute_loop"] > 0:
         print(f"\n{'-'*130}")
-        print(f"INFERRED BOTTLENECK BREAKDOWN")
-        print(f"Logic: Consumer Stall (TRISC) includes ALL upstream latency (DRAM Read + NoC Transfer).")
-        print(f"       We subtract measured DRAM zones to isolate NoC/System Overhead.")
+        print(f"COMPONENT BREAKDOWN (Trace Analysis)")
+        print(f"Note: Producer (BRISC) and Consumer (TRISC) run in parallel.")
+        print(f"      Metrics are max latency across all cores.")
         print(f"{'-'*130}")
 
         total = metrics["compute_loop"]
@@ -225,23 +235,43 @@ def analyze_breakdown(cores, freq_mhz):
         # 1. Pure Compute
         pure_compute = max(0, total - stall)
 
-        # 2. DRAM Data Fetch
-        dram_issue = metrics["weight_read_issue"]  # Active BW
-        dram_latency = metrics["weight_read_wait"]  # Tail Latency
-        dram_total = dram_issue + dram_latency
+        # 2. DRAM Data Fetch (Weights)
+        weight_issue = metrics["weight_read_issue"]  # Active BW
+        weight_latency = metrics["weight_read_wait"]  # Tail Latency
 
-        # 3. NoC/Sync Overhead
-        # The part of the stall NOT explained by DRAM activity
-        noc_overhead = max(0, stall - dram_total)
+        # 3. DRAM Data Fetch (Activations)
+        act_issue = metrics["act_read_issue"]
+        act_latency = metrics["act_read_wait"]
 
-        print(f"Total Forward Latency   : {total:.4f} ms")
+        # 4. NoC Multicast
+        # We need to capture the new zone if it exists, or it will be 0
+        # Re-iterate to find the zone in ANY risc (it should be in BRISC)
+        noc_mcast_exact = 0.0
+
+        # Helper to find zone in data
+        for risc in zone_data:
+            for (z_name, src_file), core_dur_lists in zone_data[risc].items():
+                if "WEIGHT-STREAM-MCAST" in z_name:
+                    total_time_per_core = [sum(d) for d in core_dur_lists]
+                    max_cycles = max(total_time_per_core)
+                    max_ms = max_cycles / (freq_mhz * 1000)
+                    noc_mcast_exact = max(noc_mcast_exact, max_ms)
+
+        print(f"Total Forward Latency       : {total:.4f} ms")
         print(f"--------------------------------------------------")
-        print(f"[1] Pure Compute        : {pure_compute:.4f} ms ({(pure_compute/total)*100:.1f}%)")
-        print(f"[2] Data Movement Stall : {stall:.4f} ms ({(stall/total)*100:.1f}%)")
-        print(f"    |-- DRAM Fetch      : {dram_total:.4f} ms")
-        print(f"    |   |-- Issue (BW)  : {dram_issue:.4f} ms")
-        print(f"    |   `-- Latency     : {dram_latency:.4f} ms")
-        print(f"    `-- NoC/Sync Ovhd   : {noc_overhead:.4f} ms (Inferred Residual)")
+        print(f"[CONSUMER / TRISC]")
+        print(f"  > Pure Compute            : {pure_compute:.4f} ms")
+        print(f"  > Data Wait Stall         : {stall:.4f} ms (Total Wait for Data)")
+        print(f"--------------------------------------------------")
+        print(f"[PRODUCER / BRISC] (Weights)")
+        print(f"  > DRAM Read Issue         : {weight_issue:.4f} ms (Active DRAM BW)")
+        print(f"  > DRAM Read Latency       : {weight_latency:.4f} ms (Wait for Return)")
+        print(f"  > NoC Multicast (Stream)  : {noc_mcast_exact:.4f} ms (Active NoC BW)")
+        print(f"--------------------------------------------------")
+        print(f"[PRODUCER / NCRISC] (Activations)")
+        print(f"  > DRAM Read Issue         : {act_issue:.4f} ms (Active DRAM BW)")
+        print(f"  > DRAM Read Latency       : {act_latency:.4f} ms (Wait for Return)")
+        print(f"--------------------------------------------------")
 
 
 def main():

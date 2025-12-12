@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
+# Forward time = matmul + add + transpose
+
 import os
 import sys
 
