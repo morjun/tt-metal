@@ -82,7 +82,7 @@ void kernel_main() {
 
                     {
                         // ✅ DISABLED: Measure NoC multicast wait time - causes buffer overflow
-                        // DeviceZoneScopedN("NOC-MCAST-WAIT");
+                        DeviceZoneScopedN("NOC-MCAST-WAIT");
                         // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
                         noc_semaphore_wait(in0_mcast_receiver_semaphore_addr_ptr, VALID);
                     }

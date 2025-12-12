@@ -84,7 +84,7 @@ inline void reblock_and_untilize(
 
 void MAIN {
     // ✅ DISABLED: Main profiling scope - causes buffer overflow even with 130+ cores × 1 zone
-    DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
+    // DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
 
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
@@ -148,7 +148,7 @@ void MAIN {
     mm_block_init(
         in0_cb_id, in1_cb_id, mm_partials_cb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
     for (uint32_t b = 0; b < batch; b++) {
-        // DeviceZoneScopedN("BATCH-ITERATION");
+        DeviceZoneScopedN("BATCH-ITERATION");
         if constexpr (get_batch_from_reader) {
             // Check whether this batch is valid
             bool is_batch_valid = false;
@@ -187,7 +187,7 @@ void MAIN {
 #endif
 
                     {
-                        // DeviceZoneScopedN("CB-WAIT-FRONT");
+                        DeviceZoneScopedN("CB-WAIT-FRONT");
                         cb_wait_front(in0_cb_id, in0_block_num_tiles);
                         cb_wait_front(in1_cb_id, in1_block_num_tiles);
                     }
@@ -331,7 +331,7 @@ void MAIN {
 #endif
 
                     {
-                        // DeviceZoneScopedN("CB-POP-FRONT");
+                        DeviceZoneScopedN("CB-POP-FRONT");
                         cb_pop_front(in0_cb_id, in0_block_num_tiles);
                         cb_pop_front(in1_cb_id, in1_block_num_tiles);
                     }
@@ -350,7 +350,7 @@ void MAIN {
 #endif
 
                 {
-                    // DeviceZoneScopedN("FUSE-BIAS");
+                    DeviceZoneScopedN("FUSE-BIAS");
                     reconfig_data_format(in1_cb_id, mm_partials_cb_id, in0_cb_id, bias_cb_id);
                     add_bcast_rows_init_short(mm_partials_cb_id, bias_cb_id);
                     // reconfigure unpacker df for src B
