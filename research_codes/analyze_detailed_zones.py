@@ -2,170 +2,267 @@
 """
 Analyze detailed profiling zones from profile_log_device.csv.
 
+Features:
+- Calculates timestamp-based durations.
+- Aggregates metrics "Per Core" (Average across active cores) to reflect wall-clock contribution.
+- Categorizes zones into Weight Streaming, NoC/Sync, and Compute.
+- Groups by Source File to distinguish Matmul/Transpose/Add kernels.
+- Handles nested zones (Sub-zones vs Top-level).
+
 Usage:
     python3 analyze_detailed_zones.py [csv_path]
 
-Default: tracy_output_large/profile_log_device.csv
+Default: generated/profiler/.logs/profile_log_device.csv
 """
 
 import csv
 import sys
+import argparse
 from collections import defaultdict
 from pathlib import Path
+
+# Frequency in MHz (Blackhole = 1350, Grayskull = 1200, Wormhole = 1000)
+# Ideally read from CSV header.
+DEFAULT_FREQ_MHZ = 1350
 
 
 def parse_detailed_profile(csv_path):
     """Parse profile_log_device.csv with custom zones."""
 
-    zones = defaultdict(lambda: defaultdict(list))
-    zone_stack = {}
+    # Structure: cores[core_id][risc_type][(zone_name, src_file)] = [duration, duration, ...]
+    cores = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    zone_stack = {}  # Key: (core_id, risc_type) -> list of (zone_name, start_cycle)
+
+    freq_mhz = DEFAULT_FREQ_MHZ
 
     print(f"Parsing {csv_path}...")
 
     with open(csv_path, "r", encoding="utf-8") as f:
-        # Skip first two lines (header info and column names)
-        f.readline()
+        # Read header to find frequency
+        header_info = f.readline()
+        if "CHIP_FREQ[MHz]" in header_info:
+            try:
+                part = header_info.split("CHIP_FREQ[MHz]:")[1].split(",")[0].strip()
+                freq_mhz = float(part)
+                print(f"Detected Frequency: {freq_mhz} MHz")
+            except:
+                pass
+
+        # Skip column names
         f.readline()
 
         line_count = 0
         for line in f:
             line_count += 1
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 12:
+            if len(parts) < 14:
+                # Some lines might be truncated or old format
                 continue
 
             try:
+                # CSV Format:
+                # 0:PCIe, 1:CoreX, 2:CoreY, 3:RISC, 4:TimerID, 5:Time, 6:Data, ...
+                # 10: ZoneName, 11: ZoneType, 12: SourceLine, 13: SourceFile
                 core_x, core_y = int(parts[1]), int(parts[2])
                 risc_type = parts[3]
                 cycles = int(parts[5])
                 zone_name = parts[10]
                 zone_type = parts[11]
+                src_file = parts[13]
             except (ValueError, IndexError):
                 continue
 
             if not zone_name or not zone_type:
                 continue
 
-            core_key = (core_x, core_y)
-            zone_key = (risc_type, zone_name)
+            core_id = (core_x, core_y)
+            stack_key = (core_id, risc_type)
+
+            src_file_base = Path(src_file).name
 
             if zone_type == "ZONE_START":
-                zone_stack[(core_key, zone_key)] = cycles
+                if stack_key not in zone_stack:
+                    zone_stack[stack_key] = []
+                zone_stack[stack_key].append((zone_name, cycles, src_file_base))
+
             elif zone_type == "ZONE_END":
-                stack_key = (core_key, zone_key)
-                if stack_key in zone_stack:
-                    duration = cycles - zone_stack[stack_key]
-                    zones[risc_type][zone_name].append(duration)
-                    del zone_stack[stack_key]
+                if stack_key in zone_stack and zone_stack[stack_key]:
+                    top_name, start_cycle, top_src = zone_stack[stack_key][-1]
+
+                    if top_name == zone_name:
+                        zone_stack[stack_key].pop()
+                        duration = cycles - start_cycle
+                        # Store by (ZoneName, SrcFile) to distinguish same named zones in diff files
+                        cores[core_id][risc_type][(zone_name, top_src)].append(duration)
+                    else:
+                        pass
 
         print(f"Processed {line_count} lines")
 
-    return zones
+    return cores, freq_mhz
 
 
-def print_breakdown(zones, freq_mhz=1350):
-    """Print detailed breakdown per RISC type."""
+def classify_zone(zone_name, src_file):
+    """Classify zone into categories based on name and source file."""
+    zn = zone_name.upper()
+    sf = src_file.upper()
 
-    if not zones:
-        print("No zone data found!")
+    # KERNEL Type Classification based on Source File
+    kernel_type = "OTHER"
+    if "MATMUL" in sf or "BMM" in sf:
+        kernel_type = "MATMUL"
+    elif "TRANSPOSE" in sf:
+        kernel_type = "TRANSPOSE"
+    elif "ADD" in sf or "BINARY" in sf:
+        kernel_type = "ADD"
+
+    if "READ-WEIGHT" in zn:
+        return f"WEIGHT_STREAM_{kernel_type}"
+    if "NOC" in zn or "BARRIER" in zn or "WAIT" in zn or "SYNC" in zn or "SEM-" in zn:
+        # Check specific wait types
+        if "CB-WAIT" in zn:
+            return f"DATA_WAIT_{kernel_type}"  # Waiting for data in CB
+        return f"NOC_WAIT_{kernel_type}"
+
+    if "MATMUL" in zn or "MATH" in zn or "UNPACK" in zn or "PACK" in zn:
+        return f"COMPUTE_{kernel_type}"
+
+    # Generic "KERNEL" top level
+    if "BRISC-KERNEL" in zn or "NCRISC-KERNEL" in zn or "TRISC-KERNEL" in zn:
+        return f"KERNEL_{kernel_type}"
+
+    if "FW" in zn and "KERNEL" not in zn:
+        return "FIRMWARE"
+
+    return f"SUBZONE_{kernel_type}"
+
+
+def analyze_breakdown(cores, freq_mhz):
+    """Aggregate and print metrics."""
+
+    if not cores:
+        print("No data found.")
         return
 
-    for risc_type in sorted(zones.keys()):
-        print(f"\n{'='*90}")
-        print(f"{risc_type} OPERATION BREAKDOWN")
-        print(f"{'='*90}")
+    # Structure: zone_data[risc][(zone_name, src_file)] = list of lists
+    zone_data = defaultdict(lambda: defaultdict(list))
 
-        risc_zones = zones[risc_type]
-        if not risc_zones:
-            print("No data for this RISC type")
-            continue
+    for core_id, riscs in cores.items():
+        for risc, zones in riscs.items():
+            for (z_name, src_file), durations in zones.items():
+                zone_data[risc][(z_name, src_file)].append(durations)
 
-        total_cycles = sum(sum(durations) for durations in risc_zones.values())
-        if total_cycles == 0:
-            print("Total cycles = 0, skipping")
-            continue
+    print(f"\n{'-'*130}")
+    print(f"ANALYSIS REPORT (Freq: {freq_mhz} MHz) - Grouped by Source File")
+    print(f"Max Time = Latency of the slowest core (Bottleneck Analysis)")
+    print(f"{'-'*130}")
 
-        total_ms = total_cycles / (freq_mhz * 1000)
+    # Track metrics for final summary
+    metrics = {
+        "compute_loop": 0.0,
+        "compute_stall": 0.0,
+        "weight_read_issue": 0.0,  # Active BW usage
+        "weight_read_wait": 0.0,  # Latency tail
+    }
 
-        print(f"\nTotal time: {total_ms:.2f} ms ({total_cycles:,} cycles)")
-        print(f"\n{'Operation':<40} {'Avg (cycles)':<15} {'Avg (ms)':<12} {'%':<8} {'Count':<8}")
-        print("-" * 90)
+    for risc in sorted(zone_data.keys()):
+        print(f"\n[{risc}]")
+        print(f"{'Category':<25} {'Zone Name':<45} {'Source File':<35} {'Max(ms)':<10} {'Avg(ms)':<10}")
+        print(f"{'-'*130}")
 
-        # Sort by total time
-        zone_items = []
-        for zone_name, durations in risc_zones.items():
-            if len(durations) == 0:
-                continue
-            avg_cycles = sum(durations) / len(durations)
+        items = []
+        for (z_name, src_file), core_dur_lists in zone_data[risc].items():
+            # core_dur_lists is a list of lists (one per core)
+            # Calculate total time per core
+            total_time_per_core = [sum(d) for d in core_dur_lists]
+
+            # Global stats
+            max_cycles = max(total_time_per_core)
+            avg_cycles = sum(total_time_per_core) / len(total_time_per_core)
+
+            max_ms = max_cycles / (freq_mhz * 1000)
             avg_ms = avg_cycles / (freq_mhz * 1000)
-            total_zone_cycles = sum(durations)
-            pct = (total_zone_cycles / total_cycles) * 100
-            zone_items.append((zone_name, avg_cycles, avg_ms, pct, len(durations), total_zone_cycles))
 
-        zone_items.sort(key=lambda x: x[5], reverse=True)  # Sort by total cycles
+            cat = classify_zone(z_name, src_file)
 
-        for zone_name, avg_cycles, avg_ms, pct, count, _ in zone_items:
-            print(f"{zone_name:<40} {avg_cycles:<15,.0f} {avg_ms:<12.3f} {pct:<8.1f} {count:<8,}")
+            items.append({"name": z_name, "src": src_file, "cat": cat, "max_ms": max_ms, "avg_ms": avg_ms})
 
-        # Identify idle vs work
-        print(f"\n{'─'*90}")
-        idle_keywords = ["WAIT", "BARRIER", "IDLE", "CB-WAIT", "NOC-BARRIER"]
-        idle_zones = [z for z in zone_items if any(idle_word in z[0].upper() for idle_word in idle_keywords)]
-        work_zones = [z for z in zone_items if z not in idle_zones]
+            # Capture key metrics for inferred breakdown
+            # TRISC Side
+            if "BATCH-ITERATION" in z_name:
+                metrics["compute_loop"] = max(metrics["compute_loop"], max_ms)
+            if "CB-WAIT" in z_name:
+                metrics["compute_stall"] = max(metrics["compute_stall"], max_ms)
 
-        idle_pct = sum(z[3] for z in idle_zones)
-        work_pct = sum(z[3] for z in work_zones)
+            # BRISC Side
+            if "READ-WEIGHT" in z_name:
+                metrics["weight_read_issue"] = max(metrics["weight_read_issue"], max_ms)
+            if "NOC-BARRIER" in z_name:
+                metrics["weight_read_wait"] = max(metrics["weight_read_wait"], max_ms)
 
-        print(f"{'ACTUAL WORK (estimated)':<40} {'':<15} {'':<12} {work_pct:<8.1f}")
-        print(f"{'IDLE/WAITING (estimated)':<40} {'':<15} {'':<12} {idle_pct:<8.1f}")
+        # Sort by Category
+        items.sort(key=lambda x: (x["cat"], -x["max_ms"]))
 
-        # List idle zones
-        if idle_zones:
-            print(f"\nIdle/Waiting zones:")
-            for zone_name, avg_cycles, avg_ms, pct, count, _ in idle_zones:
-                print(f"  - {zone_name}: {pct:.1f}%")
+        for item in items:
+            print(
+                f"{item['cat']:<25} {item['name']:<45} {item['src']:<35} {item['max_ms']:<10.4f} {item['avg_ms']:<10.4f}"
+            )
+
+    # Inferred Breakdown
+    # Model: Total Latency = Pure Compute + Total Stall
+    #        Total Stall = DRAM Fetch (Issue+Wait) + NoC/Sync Overhead
+
+    if metrics["compute_loop"] > 0:
+        print(f"\n{'-'*130}")
+        print(f"INFERRED BOTTLENECK BREAKDOWN")
+        print(f"Logic: Consumer Stall (TRISC) includes ALL upstream latency (DRAM Read + NoC Transfer).")
+        print(f"       We subtract measured DRAM zones to isolate NoC/System Overhead.")
+        print(f"{'-'*130}")
+
+        total = metrics["compute_loop"]
+        stall = metrics["compute_stall"]
+
+        # 1. Pure Compute
+        pure_compute = max(0, total - stall)
+
+        # 2. DRAM Data Fetch
+        dram_issue = metrics["weight_read_issue"]  # Active BW
+        dram_latency = metrics["weight_read_wait"]  # Tail Latency
+        dram_total = dram_issue + dram_latency
+
+        # 3. NoC/Sync Overhead
+        # The part of the stall NOT explained by DRAM activity
+        noc_overhead = max(0, stall - dram_total)
+
+        print(f"Total Forward Latency   : {total:.4f} ms")
+        print(f"--------------------------------------------------")
+        print(f"[1] Pure Compute        : {pure_compute:.4f} ms ({(pure_compute/total)*100:.1f}%)")
+        print(f"[2] Data Movement Stall : {stall:.4f} ms ({(stall/total)*100:.1f}%)")
+        print(f"    |-- DRAM Fetch      : {dram_total:.4f} ms")
+        print(f"    |   |-- Issue (BW)  : {dram_issue:.4f} ms")
+        print(f"    |   `-- Latency     : {dram_latency:.4f} ms")
+        print(f"    `-- NoC/Sync Ovhd   : {noc_overhead:.4f} ms (Inferred Residual)")
 
 
 def main():
-    if len(sys.argv) > 1:
-        csv_path = Path(sys.argv[1])
-    else:
-        csv_path = Path("tracy_output_large/profile_log_device.csv")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("csv_path", nargs="?", default="generated/profiler/.logs/profile_log_device.csv")
+    args = parser.parse_args()
 
+    csv_path = Path(args.csv_path)
     if not csv_path.exists():
-        print(f"Error: {csv_path} not found!")
-        print("\nRun the test with TT_METAL_DEVICE_PROFILER=1 first:")
-        print("  cd research_codes")
-        print("  export TT_METAL_DEVICE_PROFILER=1")
-        print("  python3 weight_loading_test_tracy.py --only-large")
-        return 1
+        # Try default location if relative path fails
+        alt_path = Path(f"/home/masterjunmo/codes/tt-metal/{args.csv_path}")
+        if alt_path.exists():
+            csv_path = alt_path
+        else:
+            print(f"Error: {csv_path} not found.")
+            return 1
 
-    zones = parse_detailed_profile(csv_path)
-
-    if not zones:
-        print("\nNo custom zones found in the profile!")
-        print("\nThis means either:")
-        print("  1. The kernels don't have DeviceZoneScopedN() added yet")
-        print("  2. The profiler wasn't enabled (TT_METAL_DEVICE_PROFILER=1)")
-        print("  3. The CSV file is from a different test")
-        print("\nTo add custom zones, see:")
-        print("  research_codes/EXAMPLE_reader_bmm_tile_layout_PROFILED.cpp")
-        print("  research_codes/ACTION_PLAN_DETAILED_PROFILING.md")
-        return 1
-
-    print_breakdown(zones)
-
-    print("\n" + "=" * 90)
-    print("SUMMARY")
-    print("=" * 90)
-    print("\nTo see more detailed profiling:")
-    print("  1. Add DeviceZoneScopedN() to kernel files")
-    print("  2. See EXAMPLE_*.cpp files for reference")
-    print("  3. Rebuild with ./build_metal.sh")
-    print("  4. Re-run with TT_METAL_DEVICE_PROFILER=1")
-
+    cores, freq = parse_detailed_profile(csv_path)
+    analyze_breakdown(cores, freq)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
