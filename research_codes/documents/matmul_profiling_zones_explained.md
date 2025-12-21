@@ -41,6 +41,148 @@ graph LR
 
 ---
 
+## Why BRISC Handles IN1 and NCRISC Handles IN0?
+
+You're absolutely right to note that both BRISC and NCRISC perform identical data movement tasks (DRAM → L1 SRAM), yet they're assigned to different input operands. This design reflects **hardware-level optimizations** and **architectural roles** in TT-Metal.
+
+### Hardware Role Definitions
+
+**NCRISC (Network-on-Chip RISC)**:
+- **Primary role**: NoC-related tasks - network data movement, routing, and synchronization
+- **Secondary role**: Data producer for compute (feeds IN0 to TRISC)
+- **Mapped to**: `RISCV_1` in kernel assignments
+
+**BRISC (Base RISC)**:
+- **Primary role**: Command issuer and coordinator - manages kernel execution flow
+- **Secondary role**: Data producer + output writer (feeds IN1 to TRISC, writes results back)
+- **Mapped to**: `RISCV_0` in kernel assignments
+
+### Kernel Assignment in Code
+
+From [`matmul_op_multi_core_reuse_mcast_1d_program_factory.cpp`](file:///home/masterjunmo/codes/tt-metal/ttnn/cpp/ttnn/operations/matmul/device/matmul_op_multi_core_reuse_mcast_1d_program_factory.cpp#L524-L590):
+
+```cpp
+// Line 524-535: IN0 reader kernel assigned to RISCV_1 (NCRISC)
+auto mm_kernel_in0_mcast_cores_with_work_and_in_receiver_grid_id = tt_metal::CreateKernel(
+    program,
+    "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp",
+    in0_mcast_cores_with_work_and_in_receiver_grid,
+    tt_metal::DataMovementConfig{
+        .processor = tt_metal::DataMovementProcessor::RISCV_1,  // ← NCRISC
+        .noc = in0_noc,
+        .compile_args = in0_sender_compile_time_args,
+        .defines = mm_kernel_in0_sender_writer_defines});
+
+// Line 582-590: IN1 reader/writer kernel assigned to RISCV_0 (BRISC)
+auto mm_kernel_in1_sender_writer_id = tt_metal::CreateKernel(
+    program,
+    "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp",
+    all_cores_with_work,
+    tt_metal::DataMovementConfig{
+        .processor = tt_metal::DataMovementProcessor::RISCV_0,  // ← BRISC
+        .noc = in1_noc,
+        .compile_args = in1_sender_writer_compile_time_args,
+        .defines = mm_kernel_in1_sender_writer_defines});
+```
+
+### NoC Hardware: Two Independent Network Instances on 2D Torus
+
+TT-Metal hardware has **two physical NoC (Network-on-Chip) instances**: NOC_0 and NOC_1. From [`METALIUM_GUIDE.md`](file:///home/masterjunmo/codes/tt-metal/METALIUM_GUIDE.md#L58):
+
+> The NoCs operate in a quasi-full-duplex configuration through a **unidirectional, wraparound topology** where **NoC 0 and NoC 1 traverse the chip in opposite directions**. This bidirectional capability allows both NoCs to simultaneously send and receive data, while the unidirectional design optimizes power consumption and silicon area utilization. The **wraparound 2D torus topology** ensures full connectivity, enabling any point on the chip to communicate with any other location. The opposing directional flow of the two NoCs naturally provides efficient return paths for data, regardless of the originating location.
+
+**How they map to the 130-core 2D torus**:
+- Both NOC_0 and NOC_1 share the **same physical 2D torus mesh**
+- Each core has interfaces to **BOTH** NoC instances
+- **NOC_0 and NOC_1 traverse in OPPOSITE directions** (e.g., if NOC_0 goes clockwise, NOC_1 goes counter-clockwise)
+- This creates two independent routing paths through the same physical fabric
+- **Key benefit**: Separating traffic onto different directional flows reduces router contention and collisions
+
+**Critical design choice** at [Line 510-512](file:///home/masterjunmo/codes/tt-metal/ttnn/cpp/ttnn/operations/matmul/device/matmul_op_multi_core_reuse_mcast_1d_program_factory.cpp#L510-L512):
+
+```cpp
+// in1 is the reader of weights/output writer, and we choose to make it use the optimized reader noc
+tt_metal::NOC in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
+tt_metal::NOC in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
+```
+
+**What do these functions actually return?** From [`data_types.hpp`](file:///home/masterjunmo/codes/tt-metal/tt_metal/api/tt-metalium/data_types.hpp#L26-L38):
+
+```cpp
+inline NOC preferred_noc_for_dram_read(ARCH arch) {
+    switch (arch) {
+        case ARCH::WORMHOLE_B0:
+        default: return NOC::NOC_0;  // ← Returns NOC_0
+    }
+}
+
+inline NOC preferred_noc_for_dram_write(ARCH arch) {
+    switch (arch) {
+        case ARCH::WORMHOLE_B0:
+        default: return NOC::NOC_1;  // ← Returns NOC_1
+    }
+}
+```
+
+**Your observation is correct**: The naming is misleading! These functions don't return "faster" or "slower" NoCs - they simply return **different physical network instances** to **separate traffic**:
+
+- **IN0 (NCRISC)**: Uses **NOC_1** (via `preferred_noc_for_dram_write`)
+- **IN1 (BRISC)**: Uses **NOC_0** (via `preferred_noc_for_dram_read`)
+
+### Why Assign Different NoCs?
+
+**The real reason**: **Traffic separation to avoid congestion**, NOT performance asymmetry.
+
+**You're absolutely right** that when non-sharded:
+- NCRISC: 1 DRAM read (IN0)
+- BRISC: 1 DRAM read (IN1) + 1 DRAM write (output)
+
+The compiler's choice appears to be:
+1.  **Give IN1 to NOC_0** because the code comment suggests preferring this for "the reader of weights/output writer"
+2.  **Give IN0 to NOC_1** to use the alternate path
+3.  **Both processors also multicast** over their assigned NoCs (verified: `noc_async_write_multicast` in both kernels)
+
+**Result**: Two independent data flows operating in parallel without interfering:
+- **NOC_0 traffic**: IN1 DRAM reads + IN1 multicasts + output DRAM writes (BRISC)
+- **NOC_1 traffic**: IN0 DRAM reads + IN0 multicasts (NCRISC)
+
+**The naming confusion**: `preferred_noc_for_dram_read/write` is a naming artifact - it doesn't mean "this NoC is faster for reads/writes". It's more like "convention: use NOC_0 for read-heavy paths, NOC_1 for write-heavy paths" to maintain consistency across the codebase, but **both NoCs can handle reads, writes, and multicasts equally well**.
+
+### Why This Specific Assignment?
+
+**Reason 1: Workload Balance**
+- BRISC: Reads IN1 + writes output (2 operations)
+- NCRISC: Reads IN0 only (1 operation)
+- Assigning the read-optimized NoC to BRISC balances the heavier workload
+
+**Reason 2: Historical Architecture**
+- BRISC originally acted as the "base" processor coordinating execution
+- NCRISC was added later specifically for NoC-intensive operations
+- Matmul leverages **both** processors for parallel data movement to maximize bandwidth
+
+**Reason 3: Output Writing Efficiency**
+- Having the same processor (BRISC) handle IN1 reads and output writes enables:
+  - Better L1 cache locality
+  - Simpler control flow (single kernel handles input + output)
+  - Reduced inter-processor synchronization overhead
+
+### Implications for Your Workload
+
+In `weight_loading_test.py`:
+- **IN0 = weights** (transposed, potentially HEIGHT_SHARDED)
+- **IN1 = activations** (DRAM-resident)
+
+The assignment means:
+- **NCRISC** reads your sharded weights from L1 (or DRAM if not sharded)
+- **BRISC** reads activations from DRAM using the optimized read NoC **and** writes results back
+- **TRISC** computes the matmul while both data producers run in parallel
+
+This explains why:
+- `reader_bmm_tile_layout_in0_sender_padding.cpp` has NCRISC profiling zones for IN0
+- `reader_bmm_tile_layout_in1_sender_writer_padding.cpp` has BRISC profiling zones for IN1 + output writing
+
+---
+
 ## Profiling Zones by Source File & RISC Processor
 
 ### NCRISC Zones (IN0 Data Movement)
