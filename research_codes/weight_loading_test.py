@@ -135,6 +135,7 @@ class BenchmarkResult:
 
     # Overhead metrics
     overhead: float
+    core_grid: str
 
     @property
     def overhead_percentage(self) -> float:
@@ -156,6 +157,7 @@ class BenchmarkResult:
             "mini_forward": self.mini_forward,
             "overhead": self.overhead,
             "overhead_percentage": self.overhead_percentage,
+            "core_grid": self.core_grid,
         }
 
     def __str__(self) -> str:
@@ -169,6 +171,7 @@ class BenchmarkResult:
             f"weight_load={self.mini_weight_load:.3f}ms, "
             f"forward={self.mini_forward:.3f}ms\n"
             f"  Overhead: {self.overhead:.3f}ms ({self.overhead_percentage:.2f}%)\n"
+            f"  Core Grid: {self.core_grid}\n"
             f")"
         )
 
@@ -928,6 +931,7 @@ def _save_results_to_csv(
     mini_w: float,
     mini_f: float,
     overhead: float,
+    core_grid: str = "N/A",
 ):
     """Save benchmark results to CSV file."""
     # Determine output file path
@@ -961,6 +965,7 @@ def _save_results_to_csv(
         "mini_total": f"{mini_total:.6f}",
         "overhead": f"{overhead:.6f}",
         "overhead_percentage": f"{(overhead / large_f * 100):.2f}" if large_f > 0 else "0.00",
+        "core_grid": core_grid,
         # Fine-grained phase timings for large batch
         "large_forward_pass_time": f"{large_timings_dict['forward_pass_time']:.6f}",
         "large_pure_matmul_time": f"{large_timings_dict['pure_matmul_time']:.6f}",
@@ -979,6 +984,9 @@ def _save_results_to_csv(
         # Pure Matmul Overhead
         "pure_matmul_overhead": f"{(mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']):.6f}",
         "pure_matmul_overhead_percentage": f"{((mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']) / large_timings_dict['pure_matmul_time']) * 100:.2f}",
+        "core_grid": cfg.core_grid
+        if hasattr(cfg, "core_grid")
+        else (results.core_grid if "results" in locals() and hasattr(results, "core_grid") else "N/A"),
     }
 
     # Field names (column headers)
@@ -1029,6 +1037,14 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
 
     # Pre-stage the full logical-batch input in DRAM once
     staged_large_input = make_staged_input(device, cfg.large_batch_size, cfg.in_features, dtype, cfg.seed + 42)
+
+    # Determine core grid usage
+    if cfg.enable_weight_sharding:
+        cx, cy = get_optimal_grid_size(device, cfg.in_features, cfg.out_features)
+        core_grid_str = f"{cx}x{cy}"
+    else:
+        grid = device.compute_with_storage_grid_size()
+        core_grid_str = f"Auto (Max {grid.x}x{grid.y})"
 
     # Initialize result variables
     large_phase_timings = None
@@ -1170,6 +1186,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> BenchmarkResult:
         mini_weight_load=mini_w,
         mini_forward=mini_f,
         overhead=overhead,
+        core_grid=core_grid_str,
     )
 
 
@@ -1185,6 +1202,7 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
     )
     print(f"Warmup/Measure     : {cfg.warmup_iters}/{cfg.measure_iters} iters per case")
     print(f"Weight Sharding    : {'Enabled (L1/SRAM)' if cfg.enable_weight_sharding else 'Disabled (DRAM)'}")
+    print(f"Core Grid          : {results.core_grid}")
     # Calculate pure matmul times (subtracting transpose overhead)
     # Note: We need to estimate transpose overhead for the final report based on debug prints
     # Since we didn't store them in PhaseTimings, we'll use the ratio observed in debug prints
@@ -1259,6 +1277,7 @@ def report_results(cfg: BenchmarkConfig, results: BenchmarkResult):
         results.mini_weight_load,
         results.mini_forward,
         results.overhead,
+        results.core_grid,
     )
 
 

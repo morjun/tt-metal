@@ -1,0 +1,75 @@
+Parsing generated/profiler/.logs/profile_log_device.csv...
+Detected Frequency: 1350.0 MHz
+Processed 902464 lines
+
+----------------------------------------------------------------------------------------------------------------------------------
+ANALYSIS REPORT (Freq: 1350.0 MHz) - Grouped by Source File
+Max Time = Latency of the slowest core (Bottleneck Analysis)
+----------------------------------------------------------------------------------------------------------------------------------
+
+[BRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  BRISC-FW                                      brisc.cc                            4.5483     2.5680
+KERNEL_OTHER              BRISC-KERNEL                                  brisck.cc                           4.2933     2.3774
+NOC_WAIT_MATMUL           NOC-MCAST-WAIT-PADDING                        reader_bmm_tile_layout_in1_receiver_writer_padding.cpp 2.4699     2.3557
+NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN1-PADDING                  reader_bmm_tile_layout_in1_sender_writer_padding.cpp 0.4319     0.4319
+SUBZONE_MATMUL            WEIGHT-STREAM-MCAST                           reader_bmm_tile_layout_in1_sender_writer_padding.cpp 0.9647     0.9647
+WEIGHT_STREAM_MATMUL      READ-WEIGHT-DRAM-TO-SRAM-IN1-PADDING          reader_bmm_tile_layout_in1_sender_writer_padding.cpp 1.0779     1.0779
+
+[NCRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  NCRISC-FW                                     ncrisc.cc                           2.6053     1.4964
+KERNEL_OTHER              NCRISC-KERNEL                                 ncrisck.cc                          2.4070     1.3619
+
+[TRISC_0]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 2.5961     2.5894
+FIRMWARE                  TRISC-FW                                      trisc.cc                            4.1992     2.2744
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.0456     2.1637
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 3.4059     3.3993
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0127     0.0127
+
+[TRISC_1]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0041     0.0040
+FIRMWARE                  TRISC-FW                                      trisc.cc                            4.1992     2.2719
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           3.9172     2.0389
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 3.4168     3.4104
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0038     0.0037
+
+[TRISC_2]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0039     0.0039
+FIRMWARE                  TRISC-FW                                      trisc.cc                            4.2065     2.2912
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           3.1777     1.7240
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 2.6437     2.6119
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0038     0.0038
+
+----------------------------------------------------------------------------------------------------------------------------------
+COMPONENT BREAKDOWN (Trace Analysis)
+Note: Producer (BRISC) and Consumer (TRISC) run in parallel.
+      Metrics are max latency across all cores.
+----------------------------------------------------------------------------------------------------------------------------------
+Total Forward Latency       : 3.4168 ms
+--------------------------------------------------
+[CONSUMER / TRISC]
+  > Pure Compute            : 0.8207 ms
+  > Data Wait Stall         : 2.5961 ms (Total Wait for Data)
+--------------------------------------------------
+[PRODUCER / BRISC] (Weights)
+  > DRAM Read Issue         : 1.0779 ms (Active DRAM BW)
+    NOTE: With HEIGHT_SHARDED weights, this measures L1→CB copy, not DRAM read.
+          Higher value vs non-sharded is normal (gather vs sequential).
+          Check overall latency reduction for true performance impact.
+  > DRAM Read Latency       : 0.4319 ms (Wait for Return)
+  > NoC Multicast (Stream)  : 0.9647 ms (Active NoC BW)
+--------------------------------------------------
+[PRODUCER / NCRISC] (Activations)
+  > DRAM Read Issue         : 0.0000 ms (Active DRAM BW)
+  > DRAM Read Latency       : 0.0000 ms (Wait for Return)
+--------------------------------------------------

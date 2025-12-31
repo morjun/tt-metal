@@ -266,9 +266,7 @@ Tensor MatmulOperation::invoke(
 
     // Synchronize to ensure timer captures full execution including data movement
     if (output.device()) {
-        if (auto* mesh_device = dynamic_cast<MeshDevice*>(output.device())) {
-            tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
-        }
+        tt::tt_metal::distributed::Synchronize(output.device(), std::nullopt, {});
     }
     return output;
 }
@@ -319,10 +317,9 @@ Tensor LinearOperation::invoke(
         optional_output_tensor);
 
     // Synchronize to ensure timer captures full execution including data movement
+    // Synchronize to ensure timer captures full execution including data movement
     if (output.device()) {
-        if (auto* mesh_device = dynamic_cast<MeshDevice*>(output.device())) {
-            tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
-        }
+        tt::tt_metal::distributed::Synchronize(output.device(), std::nullopt, {});
     }
     return output;
 }

@@ -4,7 +4,55 @@
 
 This document explains the profiling zones inserted into the TT-Metal matmul kernels to break down the time measured by the `ttnn::Timer` in [`matmul.cpp`](file:///home/masterjunmo/codes/tt-metal/ttnn/cpp/ttnn/operations/matmul/matmul.cpp#L228). The profiling zones measure micro-operations within the matmul pipeline, categorized by the RISC processor executing them.
 
-## Architecture Overview: Three RISC Processors
+## Definitive Call Flow Trace (Proof)
+
+You asked for the **call flow from the `ttnn.matmul` level** to prove why this specific source code (`reuse_mcast_1d_program_factory`) is used, and how `transpose` is handled.
+
+Here is the exact execution chain found in the codebase:
+
+### 1. The Entry Point: `ttnn.matmul`
+**File**: `ttnn/cpp/ttnn/operations/matmul/matmul.cpp`
+When you call `ttnn.matmul(a, b, transpose_a=True)`, the host-side function `bound_matmul` is invoked. Critical logic at line 149:
+
+```cpp
+// matmul.cpp:149
+const auto& input_tensor_a_adjusted = parameters.transpose_a
+                                          ? ttnn::transpose(input_tensor_a, -1, -2, ...)
+                                          : input_tensor_a;
+```
+**Conclusion**: `ttnn` **physically performs the transpose** operation *before* passing the tensors to the matmul device operation.
+*   **Implication**: The kernel factory *always* receives an operand A (IN0) that is already in the correct shape $K \times M$ (or whatever is needed). It does not need to "know" you asked for a transpose; it just sees an input tensor.
+*   **IN0 is always Operand A**: Even if you transposed weights to be Operand A, they are physically passed as the first argument (`input_tensor_a_adjusted`) to the device op.
+
+### 2. The Device Dispatcher: `create_program`
+**File**: `ttnn/cpp/ttnn/operations/matmul/device/matmul_op.cpp`
+The device operation calls `create_program`, which selects the strategy.
+*   It calls `get_program_config` -> `get_mcast_1d_config` (Line 564).
+*   It then switches on the config type in `std::visit` (Line 2790).
+
+```cpp
+// matmul_op.cpp:2720
+} else if constexpr (std::is_same_v<ProgramConfigType, MatmulMultiCoreReuseMultiCast1DProgramConfig>) {
+    auto mcast_mm_program = matmul_multi_core_reuse_mcast_1d_optimized(...);
+    return create_homogenous_mesh_workload(mcast_mm_program, ...);
+}
+```
+
+### 3. The Factory: `matmul_multi_core_reuse_mcast_1d_optimized`
+**File**: `ttnn/cpp/ttnn/operations/matmul/device/matmul_op_multi_core_reuse_mcast_1d_program_factory.cpp`
+This function is the definition of the factory we have been analyzing.
+
+**Final Verdict**:
+*   The **Source Code is Correct**: This factory is indeed the one executing your matmul.
+*   **"In0/In1 Reversed?"**: No. Because `ttnn` physically transposed the inputs *before* calling this factory, the factory receives them as `input_tensor_a` (IN0) and `input_tensor_b` (IN1).
+    *   **IN0** = The first operand passed to `matmul` (after `transpose_a` is applied).
+    *   **IN1** = The second operand passed to `matmul`.
+    *   If you computed `Input @ Weights^T`, then `Input` is IN0 and `Weights^T` is IN1.
+    *   The "Reuse" (Multicast) applies to **IN0 (Input)**.
+    *   The "Distribution" applies to **IN1 (Weights)**.
+
+---
+
 
 The TT-Metal hardware uses three types of RISC processors to execute a matmul operation in parallel:
 
@@ -38,6 +86,72 @@ graph LR
 - CB = Circular Buffer (L1 SRAM staging area)
 - IN0 source: **DRAM** (non-sharded) or **SRAM/L1** (HEIGHT_SHARDED)
 - IN1 source: **DRAM** (not sharded in this workload)
+
+---
+
+## Source of the Graph: Codebase Analysis
+
+The graph above is a **logical visualization derived directly from the TT-Metal source code** that implements the matmul operation on the device. It is not an imported image but a schematic representation of the C++ implementation.
+
+### Source Code File
+The authoritative source for this pipeline architecture is:
+`ttnn/cpp/ttnn/operations/matmul/device/matmul_op_multi_core_reuse_mcast_1d_program_factory.cpp`
+
+This file serves as the **Program Factory** for the "1D Multicast with Reuse" matmul strategy, which is the **standard high-performance path** for many matmul shapes (including the one profiled).
+
+### Terminology Explained: "Reuse" vs. "Sharding"
+The file name prefix `matmul_op_multi_core_reuse_mcast...` refers to the **algorithmic strategy**, which is distinct from the **memory layout** (Sharding).
+
+*   **"Reuse" (in the Program Factory name)**: This primarily refers to **Input Reuse via Multicast** (specifically `MCAST_IN0`).
+    *   *Mechanism*: The factory `matmul_op_multi_core_reuse_mcast_1d` is designed to multicasts the **IN0 (Activations)** block to a row/column of cores. This effectively "reuses" the activation data across multiple cores that are computing different parts of the output.
+    *   *Regarding Weights (IN1)*: You are completely correct that **weights are distributed**. In 1D parallelization, each core is responsible for a different slice of the weight matrix (the `N` dimension).
+    *   *Correction*: The term "Reuse" here highlights that we don't need to fetch the *Activation* block for every single core from DRAM; we fetch it once and multicast it. Ideally, weights (IN1) are just read once per core (because they are unique partitions).
+
+*   **Why IN1 (Weights) also has "Mcast" code?**:
+    *   The kernel `reader_bmm_tile_layout_in1_sender_writer_padding.cpp` includes multicast logic because it supports **block-level multicast**. Even if every core has a unique *set* of weights (partitioned N), for *each specific block* operation, it might multicast that block to a small local group if the grid configuration requires it (e.g., if we map multiple cores to the same weight slice). However, conceptually, **Weights are Distributed, Activations are Reused (Multicasted).**
+
+*   **"Sharding" (The Performance Gain)**: This refers to **L1 Residence**.
+    *   *Concept*: The entire weight tensor is distributed across the cores' L1 memory **before** the op starts.
+    *   *Benefit*: The "Sender" core does **zero** DRAM reads during the matrix multiplication. It simply multicasts the data already sitting in its own L1.
+    *   *Correction*: My previous explanation implies that "Standard Reuse" keeps weights in L1. That was incorrect. **Standard Reuse streams through L1; Sharding stays in L1.**
+
+### Derivation Steps
+The graph was constructed by tracing the following code logic in the factory file:
+1.  **Processor Assignment**: The factory creates three distinct kernels and assigns them to the three RISC processors:
+    *   **NCRISC (RISCV_1)**: Assigned `reader_bmm_tile_layout_in0_sender_padding.cpp` (IN0 Reader).
+    *   **BRISC (RISCV_0)**: Assigned `reader_bmm_tile_layout_in1_sender_writer_padding.cpp` (IN1 Reader/Writer).
+    *   **TRISC**: Assigned `bmm_large_block_zm_fused_bias_activation.cpp` (Compute).
+2.  **Data Flow**: The arrows represent the data movement commands found in these kernel files:
+    *   `noc_async_read_tile` (DRAM -> L1)
+    *   `cb_push_back` (L1 -> Circular Buffer)
+    *   `cb_wait_front` (Circular Buffer -> Compute)
+
+---
+
+### Performance: Why "Reuse" with Sharding is Faster
+
+You asked a critical question: **"If the Tenstorrent/Program Factory is 'reusing' L1 weights even without sharding, where does the performance gain from sharding come from?"**
+
+The answer lies in **where the 'Reuse' starts**:
+
+1.  **Without Sharding (Standard Reuse)**:
+    *   **Mechanism**: The architecture "reuses" a block of weights by multicasting it to many cores.
+    *   **The Cost**: Before it can reuse/multicast anything, the **Sender Core must first fetch the data from DRAM** into its L1.
+    *   **Flow**: `DRAM -> Sender L1 -> Multicast -> Receiver L1s`.
+    *   **Bottleneck**: That initial DRAM fetch is slow (high latency) and consumes DRAM bandwidth.
+
+2.  **With Sharding (Sharded Reuse)**:
+    *   **Mechanism**: The weights are **pre-loaded and resident in L1** before the matmul operation even begins.
+    *   **The Cost**: The "fetch" step is effectively **zero cost** (or a very fast local L1 copy).
+    *   **Flow**: `Sender L1 (Resident) -> Multicast -> Receiver L1s`.
+    *   **Gain**: We completely eliminate the `DRAM -> Sender L1` latency and bandwidth cost.
+
+### Is it the same source code?
+
+*   **For IN1 (Weights)**: **Yes**, it uses the same file `reader_bmm_tile_layout_in1_sender_writer_padding.cpp`, but with a **compile-time flag** (`IN1_SHARDED = 1`). This flag tells the kernel: *"Don't read from DRAM; the data is already in your local L1."*
+*   **For IN0 (Activations)**: **No**, the factory switches to a specialized kernel file: `reader_bmm_tile_layout_in0_sender_receiver_padding_block_sharded.cpp` to handle the sharded input more efficiently.
+
+This combination of **algorithmic reuse** (multicasting) plus **memory residence** (sharding) is what delivers the maximum performance.
 
 ---
 

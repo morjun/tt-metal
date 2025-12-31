@@ -1,0 +1,70 @@
+Parsing generated/profiler/.logs/profile_log_device.csv...
+Detected Frequency: 1350.0 MHz
+Processed 4852492 lines
+
+----------------------------------------------------------------------------------------------------------------------------------
+ANALYSIS REPORT (Freq: 1350.0 MHz) - Grouped by Source File
+Max Time = Latency of the slowest core (Bottleneck Analysis)
+----------------------------------------------------------------------------------------------------------------------------------
+
+[BRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  BRISC-FW                                      brisc.cc                            9.0146     8.5851
+KERNEL_OTHER              BRISC-KERNEL                                  brisck.cc                           8.7973     8.3925
+NOC_WAIT_MATMUL           NOC-MCAST-WAIT-PADDING                        reader_bmm_tile_layout_in1_receiver_writer_padding.cpp 7.5334     6.9117
+NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN1-PADDING                  reader_bmm_tile_layout_in1_sender_writer_padding.cpp 0.8065     0.8065
+SUBZONE_MATMUL            WEIGHT-STREAM-MCAST                           reader_bmm_tile_layout_in1_sender_writer_padding.cpp 1.5900     1.5900
+WEIGHT_STREAM_MATMUL      READ-WEIGHT-DRAM-TO-SRAM-IN1-PADDING          reader_bmm_tile_layout_in1_sender_writer_padding.cpp 0.3188     0.3188
+
+[NCRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  NCRISC-FW                                     ncrisc.cc                           5.0331     4.7773
+KERNEL_OTHER              NCRISC-KERNEL                                 ncrisck.cc                          4.9194     4.6832
+NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN0-PADDING                  reader_bmm_tile_layout_in0_sender_padding.cpp 3.9621     3.4874
+SUBZONE_MATMUL            READ-IN0-DRAM-TO-SRAM-PADDING                 reader_bmm_tile_layout_in0_sender_padding.cpp 0.1755     0.1717
+
+[TRISC_0]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 3.5411     3.4919
+FIRMWARE                  TRISC-FW                                      trisc.cc                            5.0010     4.7907
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.9079     4.7010
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4343     4.3690
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0872     0.0862
+
+[TRISC_1]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0307     0.0268
+FIRMWARE                  TRISC-FW                                      trisc.cc                            4.9969     4.7865
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.8180     4.6126
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4347     4.3696
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0306     0.0272
+
+[TRISC_2]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0259     0.0256
+FIRMWARE                  TRISC-FW                                      trisc.cc                            5.0142     4.8065
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.8948     4.6911
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4404     4.3750
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0291     0.0273
+
+----------------------------------------------------------------------------------------------------------------------------------
+COMPONENT BREAKDOWN (Trace Analysis)
+Note: Producer (BRISC) and Consumer (TRISC) run in parallel.
+      Metrics are max latency across all cores.
+----------------------------------------------------------------------------------------------------------------------------------
+Total Forward Latency       : 4.4404 ms
+--------------------------------------------------
+[CONSUMER / TRISC]
+  > Pure Compute            : 0.8993 ms
+  > Data Wait Stall         : 3.5411 ms (Total Wait for Data)
+--------------------------------------------------
+[PRODUCER / BRISC]
+  > DRAM Read Issue         : 0.3188 ms (Active DRAM BW)
+  > DRAM Read Latency       : 3.9621 ms (Wait for Return)
+  > NoC Multicast (Stream)  : 1.5900 ms (Active NoC BW)
+--------------------------------------------------

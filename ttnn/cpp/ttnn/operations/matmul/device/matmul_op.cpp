@@ -1744,6 +1744,64 @@ void Matmul::validate(
     MatmulProgramConfig chosen_program_config =
         get_program_config(input_tensor_a, input_tensor_b, bias_single_tile_size, this);
 
+    std::visit(
+        [&](const auto& config) {
+            using T = std::decay_t<decltype(config)>;
+            if constexpr (std::is_same_v<T, MatmulMultiCoreReuseProgramConfig>) {
+                log_debug(
+                    tt::LogOp,
+                    "Matmul Config: MultiCoreReuse - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: {}, "
+                    "out_subblock_h: {}, out_subblock_w: {}",
+                    config.compute_with_storage_grid_size,
+                    config.per_core_M,
+                    config.per_core_N,
+                    config.in0_block_w,
+                    config.out_subblock_h,
+                    config.out_subblock_w);
+            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCastProgramConfig>) {
+                log_debug(
+                    tt::LogOp,
+                    "Matmul Config: MultiCoreReuseMultiCast - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: "
+                    "{}, out_subblock_h: {}, out_subblock_w: {}, out_block_h: {}, out_block_w: {}, transpose_mcast: "
+                    "{}",
+                    config.compute_with_storage_grid_size,
+                    config.per_core_M,
+                    config.per_core_N,
+                    config.in0_block_w,
+                    config.out_subblock_h,
+                    config.out_subblock_w,
+                    config.out_block_h,
+                    config.out_block_w,
+                    config.transpose_mcast);
+            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCast1DProgramConfig>) {
+                log_debug(
+                    tt::LogOp,
+                    "Matmul Config: MultiCoreReuseMultiCast1D - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: "
+                    "{}, out_subblock_h: {}, out_subblock_w: {}, out_block_h: {}, out_block_w: {}, mcast_in0: {}, "
+                    "gather_in0: {}, hop_cores: {}",
+                    config.compute_with_storage_grid_size,
+                    config.per_core_M,
+                    config.per_core_N,
+                    config.in0_block_w,
+                    config.out_subblock_h,
+                    config.out_subblock_w,
+                    config.out_block_h,
+                    config.out_block_w,
+                    config.mcast_in0,
+                    config.gather_in0,
+                    config.hop_cores);
+            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>) {
+                log_debug(
+                    tt::LogOp,
+                    "Matmul Config: MultiCoreReuseMultiCastDRAMSharded - per_core_M: {}, per_core_N: {}, in0_block_w: "
+                    "{}",
+                    config.per_core_M,
+                    config.per_core_N,
+                    config.in0_block_w);
+            }
+        },
+        chosen_program_config);
+
     if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(chosen_program_config) &&
         this->global_cb.has_value() && input_tensor_b.is_sharded() && input_tensor_b.buffer()->is_dram()) {
         for (uint32_t i = 1; i < input_tensors.size(); ++i) {

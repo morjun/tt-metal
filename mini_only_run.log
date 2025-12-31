@@ -1,0 +1,69 @@
+nohup: ignoring input
+2025-11-10 06:28:24.539 | DEBUG    | ttnn:<module>:77 - Initial ttnn.CONFIG:
+Config{cache_path=/home/masterjunmo/.cache/ttnn,model_cache_path=/home/masterjunmo/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+2025-11-10 06:28:24.866 | info     |             UMD | Established cluster ETH FW version: 1.6.0 (topology_discovery_blackhole.cpp:295)
+2025-11-10 06:28:24.981 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:209)
+2025-11-10 06:28:25.194 | info     |             UMD | Established cluster ETH FW version: 1.6.0 (topology_discovery_blackhole.cpp:295)
+2025-11-10 06:28:25.540 | info     |             UMD | Established cluster ETH FW version: 1.6.0 (topology_discovery_blackhole.cpp:295)
+2025-11-10 06:28:25.654 | info     |             UMD | Harvesting mask for chip 0 is 0x0 (NOC0: 0x0, simulated harvesting mask: 0x0). (cluster.cpp:413)
+2025-11-10 06:28:25.755 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:257)
+2025-11-10 06:28:25.755 | info     |             UMD | All devices in cluster running firmware version: 18.10.0 (cluster.cpp:235)
+2025-11-10 06:28:25.755 | info     |             UMD | IOMMU: disabled (cluster.cpp:177)
+2025-11-10 06:28:25.755 | info     |             UMD | KMD version: 2.4.1 (cluster.cpp:180)
+2025-11-10 06:28:25.757 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f9c00000000 and size 0x40000000 pinned to physical address 0x200000000 (pci_device.cpp:536)
+2025-11-10 06:28:25.757 | info     |             UMD | Device: 0 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x200000000 (blackhole_tt_device.cpp:95)
+2025-11-10 06:28:25.774 | info     |          Fabric | TopologyMapper mapping start (mesh=0): n_log=1, n_phys=1, log_deg_hist={0:1}, phys_deg_hist={0:1} (topology_mapper.cpp:574)
+2025-11-10 06:28:27.402 | info     |           Metal | Profiler started on device 0 (device_pool.cpp:203)
+2025-11-10 06:28:32.897 | INFO     | tracy:signpost:41 - MiniBatch_Sequence_0_Start : Starting minibatch sequence 0
+2025-11-10 06:28:33.673 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_0_Start : Sequence 0, Forward pass 0
+2025-11-10 06:28:33.673 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_0_End : Completed sequence 0, forward pass 0
+2025-11-10 06:28:33.674 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_1_Start : Sequence 0, Forward pass 1
+2025-11-10 06:28:33.675 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_1_End : Completed sequence 0, forward pass 1
+2025-11-10 06:28:33.676 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_2_Start : Sequence 0, Forward pass 2
+2025-11-10 06:28:33.676 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_2_End : Completed sequence 0, forward pass 2
+2025-11-10 06:28:33.677 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_3_Start : Sequence 0, Forward pass 3
+2025-11-10 06:28:33.677 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_3_End : Completed sequence 0, forward pass 3
+2025-11-10 06:28:33.678 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_4_Start : Sequence 0, Forward pass 4
+2025-11-10 06:28:33.679 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_4_End : Completed sequence 0, forward pass 4
+2025-11-10 06:28:33.680 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_5_Start : Sequence 0, Forward pass 5
+2025-11-10 06:28:33.680 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_5_End : Completed sequence 0, forward pass 5
+2025-11-10 06:28:33.681 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_6_Start : Sequence 0, Forward pass 6
+2025-11-10 06:28:33.681 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_6_End : Completed sequence 0, forward pass 6
+2025-11-10 06:28:33.682 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_7_Start : Sequence 0, Forward pass 7
+2025-11-10 06:28:33.683 | INFO     | tracy:signpost:41 - MiniBatch_Forward_0_7_End : Completed sequence 0, forward pass 7
+2025-11-10 06:28:33.683 | INFO     | tracy:signpost:41 - MiniBatch_Sequence_0_End : Completed minibatch sequence 0
+2025-11-10 06:28:33.709 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.710 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.712 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.713 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.714 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.715 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.716 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+2025-11-10 06:28:33.717 | warning  |           Metal | Unable to set process priority to 0, error code: -1 (thread_pool.cpp:97)
+[INFO] TRACY profiling enabled
+[TRACY] Profiling enabled - zones and signposts will be recorded
+
+===== TTNN Linear Benchmark with TRACY Profiling =====
+Comparison: Large batch (single load) vs Minibatches (same weights; DRAM→L1 re-stream)
+DType: bfloat16
+Dims: in=4096, out=4096
+Large batch: B=256
+Small batch: b=32 x 8 (total=256)
+Warmup/Measure: 0/1 iters per case
+
+-- Single pass: LARGE batch --
+Total avg (ms):    0.000
+  Weight load (ms):    0.000
+  Forward (ms):    0.000
+
+-- Repeated passes: SMALL minibatch --
+Sequence total (ms) for 8 passes:   60.260
+  Weight load sum (ms):   58.538
+  Forward sum (ms):    1.722
+
+-- Overhead vs single large batch --
+Estimated overhead (ms):    1.722
+Overhead percentage:   0.00%
+
+Results saved to: /home/masterjunmo/codes/tt-metal/research_codes/benchmark_results_tracy.csv
+2025-11-10 06:28:34.964 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:425)

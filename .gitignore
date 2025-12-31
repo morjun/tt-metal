@@ -5,7 +5,7 @@
 .idea
 runtime
 *.tracy
-*.log
+# *.log
 *.csv
 *.xlsx
 *.code-workspace

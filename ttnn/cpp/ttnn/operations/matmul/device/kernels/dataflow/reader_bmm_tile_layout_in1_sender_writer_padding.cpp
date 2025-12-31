@@ -313,8 +313,8 @@ void kernel_main() {
                             l1_write_addr_in1;  // copy start address of block, to be used for mcasting
 
                         {
-                            // ✅ DISABLED: Measure IN1 (weight) reading - causes buffer overflow
-                            DeviceZoneScopedN("READ-WEIGHT-DRAM-TO-SRAM-IN1-PADDING");
+                            // Measure IN1 (activations in transposed workload) reading
+                            DeviceZoneScopedN("READ-IN1-DRAM-TO-SRAM-PADDING");
 
                             // Copy in1 block into CB, as the default kernel
                             uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
@@ -342,7 +342,7 @@ void kernel_main() {
                         }
 
                         {
-                            // ✅ DISABLED: Measure NOC barrier wait time - causes buffer overflow
+                            // Measure NOC barrier wait time for IN1 (activations)
                             DeviceZoneScopedN("NOC-BARRIER-WAIT-IN1-PADDING");
                             // Barrier! make sure the reads are done
                             noc_async_read_barrier();
@@ -352,7 +352,8 @@ void kernel_main() {
 
 #ifndef SKIP_MCAST
                         {
-                            DeviceZoneScopedN("WEIGHT-STREAM-MCAST");
+                            // Multicast IN1 (activations) to receiver cores
+                            DeviceZoneScopedN("IN1-STREAM-MCAST");
 
                             // wait until all in1 mcast destinations have atomically incremented the in1 semaphore_addr
                             // (i.e. its value should be in0_mcast_num_dests), then reset the semaphore_addr value back

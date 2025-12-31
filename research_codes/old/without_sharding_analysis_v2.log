@@ -1,0 +1,68 @@
+Parsing generated/profiler/.logs/profile_log_device.csv...
+Detected Frequency: 1350.0 MHz
+Processed 4852492 lines
+
+----------------------------------------------------------------------------------------------------------------------------------
+ANALYSIS REPORT (Freq: 1350.0 MHz) - Grouped by Source File
+Max Time = Latency of the slowest core (Bottleneck Analysis)
+----------------------------------------------------------------------------------------------------------------------------------
+
+[BRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  BRISC-FW                                      brisc.cc                            9.0722     8.6444
+KERNEL_OTHER              BRISC-KERNEL                                  brisck.cc                           8.8571     8.4505
+NOC_WAIT_MATMUL           NOC-MCAST-WAIT-PADDING                        reader_bmm_tile_layout_in1_receiver_writer_padding.cpp 7.5912     6.9488
+NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN1-PADDING                  reader_bmm_tile_layout_in1_sender_writer_padding.cpp 1.1912     1.1912
+WEIGHT_STREAM_MATMUL      READ-WEIGHT-DRAM-TO-SRAM-IN1-PADDING          reader_bmm_tile_layout_in1_sender_writer_padding.cpp 0.4882     0.4882
+
+[NCRISC]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+FIRMWARE                  NCRISC-FW                                     ncrisc.cc                           5.0624     4.8102
+KERNEL_OTHER              NCRISC-KERNEL                                 ncrisck.cc                          4.9490     4.7163
+NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN0-PADDING                  reader_bmm_tile_layout_in0_sender_padding.cpp 3.9983     3.5129
+SUBZONE_MATMUL            READ-IN0-DRAM-TO-SRAM-PADDING                 reader_bmm_tile_layout_in0_sender_padding.cpp 0.1754     0.1718
+
+[TRISC_0]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 3.5760     3.5250
+FIRMWARE                  TRISC-FW                                      trisc.cc                            5.0348     4.8252
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.9419     4.7361
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4677     4.4019
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0873     0.0863
+
+[TRISC_1]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0288     0.0268
+FIRMWARE                  TRISC-FW                                      trisc.cc                            5.0306     4.8210
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.8487     4.6469
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4681     4.4025
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0311     0.0272
+
+[TRISC_2]
+Category                  Zone Name                                     Source File                         Max(ms)    Avg(ms)
+----------------------------------------------------------------------------------------------------------------------------------
+DATA_WAIT_MATMUL          CB-WAIT-FRONT                                 bmm_large_block_zm_fused_bias_activation.cpp 0.0265     0.0256
+FIRMWARE                  TRISC-FW                                      trisc.cc                            5.0498     4.8412
+KERNEL_OTHER              TRISC-KERNEL                                  trisck.cc                           4.9210     4.7258
+SUBZONE_MATMUL            BATCH-ITERATION                               bmm_large_block_zm_fused_bias_activation.cpp 4.4739     4.4081
+SUBZONE_MATMUL            CB-POP-FRONT                                  bmm_large_block_zm_fused_bias_activation.cpp 0.0291     0.0272
+
+----------------------------------------------------------------------------------------------------------------------------------
+INFERRED BOTTLENECK BREAKDOWN
+Logic: Assumes perfect overlap between Compute and Data Movement.
+       System Overhead = Total Latency - max(Pure Compute, DRAM Fetch).
+----------------------------------------------------------------------------------------------------------------------------------
+Total Forward Latency   : 4.4739 ms
+Primary Bottleneck      : DRAM Bandwidth/Latency
+--------------------------------------------------
+[1] Pure Compute        : 0.8979 ms
+[2] DRAM Fetch (Active) : 4.4865 ms
+    |-- Issue           : 0.4882 ms
+    `-- Latency         : 3.9983 ms
+[3] System Overhead     : 0.0000 ms (NoC/Sync/Misc)
+--------------------------------------------------
+Overlap Efficiency      : 100.0%
