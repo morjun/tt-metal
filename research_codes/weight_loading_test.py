@@ -600,6 +600,25 @@ def make_tt_input(
     return x_tt
 
 
+def write_iter_to_l1(device, iter_idx):
+    # Write to a safe address in L1 (e.g. 100000, well past Mailbox/FW/Reserved)
+    l1_addr = 100000
+    # Use compute_with_storage_grid_size to cover all potential workers
+    grid = device.compute_with_storage_grid_size()
+    data = [int(iter_idx)]
+    # Iterate x, y
+    for x in range(grid.x):
+        for y in range(grid.y):
+            core = ttnn.CoreCoord(x, y)
+            # Use the bound function directly from _ttnn
+            if hasattr(ttnn._ttnn.device, "WriteToDeviceL1"):
+                try:
+                    ttnn._ttnn.device.WriteToDeviceL1(device, core, l1_addr, data)
+                except Exception as e:
+                    # This might happen if the core is not a valid worker core
+                    pass
+
+
 def make_staged_input(device: ttnn.Device, total_batch_size: int, in_features: int, dtype, seed: int) -> ttnn.Tensor:
     """Create a single large input tensor on device DRAM to be sliced per minibatch."""
     return make_tt_input(device, total_batch_size, in_features, dtype, seed)
@@ -677,6 +696,7 @@ def time_forward(
         ttnn.timer.reset_all()
 
         # Forward pass - measure compute time
+        write_iter_to_l1(device, iter_idx + 1)
         print(f"[PROFILE] Measurement forward {iter_idx}")
         _ = linear(x_tt)
 
@@ -813,6 +833,8 @@ def time_minibatch_sequence(
 
             # Forward pass - includes weight streaming, compute, and communication
             # (all happen during kernel execution, measured as total forward time)
+            # Use 100 base for minibatches to distinguish from large batch
+            write_iter_to_l1(device, 100 + sequence_idx * 10 + i)
             _ = linear(x_slice)
 
             # Get durations from C++ timers

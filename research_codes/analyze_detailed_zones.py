@@ -29,9 +29,12 @@ DEFAULT_FREQ_MHZ = 1350
 def parse_detailed_profile(csv_path):
     """Parse profile_log_device.csv with custom zones."""
 
-    # Structure: cores[core_id][risc_type][(zone_name, src_file)] = [duration, duration, ...]
+    # Structure: cores[core_id][risc_type][(zone_name, src_file, iter_id)] = [duration, duration, ...]
     cores = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     zone_stack = {}  # Key: (core_id, risc_type) -> list of (zone_name, start_cycle)
+
+    # Track current iteration ID per core/RISC
+    core_iter_map = {}  # Key: (core_id, risc_type) -> current_iter_id
 
     freq_mhz = DEFAULT_FREQ_MHZ
 
@@ -56,7 +59,6 @@ def parse_detailed_profile(csv_path):
             line_count += 1
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 14:
-                # Some lines might be truncated or old format
                 continue
 
             try:
@@ -92,10 +94,22 @@ def parse_detailed_profile(csv_path):
                     if top_name == zone_name:
                         zone_stack[stack_key].pop()
                         duration = cycles - start_cycle
-                        # Store by (ZoneName, SrcFile) to distinguish same named zones in diff files
-                        cores[core_id][risc_type][(zone_name, top_src)].append(duration)
+
+                        # Get current iteration ID
+                        iter_id = core_iter_map.get(stack_key, 0)  # Default to 0 if not set
+
+                        # Store by (ZoneName, SrcFile, IterID)
+                        cores[core_id][risc_type][(zone_name, top_src, iter_id)].append(duration)
                     else:
                         pass
+
+            elif zone_type == "TS_DATA":
+                try:
+                    data_val = int(parts[6])
+                    core_iter_map[stack_key] = data_val
+                    # print(f"DEBUG: Found TS_DATA {data_val} on Core {core_x},{core_y} {risc_type} at {cycles}")
+                except:
+                    pass
 
         print(f"Processed {line_count} lines")
 
@@ -146,166 +160,84 @@ def analyze_breakdown(cores, freq_mhz):
         print("No data found.")
         return
 
-    # Structure: zone_data[risc][(zone_name, src_file)] = list of lists
-    zone_data = defaultdict(lambda: defaultdict(list))
+    # Structure: duration_per_iter[iter_id][core_id][risc][(zone, src)] = sum(durations)
+    duration_per_iter = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
 
     for core_id, riscs in cores.items():
         for risc, zones in riscs.items():
-            for (z_name, src_file), durations in zones.items():
-                zone_data[risc][(z_name, src_file)].append(durations)
+            for (z_name, src_file, iter_id), durations in zones.items():
+                total_dur = sum(durations)
+                duration_per_iter[iter_id][core_id][risc][(z_name, src_file)] += total_dur
+
+    # Group IDs
+    groups = {"LARGE_BATCH (IDs < 100)": [], "MINIBATCH (IDs >= 100)": [], "UNKNOWN (ID 0)": []}
+
+    for iter_id in sorted(duration_per_iter.keys()):
+        if iter_id == 0:
+            groups["UNKNOWN (ID 0)"].append(iter_id)
+        elif iter_id < 100:
+            groups["LARGE_BATCH (IDs < 100)"].append(iter_id)
+        else:
+            groups["MINIBATCH (IDs >= 100)"].append(iter_id)
 
     print(f"\n{'-'*130}")
-    print(f"ANALYSIS REPORT (Freq: {freq_mhz} MHz) - Grouped by Source File")
-    print(f"Max Time = Latency of the slowest core (Bottleneck Analysis)")
+    print(f"ITERATION ANALYSIS (Freq: {freq_mhz} MHz) - Grouped by Iteration ID")
+    print(f"Metrics are averaged across iterations in each group.")
+    print(f"Bottleneck analysis: Max duration across all cores.")
     print(f"{'-'*130}")
 
-    # Track metrics for final summary
-    metrics = {
-        "compute_loop": 0.0,
-        "compute_stall": 0.0,
-        "weight_read_issue": 0.0,  # Active BW usage (BRISC)
-        "weight_read_wait": 0.0,  # Latency tail (BRISC)
-        "act_read_issue": 0.0,  # Active BW usage (NCRISC)
-        "act_read_wait": 0.0,  # Latency tail (NCRISC)
-    }
+    for group_name, iter_ids in groups.items():
+        if not iter_ids:
+            continue
 
-    for risc in sorted(zone_data.keys()):
-        print(f"\n[{risc}]")
+        print(f"\n>>> Group: {group_name} (Count: {len(iter_ids)}, IDs: {sorted(iter_ids)})")
 
-        items = []
-        for (z_name, src_file), core_dur_lists in zone_data[risc].items():
-            cat = classify_zone(z_name, src_file)
+        # Collect all (zone, src, risc) keys present in this group
+        all_keys = set()
+        for iid in iter_ids:
+            for core in duration_per_iter[iid]:
+                for risc in duration_per_iter[iid][core]:
+                    for k in duration_per_iter[iid][core][risc]:
+                        all_keys.add((k, risc))
 
-            # 1. Calculate Total Time per Core (Bottleneck Analysis)
-            # core_dur_lists is a list of lists (one per core)
-            total_time_per_core = [sum(d) for d in core_dur_lists]
-            max_cycles = max(total_time_per_core)
+        if not all_keys:
+            print("  No data recorded.")
+            continue
 
-            # Max(ms) = Latency of the slowest core (Bottleneck)
-            max_ms = max_cycles / (freq_mhz * 1000)
+        print(f"{'RISC':<15} | {'ZONE':<45} | {'AVG TIME (ms)':<15} | {'MAX TIME (ms)':<15}")
+        print(f"{'-'*100}")
 
-            # 2. Calculate Per-Iteration Stats (Latency Analysis)
-            # Flatten all durations to find the absolute worst single-invocation latency
-            all_durations = [d for sublist in core_dur_lists for d in sublist]
-            if not all_durations:
-                continue
+        # Calculate stats for each zone type
+        results = []
+        for (z_name, src), risc in all_keys:
+            total_time_group_max = 0.0  # Sum of max-core-times across iterations
+            global_max_single_iter = 0.0
 
-            max_iter_cycles_global = max(all_durations)
-            max_iter_ms = max_iter_cycles_global / (freq_mhz * 1000)
+            for iid in iter_ids:
+                # Find max duration across cores for this iid and zone
+                max_core_dur = 0.0
+                for core in duration_per_iter[iid]:
+                    if risc in duration_per_iter[iid][core]:
+                        val = duration_per_iter[iid][core][risc].get((z_name, src), 0)
+                        if val > max_core_dur:
+                            max_core_dur = val
 
-            # 3. Calculate Count and Avg/Iter
-            # We use the count from the bottleneck core (or average if slightly skewed)
-            counts = [len(d) for d in core_dur_lists]
-            # Use max count to be safe (if some cores finished early/dropped packets, we want the full count)
-            final_count = max(counts)
+                total_time_group_max += max_core_dur
+                if max_core_dur > global_max_single_iter:
+                    global_max_single_iter = max_core_dur
 
-            # Avg/Iter = Total Time of Bottleneck Core / Count of Bottleneck Core
-            if final_count > 0:
-                avg_iter_ms = max_ms / final_count
-            else:
-                avg_iter_ms = 0.0
+            avg_time_ms = (total_time_group_max / len(iter_ids)) / (freq_mhz * 1000)
+            max_time_ms = global_max_single_iter / (freq_mhz * 1000)
 
-            items.append(
-                {
-                    "name": z_name,
-                    "src": src_file,
-                    "cat": cat,
-                    "max_ms": max_ms,
-                    "count": final_count,
-                    "avg_iter_ms": avg_iter_ms,
-                    "max_iter_ms": max_iter_ms,
-                }
-            )
+            results.append((risc, z_name, avg_time_ms, max_time_ms))
 
-            # Capture key metrics for inferred breakdown
-            # TRISC Side
-            if "BATCH-ITERATION" in z_name:
-                metrics["compute_loop"] = max(metrics["compute_loop"], max_ms)
-            if "CB-WAIT" in z_name:
-                metrics["compute_stall"] = max(metrics["compute_stall"], max_ms)
+        # Sort by avg time desc
+        results.sort(key=lambda x: x[2], reverse=True)
 
-            # BRISC Side (IN1 = Activations in transposed workload)
-            if "READ-WEIGHT" in z_name or "READ-IN1" in z_name:
-                metrics["weight_read_issue"] = max(metrics["weight_read_issue"], max_ms)
-            if "NOC-BARRIER-WAIT-IN1" in z_name:  # Specific to IN1 (Activations)
-                metrics["weight_read_wait"] = max(metrics["weight_read_wait"], max_ms)
+        for risc, z_name, avg_t, max_t in results:
+            print(f"{risc:<15} | {z_name:<45} | {avg_t:<15.4f} | {max_t:<15.4f}")
 
-            # NCRISC Side (IN0 = Weights in transposed workload)
-            if "READ-IN0" in z_name:
-                metrics["act_read_issue"] = max(metrics["act_read_issue"], max_ms)
-            if "NOC-BARRIER-WAIT-IN0" in z_name:  # Specific to IN0 (Weights)
-                metrics["act_read_wait"] = max(metrics["act_read_wait"], max_ms)
-
-        # Sort by Category
-        items.sort(key=lambda x: (x["cat"], -x["max_ms"]))
-
-        # Header for the table
-        print(
-            f"{'Category':<25} {'Zone Name':<45} {'Source File':<35} {'Count':<8} {'Avg/Iter':<10} {'Max/Iter':<10} {'Max(ms)':<10}"
-        )
-        print(f"{'-'*155}")
-
-        for item in items:
-            print(
-                f"{item['cat']:<25} {item['name']:<45} {item['src']:<35} {int(item['count']):<8} {item['avg_iter_ms']:<10.4f} {item['max_iter_ms']:<10.4f} {item['max_ms']:<10.4f}"
-            )
-
-    # Component Breakdown
-    # Present raw metrics for Producer (BRISC) and Consumer (TRISC)
-    # Avoid inferring overlap efficiency or hidden overheads.
-
-    if metrics["compute_loop"] > 0:
-        print(f"\n{'-'*130}")
-        print(f"COMPONENT BREAKDOWN (Trace Analysis)")
-        print(f"Note: Producer (BRISC) and Consumer (TRISC) run in parallel.")
-        print(f"      Metrics are max latency across all cores.")
-        print(f"{'-'*130}")
-
-        total = metrics["compute_loop"]
-        stall = metrics["compute_stall"]
-
-        # 1. Pure Compute
-        pure_compute = max(0, total - stall)
-
-        # 2. DRAM Data Fetch (Weights)
-        weight_issue = metrics["weight_read_issue"]  # Active BW
-        weight_latency = metrics["weight_read_wait"]  # Tail Latency
-
-        # 3. DRAM Data Fetch (Activations)
-        act_issue = metrics["act_read_issue"]
-        act_latency = metrics["act_read_wait"]
-
-        # 4. NoC Multicast
-        # We need to capture the new zone if it exists, or it will be 0
-        # Re-iterate to find the zone in ANY risc (it should be in BRISC)
-        noc_mcast_exact = 0.0
-
-        # Helper to find zone in data
-        for risc in zone_data:
-            for (z_name, src_file), core_dur_lists in zone_data[risc].items():
-                if "WEIGHT-STREAM-MCAST" in z_name:
-                    total_time_per_core = [sum(d) for d in core_dur_lists]
-                    max_cycles = max(total_time_per_core)
-                    max_ms = max_cycles / (freq_mhz * 1000)
-                    noc_mcast_exact = max(noc_mcast_exact, max_ms)
-
-        print(f"Total Forward Latency       : {total:.4f} ms")
-        print(f"--------------------------------------------------")
-        print(f"[CONSUMER / TRISC]")
-        print(f"  > Pure Compute            : {pure_compute:.4f} ms")
-        print(f"  > Data Wait Stall         : {stall:.4f} ms (Total Wait for Data)")
-        print(f"--------------------------------------------------")
-        print(f"[PRODUCER / BRISC] (IN1 - Activations)")
-        print(f"  > DRAM Read Issue         : {weight_issue:.4f} ms (Active DRAM BW)")
-        print(f"    NOTE: Activations are always loaded from GDDR6 DRAM (never pre-sharded).")
-        print(f"          Zone name 'READ-WEIGHT...' is misleading - this measures activation loading.")
-        print(f"  > DRAM Read Latency       : {weight_latency:.4f} ms (Wait for Return)")
-        print(f"  > NoC Multicast (Stream)  : {noc_mcast_exact:.4f} ms (Active NoC BW)")
-        print(f"--------------------------------------------------")
-        print(f"[PRODUCER / NCRISC] (IN0 - Weights)")
-        print(f"  > DRAM Read Issue         : {act_issue:.4f} ms (Active DRAM BW)")
-        print(f"  > DRAM Read Latency       : {act_latency:.4f} ms (Wait for Return)")
-        print(f"--------------------------------------------------")
+    return
 
 
 def main():

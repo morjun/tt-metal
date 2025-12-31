@@ -83,6 +83,12 @@ inline void reblock_and_untilize(
 }
 
 void MAIN {
+    // Read iteration index from L1 (written by host)
+    // Address must match host side (100000)
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(100000);
+    uint32_t iter_idx = *ptr;
+    DeviceTimestampedData("FORWARD_PASS", (uint64_t)iter_idx);
+
     // ✅ DISABLED: Main profiling scope - causes buffer overflow even with 130+ cores × 1 zone
     // DeviceZoneScopedMainChildN("TRISC-MATMUL-FUSED-COMPUTE");
 

@@ -527,6 +527,22 @@ void device_module(py::module& m_device) {
     m_device.attr("DEFAULT_WORKER_L1_SIZE") = py::int_(DEFAULT_WORKER_L1_SIZE);
 
     m_device.def(
+        "WriteToDeviceL1",
+        [](MeshDevice* mesh_device, const CoreCoord& core, uint32_t address, const std::vector<uint32_t>& data) {
+            bool success = true;
+            for (auto* device : mesh_device->get_devices()) {
+                std::vector<uint32_t> data_copy = data;
+                success &= tt::tt_metal::detail::WriteToDeviceL1(device, core, address, data_copy);
+            }
+            return success;
+        },
+        py::arg("device"),
+        py::arg("core"),
+        py::arg("address"),
+        py::arg("data"),
+        "Write data to L1 memory of a specific core.");
+
+    m_device.def(
         "get_max_worker_l1_unreserved_size",
         &tt::tt_metal::hal::get_max_worker_l1_unreserved_size,
         "Return the maximum size of the worker L1 unreserved memory.");
