@@ -170,11 +170,11 @@ def analyze_breakdown(cores, freq_mhz):
                 duration_per_iter[iter_id][core_id][risc][(z_name, src_file)] += total_dur
 
     # Group IDs
-    groups = {"LARGE_BATCH (IDs < 100)": [], "MINIBATCH (IDs >= 100)": [], "UNKNOWN (ID 0)": []}
+    groups = {"LARGE_BATCH (IDs < 100)": [], "MINIBATCH (IDs >= 100)": [], "IGNORED/WARMUP": []}
 
     for iter_id in sorted(duration_per_iter.keys()):
-        if iter_id == 0:
-            groups["UNKNOWN (ID 0)"].append(iter_id)
+        if iter_id <= 0 or iter_id > 1000000:
+            groups["IGNORED/WARMUP"].append(iter_id)
         elif iter_id < 100:
             groups["LARGE_BATCH (IDs < 100)"].append(iter_id)
         else:

@@ -83,9 +83,8 @@ inline void reblock_and_untilize(
 }
 
 void MAIN {
-    // Read iteration index from L1 (written by host)
-    // Address must match host side (100000)
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(100000);
+    // Read iter index from L1 (written by host)
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(120000);
     uint32_t iter_idx = *ptr;
     DeviceTimestampedData("FORWARD_PASS", (uint64_t)iter_idx);
 

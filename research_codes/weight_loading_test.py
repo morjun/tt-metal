@@ -574,6 +574,16 @@ def make_tt_weight_and_bias(
     # Capture weight loading time from C++ timer
     weight_load_time = ttnn.timer.get_duration("to_device") / 1000.0
 
+    # # DEBUG: Check Buffer Address
+    # try:
+    #     if hasattr(w_tt, "buffer_address"):
+    #          addr = w_tt.buffer_address()
+    #         #  print(f"[DEBUG] Weight Tensor Address: {addr} (Type: {w_tt.memory_config().buffer_type})")
+    #     if hasattr(w_tt.memory_config(), "shard_spec"):
+    #         #  print(f"[DEBUG] Weight Shard Spec: {w_tt.memory_config().shard_spec}")
+    # except:
+    #     pass
+
     return w_tt, b_tt, weight_load_time
 
 
@@ -597,15 +607,25 @@ def make_tt_input(
 
     # Input loading time will be captured by C++ timers.
 
+    # DEBUG: Check Buffer Address
+    # Note: Accessing buffer address might require using _ttnn or attributes depending on version
+    # try:
+    #     if hasattr(x_tt, "buffer_address"):
+    #          addr = x_tt.buffer_address()
+    #          print(f"[DEBUG] Input Tensor Address: {addr} (Type: {x_tt.memory_config().buffer_type})")
+    # except:
+    #     pass
+
     return x_tt
 
 
 def write_iter_to_l1(device, iter_idx):
-    # Write to a safe address in L1 (e.g. 100000, well past Mailbox/FW/Reserved)
-    l1_addr = 100000
+    # Write to a safe address in L1 (e.g. 120000, well past Mailbox/FW/Reserved/ShardedWeights)
+    l1_addr = 120000
     # Use compute_with_storage_grid_size to cover all potential workers
     grid = device.compute_with_storage_grid_size()
     data = [int(iter_idx)]
+    # print(f"[DEBUG] Writing {data} to L1 {l1_addr} on Grid: {grid.x}x{grid.y}")
     # Iterate x, y
     for x in range(grid.x):
         for y in range(grid.y):
@@ -616,6 +636,7 @@ def write_iter_to_l1(device, iter_idx):
                     ttnn._ttnn.device.WriteToDeviceL1(device, core, l1_addr, data)
                 except Exception as e:
                     # This might happen if the core is not a valid worker core
+                    # print(f"[DEBUG] Failed to write to {x},{y}: {e}")
                     pass
 
 
@@ -671,15 +692,18 @@ def time_forward(
     if pre_measured_compile_ms is not None:
         timings.compile_time = pre_measured_compile_ms
         print(f"[PROFILE] Warmup forward 0 (kernel already compiled)")
+        write_iter_to_l1(device, 0)  # ID 0 for Warmup
         _ = linear(x_tt)
     else:
         print(f"[PROFILE] Warmup forward 0 (compiling kernels)")
+        write_iter_to_l1(device, 0)  # ID 0 for Warmup
         _ = linear(x_tt)
         # Compilation time will be captured by C++ timers.
 
     # Continue with remaining warmup iterations (compilation already done)
     for i in range(1, warmup_iters):
         print(f"[PROFILE] Warmup forward {i}")
+        write_iter_to_l1(device, 0)  # ID 0 for Warmup
         _ = linear(x_tt)
 
     # Measure with fine-grained timing
@@ -805,7 +829,7 @@ def time_minibatch_sequence(
     initial_kernel_compilation_ms = timings.compile_time
 
     def run_one_sequence(
-        sequence_idx: int, include_one_time_costs: bool
+        sequence_idx: int, include_one_time_costs: bool, is_warmup: bool = False
     ) -> Tuple[PhaseTimings, float, float, float, float]:
         seq_timings = PhaseTimings()
         seq_fwd_ms = 0.0
@@ -834,7 +858,10 @@ def time_minibatch_sequence(
             # Forward pass - includes weight streaming, compute, and communication
             # (all happen during kernel execution, measured as total forward time)
             # Use 100 base for minibatches to distinguish from large batch
-            write_iter_to_l1(device, 100 + sequence_idx * 10 + i)
+            if is_warmup:
+                write_iter_to_l1(device, 0)  # ID 0 for Warmup
+            else:
+                write_iter_to_l1(device, 100 + sequence_idx * 10 + i)
             _ = linear(x_slice)
 
             # Get durations from C++ timers
@@ -903,8 +930,10 @@ def time_minibatch_sequence(
     # Use pre-measured compile time if provided; otherwise measure once
     if pre_measured_compile_ms is not None:
         timings.compile_time = pre_measured_compile_ms
+        write_iter_to_l1(device, 0)  # ID 0 for Warmup
         _ = linear(dummy_input_tt)
     else:
+        write_iter_to_l1(device, 0)  # ID 0 for Warmup
         _ = linear(dummy_input_tt)
         # Compilation time will be captured by C++ timers.
         timings.compile_time = 0.0
@@ -915,7 +944,7 @@ def time_minibatch_sequence(
     # Now run warmup sequences (compilation already done, so these are fast)
     # All minibatches in run_one_sequence will reuse the kernel compiled above
     for i in range(warmup_iters):
-        _, _, _, _, _ = run_one_sequence(i, include_one_time_costs=False)
+        _, _, _, _, _ = run_one_sequence(i, include_one_time_costs=False, is_warmup=True)
 
     # Measure: run full sequence measure_iters times and average
     phase_timings_list = []
@@ -927,7 +956,9 @@ def time_minibatch_sequence(
         # include_one_time = seq_idx == 0  # Include one-time costs only for first sequence
         include_one_time = False
         ttnn.timer.reset_all()
-        seq_timings, total, weight_load_ms, fwd_ms, pure_matmul_ms = run_one_sequence(seq_idx, include_one_time)
+        seq_timings, total, weight_load_ms, fwd_ms, pure_matmul_ms = run_one_sequence(
+            seq_idx, include_one_time, is_warmup=False
+        )
         totals.append(total)
         weight_loads.append(weight_load_ms)
         fwds.append(fwd_ms)
