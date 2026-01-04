@@ -16,6 +16,11 @@
 void kernel_main() {
     // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
     // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-IN0-SENDER");
+    // Read iter index from L1 (written by host)
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(120000);
+    uint32_t iter_idx = *ptr;
+    DeviceTimestampedData("FORWARD_PASS", (uint64_t)iter_idx);
+
     uint32_t rt_args_idx = 0;
     // in0 tensor args
     const uint32_t in0_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);

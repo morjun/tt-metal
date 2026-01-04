@@ -1,0 +1,74 @@
+Parsing generated/profiler/.logs/profile_log_device.csv...
+Detected Frequency: 1350.0 MHz
+Processed 915136 lines
+
+----------------------------------------------------------------------------------------------------------------------------------
+ITERATION ANALYSIS (Freq: 1350.0 MHz) - Grouped by Iteration ID
+Metrics are averaged across iterations in each group.
+Bottleneck analysis: Max duration across all cores.
+----------------------------------------------------------------------------------------------------------------------------------
+
+>>> Group: LARGE_BATCH (IDs < 100) (Count: 5, IDs: [1, 2, 3, 4, 5])
+RISC            | ZONE                                          | AVG TIME (ms)   | MAX TIME (ms)
+----------------------------------------------------------------------------------------------------
+TRISC_2         | TRISC-FW                                      | 0.2606          | 0.2626
+TRISC_1         | TRISC-FW                                      | 0.2592          | 0.2611
+TRISC_0         | TRISC-FW                                      | 0.2592          | 0.2611
+TRISC_0         | TRISC-KERNEL                                  | 0.2563          | 0.2580
+TRISC_1         | TRISC-KERNEL                                  | 0.2534          | 0.2552
+TRISC_2         | TRISC-KERNEL                                  | 0.2460          | 0.2481
+TRISC_1         | BATCH-ITERATION                               | 0.2166          | 0.2168
+TRISC_0         | BATCH-ITERATION                               | 0.2164          | 0.2166
+TRISC_2         | BATCH-ITERATION                               | 0.2049          | 0.2051
+TRISC_0         | CB-WAIT-FRONT                                 | 0.1635          | 0.1637
+TRISC_0         | CB-POP-FRONT                                  | 0.0008          | 0.0008
+TRISC_1         | CB-WAIT-FRONT                                 | 0.0003          | 0.0003
+TRISC_2         | CB-POP-FRONT                                  | 0.0003          | 0.0003
+TRISC_2         | CB-WAIT-FRONT                                 | 0.0003          | 0.0003
+TRISC_1         | CB-POP-FRONT                                  | 0.0003          | 0.0003
+
+>>> Group: MINIBATCH (IDs >= 100) (Count: 40, IDs: [100, 101, 102, 103, 104, 105, 106, 107, 110, 111, 112, 113, 114, 115, 116, 117, 120, 121, 122, 123, 124, 125, 126, 127, 130, 131, 132, 133, 134, 135, 136, 137, 140, 141, 142, 143, 144, 145, 146, 147])
+RISC            | ZONE                                          | AVG TIME (ms)   | MAX TIME (ms)
+----------------------------------------------------------------------------------------------------
+TRISC_2         | TRISC-FW                                      | 0.0309          | 0.0312
+TRISC_1         | TRISC-FW                                      | 0.0308          | 0.0311
+TRISC_0         | TRISC-FW                                      | 0.0308          | 0.0311
+TRISC_0         | TRISC-KERNEL                                  | 0.0285          | 0.0289
+TRISC_1         | TRISC-KERNEL                                  | 0.0271          | 0.0274
+TRISC_1         | BATCH-ITERATION                               | 0.0248          | 0.0250
+TRISC_0         | BATCH-ITERATION                               | 0.0247          | 0.0249
+TRISC_0         | CB-WAIT-FRONT                                 | 0.0180          | 0.0182
+TRISC_2         | TRISC-KERNEL                                  | 0.0157          | 0.0158
+TRISC_2         | BATCH-ITERATION                               | 0.0135          | 0.0136
+TRISC_0         | CB-POP-FRONT                                  | 0.0001          | 0.0001
+TRISC_2         | CB-WAIT-FRONT                                 | 0.0000          | 0.0000
+TRISC_1         | CB-WAIT-FRONT                                 | 0.0000          | 0.0000
+TRISC_1         | CB-POP-FRONT                                  | 0.0000          | 0.0000
+TRISC_2         | CB-POP-FRONT                                  | 0.0000          | 0.0000
+
+>>> Group: IGNORED/WARMUP (Count: 3, IDs: [0, 1053146953, 3193912787])
+RISC            | ZONE                                          | AVG TIME (ms)   | MAX TIME (ms)
+----------------------------------------------------------------------------------------------------
+BRISC           | BRISC-FW                                      | 1.3986          | 4.1957
+BRISC           | BRISC-KERNEL                                  | 1.3205          | 3.9614
+NCRISC          | NCRISC-FW                                     | 0.7598          | 2.2795
+BRISC           | NOC-MCAST-WAIT-PADDING                        | 0.7425          | 2.2276
+NCRISC          | NCRISC-KERNEL                                 | 0.6940          | 2.0819
+TRISC_2         | TRISC-FW                                      | 0.4482          | 1.0515
+TRISC_0         | TRISC-FW                                      | 0.4470          | 1.0495
+TRISC_1         | TRISC-FW                                      | 0.4470          | 1.0495
+TRISC_0         | TRISC-KERNEL                                  | 0.4305          | 1.0050
+TRISC_1         | TRISC-KERNEL                                  | 0.4187          | 0.9741
+TRISC_1         | BATCH-ITERATION                               | 0.3657          | 0.8557
+TRISC_0         | BATCH-ITERATION                               | 0.3646          | 0.8526
+BRISC           | READ-IN1-DRAM-TO-SRAM-PADDING                 | 0.3585          | 1.0756
+TRISC_2         | TRISC-KERNEL                                  | 0.3433          | 0.7665
+BRISC           | IN1-STREAM-MCAST                              | 0.3215          | 0.9646
+TRISC_2         | BATCH-ITERATION                               | 0.2854          | 0.6377
+TRISC_0         | CB-WAIT-FRONT                                 | 0.2717          | 0.6335
+BRISC           | NOC-BARRIER-WAIT-IN1-PADDING                  | 0.0644          | 0.1933
+TRISC_0         | CB-POP-FRONT                                  | 0.0015          | 0.0035
+TRISC_1         | CB-WAIT-FRONT                                 | 0.0005          | 0.0011
+TRISC_2         | CB-WAIT-FRONT                                 | 0.0005          | 0.0011
+TRISC_2         | CB-POP-FRONT                                  | 0.0004          | 0.0010
+TRISC_1         | CB-POP-FRONT                                  | 0.0004          | 0.0010
