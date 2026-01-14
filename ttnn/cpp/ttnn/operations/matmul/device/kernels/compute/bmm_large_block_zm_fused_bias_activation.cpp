@@ -150,10 +150,15 @@ void MAIN {
     constexpr bool spill = num_blocks_inner_dim > 1;
 
     // MM-BLOCK-INIT zone removed to reduce profiler buffer usage
-    mm_block_init(
-        in0_cb_id, in1_cb_id, mm_partials_cb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
+
+    {
+        // ✅ ADD THIS: Profile MM initialization
+        // DeviceZoneScopedN("MM-INIT");
+        mm_block_init(
+            in0_cb_id, in1_cb_id, mm_partials_cb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
+    }
     for (uint32_t b = 0; b < batch; b++) {
-        DeviceZoneScopedN("BATCH-ITERATION");
+        // DeviceZoneScopedN("BATCH-ITERATION");
         if constexpr (get_batch_from_reader) {
             // Check whether this batch is valid
             bool is_batch_valid = false;
@@ -197,53 +202,64 @@ void MAIN {
                         cb_wait_front(in1_cb_id, in1_block_num_tiles);
                     }
 
-                    int in0_index_subblock_offset = 0;
-                    for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
-                        int in1_index_subblock_offset = 0;
-                        for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
-                            tile_regs_acquire();
-                            if (enable_reload) {
-                                reload_from_cb_to_dst(
-                                    in0_cb_id,
-                                    in1_cb_id,
-                                    mm_partials_cb_id,
-                                    in1_transpose_tile,
-                                    out_subblock_num_tiles,
-                                    out_subblock_w,
-                                    out_subblock_h,
-                                    in0_block_w);
-                            }
+                    {
+                        DeviceZoneScopedN("GEMM-PROCESSING");
+
+                        int in0_index_subblock_offset = 0;
+                        for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
+                            int in1_index_subblock_offset = 0;
+                            for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
+                                {
+                                    // DeviceZoneScopedN("ACQUIRE-DST");
+                                    tile_regs_acquire();
+                                }
+                                if (enable_reload) {
+                                    // DeviceZoneScopedN("RELOAD-PARTIAL");
+                                    reload_from_cb_to_dst(
+                                        in0_cb_id,
+                                        in1_cb_id,
+                                        mm_partials_cb_id,
+                                        in1_transpose_tile,
+                                        out_subblock_num_tiles,
+                                        out_subblock_w,
+                                        out_subblock_h,
+                                        in0_block_w);
+                                }
 
 #ifndef SKIP_COMPUTE
                             // ✅ COMPUTE zone temporarily disabled to reduce profiler buffer usage
                             // Compute output sub-block
-                            uint32_t dst_index =
-                                0;  // start at 0, each call to matmul_block internally increments dst_index
-                            uint32_t in0_index = in0_index_subblock_offset;  // offset into in0 block
-                            uint32_t in1_index = in1_index_subblock_offset;  // offset into in1 block
-                            // inner dim that we accumualte is the inner dim of in0/in1, which is in0_block_w
-                            for (uint32_t inner_dim_idx = 0; inner_dim_idx < in0_block_w; ++inner_dim_idx) {
-                                // matmul outer product of (out_subblock_h x out_subblock_w) tiles that fill dst
-                                // accumulation is done by iterating matmul_block across inner dim
-                                // in0_block_w is passed as innder dim (kt) to matmul_block, interally used to stride
-                                // in0
-                                matmul_block(
-                                    in0_cb_id,
-                                    in1_cb_id,
-                                    in0_index,
-                                    in1_index,
-                                    dst_index,
-                                    in1_transpose_tile,
-                                    out_subblock_w,
-                                    out_subblock_h,
-                                    in0_block_w);
-                                in0_index++;               // stride right by 1
-                                in1_index += in1_block_w;  // to stride down by 1 need to stride by in_per_core_w
-                                                           // (should be called in1_block_w)
-                            }
+                            {
+                                // DeviceZoneScopedN("MATMUL-TILES");
+                                uint32_t dst_index =
+                                    0;  // start at 0, each call to matmul_block internally increments dst_index
+                                uint32_t in0_index = in0_index_subblock_offset;  // offset into in0 block
+                                uint32_t in1_index = in1_index_subblock_offset;  // offset into in1 block
+                                // inner dim that we accumualte is the inner dim of in0/in1, which is in0_block_w
+                                for (uint32_t inner_dim_idx = 0; inner_dim_idx < in0_block_w; ++inner_dim_idx) {
+                                    // matmul outer product of (out_subblock_h x out_subblock_w) tiles that fill dst
+                                    // accumulation is done by iterating matmul_block across inner dim
+                                    // in0_block_w is passed as innder dim (kt) to matmul_block, interally used to
+                                    // stride in0
+                                    matmul_block(
+                                        in0_cb_id,
+                                        in1_cb_id,
+                                        in0_index,
+                                        in1_index,
+                                        dst_index,
+                                        in1_transpose_tile,
+                                        out_subblock_w,
+                                        out_subblock_h,
+                                        in0_block_w);
+                                    in0_index++;               // stride right by 1
+                                    in1_index += in1_block_w;  // to stride down by 1 need to stride by in_per_core_w
+                                                               // (should be called in1_block_w)
+                                }
+                            }  // End MATMUL-TILES zone
 #endif  // SKIP_COMPUTE
 
                             if (last_out) {
+                                // DeviceZoneScopedN("PACK-OUTPUT");
 // If we fuse bias, we will pack out and run bias + optional sfpu in a separate loop
 #if not defined FUSE_BIAS and defined SFPU_OP_INIT_ACTIVATION
                                 for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
@@ -278,6 +294,7 @@ void MAIN {
                                 cb_push_back(mm_out_cb_id, out_subblock_num_tiles);
 
                             } else {
+                                // DeviceZoneScopedN("PACK-PARTIAL");
                                 tile_regs_commit();
                                 // Wait for tiles in output buffer to be written out since interm and output share
                                 // memory
@@ -305,9 +322,13 @@ void MAIN {
                             }
 
                             in1_index_subblock_offset += out_subblock_w;
-                        }
+                            }
                         in0_index_subblock_offset += in0_subblock_num_tiles;
-                    }
+                        }
+                        {
+                            //  DeviceZoneScopedN("RELEASE-DST");
+                            tile_regs_release();
+                        }
 
 #ifdef PACKER_L1_ACC
 #ifdef FUSE_BIAS
@@ -334,6 +355,7 @@ void MAIN {
                         enable_reload = true;
                     }
 #endif
+                    }  // GEMM-PROCESSING
 
                     {
                         DeviceZoneScopedN("CB-POP-FRONT");

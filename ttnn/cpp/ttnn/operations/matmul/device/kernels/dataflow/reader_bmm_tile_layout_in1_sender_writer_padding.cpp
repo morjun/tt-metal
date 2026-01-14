@@ -319,7 +319,7 @@ void kernel_main() {
 
                         {
                             // Measure IN1 (activations in transposed workload) reading
-                            DeviceZoneScopedN("READ-IN1-DRAM-TO-SRAM-PADDING");
+                            // DeviceZoneScopedN("READ-IN1-DRAM-TO-SRAM-PADDING");
 
                             // Copy in1 block into CB, as the default kernel
                             uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;

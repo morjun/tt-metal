@@ -378,6 +378,7 @@ Tensor Tensor::to_device(
     distributed::MeshDevice* mesh_device,
     ttsl::optional_reference<const MemoryConfig> mem_config,
     std::optional<tt::tt_metal::QueueId> cq_id) const {
+    ZoneScoped;
     return tensor_ops::tensor_to_device(*this, mesh_device, mem_config, cq_id);
 }
 

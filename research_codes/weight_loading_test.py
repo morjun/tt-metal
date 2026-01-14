@@ -31,6 +31,8 @@ from typing import Optional, Tuple, Dict, List, Any
 import torch
 import ttnn
 
+WARMUP_INDEX = 10000
+
 
 @dataclass
 class BenchmarkConfig:
@@ -689,21 +691,22 @@ def time_forward(
     x_tt = make_tt_input(device, batch_size, in_features, dtype, seed)
 
     # Warmup and ensure kernel is resident
-    if pre_measured_compile_ms is not None:
-        timings.compile_time = pre_measured_compile_ms
-        print(f"[PROFILE] Warmup forward 0 (kernel already compiled)")
-        write_iter_to_l1(device, 0)  # ID 0 for Warmup
-        _ = linear(x_tt)
-    else:
-        print(f"[PROFILE] Warmup forward 0 (compiling kernels)")
-        write_iter_to_l1(device, 0)  # ID 0 for Warmup
-        _ = linear(x_tt)
-        # Compilation time will be captured by C++ timers.
+    if warmup_iters > 0:
+        if pre_measured_compile_ms is not None:
+            timings.compile_time = pre_measured_compile_ms
+            print(f"[PROFILE] Warmup forward 0 (kernel already compiled)")
+            write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
+            _ = linear(x_tt)
+        else:
+            print(f"[PROFILE] Warmup forward 0 (compiling kernels)")
+            write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
+            _ = linear(x_tt)
+            # Compilation time will be captured by C++ timers.
 
     # Continue with remaining warmup iterations (compilation already done)
     for i in range(1, warmup_iters):
         print(f"[PROFILE] Warmup forward {i}")
-        write_iter_to_l1(device, 0)  # ID 0 for Warmup
+        write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
         _ = linear(x_tt)
 
     # Measure with fine-grained timing
@@ -859,7 +862,7 @@ def time_minibatch_sequence(
             # (all happen during kernel execution, measured as total forward time)
             # Use 100 base for minibatches to distinguish from large batch
             if is_warmup:
-                write_iter_to_l1(device, 0)  # ID 0 for Warmup
+                write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
             else:
                 write_iter_to_l1(device, 100 + sequence_idx * 10 + i)
             _ = linear(x_slice)
@@ -928,15 +931,16 @@ def time_minibatch_sequence(
     # Ensure any tensor creation overhead is complete before measuring compilation
 
     # Use pre-measured compile time if provided; otherwise measure once
-    if pre_measured_compile_ms is not None:
-        timings.compile_time = pre_measured_compile_ms
-        write_iter_to_l1(device, 0)  # ID 0 for Warmup
-        _ = linear(dummy_input_tt)
-    else:
-        write_iter_to_l1(device, 0)  # ID 0 for Warmup
-        _ = linear(dummy_input_tt)
-        # Compilation time will be captured by C++ timers.
-        timings.compile_time = 0.0
+    if warmup_iters > 0:
+        if pre_measured_compile_ms is not None:
+            timings.compile_time = pre_measured_compile_ms
+            write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
+            _ = linear(dummy_input_tt)
+        else:
+            write_iter_to_l1(device, WARMUP_INDEX)  # ID 0 for Warmup
+            _ = linear(dummy_input_tt)
+            # Compilation time will be captured by C++ timers.
+            timings.compile_time = 0.0
 
     # Update initial_kernel_compilation_ms with the measured value
     initial_kernel_compilation_ms = timings.compile_time
@@ -1036,7 +1040,9 @@ def _save_results_to_csv(
         "mini_per_fwd_transpose_time": f"{mini_timings_dict['transpose_time'] / cfg.minibatches:.6f}",
         # Pure Matmul Overhead
         "pure_matmul_overhead": f"{(mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']):.6f}",
-        "pure_matmul_overhead_percentage": f"{((mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']) / large_timings_dict['pure_matmul_time']) * 100:.2f}",
+        "pure_matmul_overhead_percentage": f"{((mini_timings_dict['pure_matmul_time'] - large_timings_dict['pure_matmul_time']) / large_timings_dict['pure_matmul_time']) * 100:.2f}"
+        if large_timings_dict["pure_matmul_time"] != 0
+        else "0.00",
         "core_grid": cfg.core_grid
         if hasattr(cfg, "core_grid")
         else (results.core_grid if "results" in locals() and hasattr(results, "core_grid") else "N/A"),

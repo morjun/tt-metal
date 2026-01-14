@@ -604,6 +604,7 @@ DeviceStorage replicate_to_mesh_buffer(
     const std::shared_ptr<distributed::MeshBuffer>& mesh_buffer,
     const TensorSpec& tensor_spec,
     std::optional<tt::tt_metal::QueueId> cq_id) {
+    ZoneScoped;
     auto* mesh_device = mesh_buffer->device();
     auto data_to_write = buffer.view_bytes();
     const auto expected_packed_buffer_size_bytes = tensor_spec.compute_packed_buffer_size_bytes();
@@ -630,6 +631,7 @@ DeviceStorage write_to_mesh_buffer(
     const DistributedHostBuffer& distributed_host_buffer,
     const std::shared_ptr<distributed::MeshBuffer>& mesh_buffer,
     std::optional<tt::tt_metal::QueueId> cq_id) {
+    ZoneScoped;
     std::optional<uint8_t> cq_id_int = cq_id.has_value() ? std::make_optional(cq_id.value().get()) : std::nullopt;
     mesh_buffer->device()->mesh_command_queue(cq_id_int).enqueue_write(
         mesh_buffer, distributed_host_buffer, /*blocking=*/false);
@@ -686,6 +688,7 @@ Tensor to_device(
     distributed::MeshDevice* mesh_device,
     ttsl::optional_reference<const MemoryConfig> memory_config,
     std::optional<tt::tt_metal::QueueId> cq_id) {
+    ZoneScoped;
     ttnn::Timer timer("to_device");
     if (tensor.storage_type() == StorageType::DEVICE) {
         return tensor;  // Tensor already on device

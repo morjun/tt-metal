@@ -229,7 +229,7 @@ void kernel_main() {
 
                         {
                             // ✅ DISABLED: Measure IN0 (input) reading - causes buffer overflow
-                            DeviceZoneScopedN("READ-IN0-DRAM-TO-SRAM-PADDING");
+                            // DeviceZoneScopedN("READ-IN0-DRAM-TO-SRAM-PADDING");
 
                             // Copy in0 block into CB, as the default kernel
                             uint32_t in0_tensor_row_start_tile_id = in0_tensor_current_inner_dim_block_start_tile_id;

@@ -35,6 +35,7 @@ Tensor tensor_to_device(
     distributed::MeshDevice* mesh_device,
     ttsl::optional_reference<const MemoryConfig> mem_config,
     std::optional<QueueId> cq_id) {
+    ZoneScoped;
     GraphTracker::instance().track_function_start("Tensor::to_device", input_tensor, mesh_device, mem_config);
     if (input_tensor.storage_type() == StorageType::DEVICE) {
         TT_ASSERT(input_tensor.device() == mesh_device, "Currently do not support moving between devices");

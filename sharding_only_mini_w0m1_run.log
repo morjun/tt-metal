@@ -1,0 +1,141 @@
+2026-01-12 08:46:53.353 | info     |             UMD | Established cluster ETH FW version: 1.7.1 (topology_discovery_blackhole.cpp:295)
+2026-01-12 08:46:53.415 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:209)
+2026-01-12 08:46:53.541 | info     |             UMD | Established cluster ETH FW version: 1.7.1 (topology_discovery_blackhole.cpp:295)
+2026-01-12 08:46:53.733 | info     |             UMD | Established cluster ETH FW version: 1.7.1 (topology_discovery_blackhole.cpp:295)
+2026-01-12 08:46:53.793 | info     |             UMD | Harvesting mask for chip 0 is 0x0 (NOC0: 0x0, simulated harvesting mask: 0x0). (cluster.cpp:413)
+2026-01-12 08:46:53.922 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:257)
+2026-01-12 08:46:53.922 | warning  |             UMD | Firmware version 19.4.0 on the system is newer than the maximum supported version 19.0.0 for blackhole architecture. New features may not be supported. (cluster.cpp:215)
+2026-01-12 08:46:53.922 | info     |             UMD | All devices in cluster running firmware version: 19.4.0 (cluster.cpp:235)
+2026-01-12 08:46:53.922 | info     |             UMD | IOMMU: disabled (cluster.cpp:177)
+2026-01-12 08:46:53.922 | info     |             UMD | KMD version: 2.6.0 (cluster.cpp:180)
+2026-01-12 08:46:53.924 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7fc780000000 and size 0x40000000 pinned to physical address 0x200000000 (pci_device.cpp:536)
+2026-01-12 08:46:53.924 | info     |             UMD | Device: 0 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x200000000 (blackhole_tt_device.cpp:95)
+2026-01-12 08:46:54.100 | info     |          Fabric | TopologyMapper mapping start (mesh=0): n_log=1, n_phys=1, log_deg_hist={0:1}, phys_deg_hist={0:1} (topology_mapper.cpp:574)
+2026-01-12 08:46:55.908 | info     |           Metal | Profiler started on device 0 (device_pool.cpp:203)
+2026-01-12 08:46:59.311 | info     |           Metal | [Timer] to_device: 960 us (timer.hpp:21)
+2026-01-12 08:46:59.514 | info     |           Metal | [Timer] to_device: 7587 us (timer.hpp:21)
+2026-01-12 08:46:59.522 | info     |           Metal | [Timer] to_device: 379 us (timer.hpp:21)
+2026-01-12 08:46:59.529 | info     |           Metal | [Timer] to_device: 272 us (timer.hpp:21)
+2026-01-12 08:47:00.392 | info     |           Metal | [Timer] compile_and_cache_program: 862511 us (timer.hpp:21)
+2026-01-12 08:47:00.392 | info     |           Metal | [Timer] transpose: 862899 us (timer.hpp:21)
+2026-01-12 08:47:01.530 | info     |           Metal | [Timer] compile_and_cache_program: 1137880 us (timer.hpp:21)
+2026-01-12 08:47:01.531 | info     |           Metal | [Timer] matmul: 1138528 us (timer.hpp:21)
+2026-01-12 08:47:01.534 | info     |           Metal | [Timer] compile_and_cache_program: 2764 us (timer.hpp:21)
+2026-01-12 08:47:01.534 | info     |           Metal | [Timer] transpose: 3228 us (timer.hpp:21)
+2026-01-12 08:47:02.484 | info     |           Metal | [Timer] compile_and_cache_program: 949833 us (timer.hpp:21)
+2026-01-12 08:47:02.485 | info     |           Metal | [Timer] add: 950327 us (timer.hpp:21)
+2026-01-12 08:47:02.795 | info     |           Metal | [Timer] to_device: 7574 us (timer.hpp:21)
+2026-01-12 08:47:02.802 | info     |           Metal | [Timer] to_device: 258 us (timer.hpp:21)
+2026-01-12 08:47:02.809 | info     |           Metal | [Timer] to_device: 275 us (timer.hpp:21)
+2026-01-12 08:47:03.663 | info     |           Metal | [Timer] compile_and_cache_program: 853078 us (timer.hpp:21)
+2026-01-12 08:47:03.665 | info     |           Metal | [Timer] transpose: 578 us (timer.hpp:21)
+2026-01-12 08:47:03.666 | info     |           Metal | [Timer] matmul: 626 us (timer.hpp:21)
+2026-01-12 08:47:03.666 | info     |           Metal | [Timer] transpose: 382 us (timer.hpp:21)
+2026-01-12 08:47:03.667 | info     |           Metal | [Timer] add: 316 us (timer.hpp:21)
+2026-01-12 08:47:03.669 | info     |           Metal | [Timer] compile_and_cache_program: 1820 us (timer.hpp:21)
+2026-01-12 08:47:03.670 | info     |           Metal | [Timer] transpose: 245 us (timer.hpp:21)
+2026-01-12 08:47:03.670 | info     |           Metal | [Timer] matmul: 247 us (timer.hpp:21)
+2026-01-12 08:47:03.670 | info     |           Metal | [Timer] transpose: 216 us (timer.hpp:21)
+2026-01-12 08:47:03.671 | info     |           Metal | [Timer] add: 146 us (timer.hpp:21)
+2026-01-12 08:47:03.672 | info     |           Metal | [Timer] compile_and_cache_program: 1667 us (timer.hpp:21)
+2026-01-12 08:47:03.673 | info     |           Metal | [Timer] transpose: 237 us (timer.hpp:21)
+2026-01-12 08:47:03.674 | info     |           Metal | [Timer] matmul: 243 us (timer.hpp:21)
+2026-01-12 08:47:03.674 | info     |           Metal | [Timer] transpose: 212 us (timer.hpp:21)
+2026-01-12 08:47:03.674 | info     |           Metal | [Timer] add: 128 us (timer.hpp:21)
+2026-01-12 08:47:03.676 | info     |           Metal | [Timer] compile_and_cache_program: 1557 us (timer.hpp:21)
+2026-01-12 08:47:03.677 | info     |           Metal | [Timer] transpose: 427 us (timer.hpp:21)
+2026-01-12 08:47:03.677 | info     |           Metal | [Timer] matmul: 215 us (timer.hpp:21)
+2026-01-12 08:47:03.677 | info     |           Metal | [Timer] transpose: 197 us (timer.hpp:21)
+2026-01-12 08:47:03.678 | info     |           Metal | [Timer] add: 226 us (timer.hpp:21)
+2026-01-12 08:47:03.679 | info     |           Metal | [Timer] compile_and_cache_program: 1297 us (timer.hpp:21)
+2026-01-12 08:47:03.680 | info     |           Metal | [Timer] transpose: 230 us (timer.hpp:21)
+2026-01-12 08:47:03.680 | info     |           Metal | [Timer] matmul: 96 us (timer.hpp:21)
+2026-01-12 08:47:03.680 | info     |           Metal | [Timer] transpose: 75 us (timer.hpp:21)
+2026-01-12 08:47:03.680 | info     |           Metal | [Timer] add: 103 us (timer.hpp:21)
+2026-01-12 08:47:03.681 | info     |           Metal | [Timer] compile_and_cache_program: 1309 us (timer.hpp:21)
+2026-01-12 08:47:03.682 | info     |           Metal | [Timer] transpose: 91 us (timer.hpp:21)
+2026-01-12 08:47:03.682 | info     |           Metal | [Timer] matmul: 106 us (timer.hpp:21)
+2026-01-12 08:47:03.682 | info     |           Metal | [Timer] transpose: 76 us (timer.hpp:21)
+2026-01-12 08:47:03.683 | info     |           Metal | [Timer] add: 104 us (timer.hpp:21)
+2026-01-12 08:47:03.684 | info     |           Metal | [Timer] compile_and_cache_program: 1257 us (timer.hpp:21)
+2026-01-12 08:47:03.684 | info     |           Metal | [Timer] transpose: 90 us (timer.hpp:21)
+2026-01-12 08:47:03.685 | info     |           Metal | [Timer] matmul: 111 us (timer.hpp:21)
+2026-01-12 08:47:03.685 | info     |           Metal | [Timer] transpose: 77 us (timer.hpp:21)
+2026-01-12 08:47:03.685 | info     |           Metal | [Timer] add: 107 us (timer.hpp:21)
+2026-01-12 08:47:03.686 | info     |           Metal | [Timer] compile_and_cache_program: 1312 us (timer.hpp:21)
+2026-01-12 08:47:03.687 | info     |           Metal | [Timer] transpose: 229 us (timer.hpp:21)
+2026-01-12 08:47:03.688 | info     |           Metal | [Timer] matmul: 453 us (timer.hpp:21)
+2026-01-12 08:47:03.688 | info     |           Metal | [Timer] transpose: 191 us (timer.hpp:21)
+2026-01-12 08:47:03.688 | info     |           Metal | [Timer] add: 302 us (timer.hpp:21)
+[INFO] Available cores: 13x10 = 130
+[INFO] Weight dimensions: [4096, 4096]
+[INFO] Creating L1 HEIGHT_SHARDED config for zero-copy weight access
+[INFO] Total weight size: 32.00 MB
+[INFO] Minimum cores needed: 23
+[INFO] Selected grid: 8x8 = 64 cores
+[INFO] Using HEIGHT_SHARDED L1 with grid: 8x8
+[INFO] Using 8x8 = 64 cores
+[INFO] Shard shape per core: [64, 4096]
+[INFO] Shard size per core: 0.50 MB
+[INFO] Successfully created HEIGHT_SHARDED L1 memory config
+[INFO] Weight is L1 HEIGHT_SHARDED - Optimized kernel path will be enabled
+[INFO] Weight will be reused across forward passes with zero L1→CB copy!
+[INFO] Available cores: 13x10 = 130
+[INFO] Weight dimensions: [4096, 4096]
+[INFO] Creating L1 HEIGHT_SHARDED config for zero-copy weight access
+[INFO] Total weight size: 32.00 MB
+[INFO] Minimum cores needed: 23
+[INFO] Selected grid: 8x8 = 64 cores
+[INFO] Using HEIGHT_SHARDED L1 with grid: 8x8
+[INFO] Using 8x8 = 64 cores
+[INFO] Shard shape per core: [64, 4096]
+[INFO] Shard size per core: 0.50 MB
+[INFO] Successfully created HEIGHT_SHARDED L1 memory config
+[INFO] Weight is L1 HEIGHT_SHARDED - Optimized kernel path will be enabled
+[INFO] Weight will be reused across forward passes with zero L1→CB copy!
+[DEBUG] Minibatch Seq - Total: 7.082ms, Transpose: 3.553ms, Pure Matmul: 2.097ms
+
+===== TTNN Linear Benchmark (single device) =====
+Comparison         : Large batch (single load) vs Minibatches (same weights; DRAM→L1 re-stream)
+DType              : bfloat16
+Dims               : in=4096, out=4096
+Large batch        : B=256
+Small batch        : b=32 x 8 (total=256)
+Warmup/Measure     : 0/1 iters per case
+Weight Sharding    : Enabled (L1/SRAM)
+Core Grid          : 8x8
+
+-- Single pass: LARGE batch --
+Total avg (ms)     : 0.000
+  Weight load (from host DRAM to device GDDR6 DRAM) (ms) : 0.000
+  Forward (ms)     : 0.000
+
+  Fine-grained phase breakdown (average per iteration):
+    Weight load (Host DRAM -> GDDR6) (ms)      : 0.000
+    Forward compute (ms)                     : 0.000
+    Pure Matmul (ms)                         : 0.000
+    Add (ms)                                 : 0.000
+    Transpose (ms)                           : 0.000
+
+-- Repeated passes: SMALL minibatch (same weights on device) --
+Sequence total (ms) for 8 passes : 7.082
+  Weight load sum (from host DRAM to device GDDR6 DRAM) (ms)                           : 7.832
+  Forward sum (ms)                               : 7.082
+
+  Fine-grained phase breakdown (average per sequence):
+    Weight load (Host DRAM -> GDDR6) (ms)      : 7.832
+    Forward compute (ms)                     : 7.082
+    Pure Matmul (ms)                         : 2.097
+    Add (ms)                                 : 1.432
+    Transpose (ms)                           : 3.553
+
+  Per-forward (average per minibatch):
+    Forward compute (ms)                     : 0.885
+    Pure Matmul (ms)                         : 0.262
+    Add (ms)                                 : 0.179
+    Transpose (ms)                           : 0.444
+
+-- Overhead vs single large batch (Pure Matmul) --
+Estimated overhead (ms): 2.097
+Overhead percentage     : 0.00%
+2026-01-12 08:47:06.360 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:425)

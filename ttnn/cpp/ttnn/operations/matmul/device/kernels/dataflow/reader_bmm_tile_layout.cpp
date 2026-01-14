@@ -94,7 +94,7 @@ void kernel_main() {
 
             {
                 // ✅ DISABLED: Measure IN1 (weight) reading - causes buffer overflow
-                DeviceZoneScopedN("READ-IN1-WEIGHT");
+                // DeviceZoneScopedN("READ-IN1-WEIGHT");
 
                 uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_block_start_tile_id;
                 for (uint32_t h = 0; h < in1_block_h; h++) {

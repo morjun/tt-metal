@@ -1,0 +1,7 @@
+--- Analyzing generated/profiler/.logs/profile_log_device.csv ---
+TRISC_0 BATCH-ITERATION: Count=1408, AvgDuration=205366 cycles
+TRISC_0 CB-WAIT-FRONT: Count=87296, AvgDuration=2712 cycles
+--- Analyzing research_codes/profile_log_device_detailed_nosharding_w0m1.csv ---
+TRISC_0 BATCH-ITERATION: Count=1408, AvgDuration=206705 cycles
+TRISC_0 CB-WAIT-FRONT: Count=25344, AvgDuration=2862 cycles
+TRISC_0 GEMM-PROCESSING: Count=25344, AvgDuration=483 cycles

@@ -18,6 +18,7 @@ import copy
 
 # Default frequency if not found in header
 DEFAULT_FREQ_MHZ = 1350
+global_iter_ids = set()
 
 
 def compress_timeline(events, gap_threshold_cycles=None, freq_mhz=1200):
@@ -155,8 +156,9 @@ def parse_profile_events(csv_path):
                     try:
                         val = int(parts[6])
                         # Filter trash values: Valid IDs are usually small (e.g. < 10000)
-                        if 0 <= val < 10000:
-                            risc_markers[(core_id, risc_type)].append((cycles, val))
+                        # if 0 <= val < 10000:
+                        risc_markers[(core_id, risc_type)].append((cycles, val))
+                        global_iter_ids.add(val)
                     except:
                         pass
                     continue
@@ -205,8 +207,8 @@ def parse_profile_events(csv_path):
                 if idx > 0:
                     iter_id = marker_ids[idx - 1]
                 else:
-                    # Before first marker -> Assume 'Warmup' or 'Setup' (0)
-                    iter_id = 0
+                    # Before first marker -> Assume 'Warmup' or 'Setup' (-1)
+                    iter_id = -1
 
                 z["iter_id"] = iter_id
                 final_events[core_id][risc_type].append(z)
@@ -227,8 +229,8 @@ def get_busiest_core(events):
 
 def generate_colors(iter_ids):
     sorted_ids = sorted(list(iter_ids))
-    # Use tab20c or tab20b for more variety?
-    cmap = plt.get_cmap("tab20c")
+    # Use tab20 for more contrast (instead of tab20c)
+    cmap = plt.get_cmap("tab20")
 
     id_to_color = {}
 
@@ -247,13 +249,22 @@ def generate_colors(iter_ids):
     unique_keys = sorted(list(set(get_color_key(iid) for iid in sorted_ids if iid > 0)))
     key_to_idx = {k: i for i, k in enumerate(unique_keys)}
 
+    # tab20 layout: 14-15 are Gray. We exclude them.
+    safe_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19]
+    n_safe = len(safe_indices)
+
     for iid in sorted_ids:
-        if iid <= 0:
-            id_to_color[iid] = "#DDDDDD"  # Gray for Warmup/Pre
+        if iid == 0:
+            id_to_color[iid] = "#DDDDDD"  # Gray for Warmup
+        elif iid < 0 or iid >= 1000:
+            id_to_color[iid] = "#AAAAAA"  # Darker Gray for Unknown
         else:
             key = get_color_key(iid)
             idx = key_to_idx[key]
-            id_to_color[iid] = cmap(idx % 20)
+            # Use a prime stride (e.g., 7) to jump around the safe list
+            mapped_idx = (idx * 7) % n_safe
+            real_idx = safe_indices[mapped_idx]
+            id_to_color[iid] = cmap(real_idx)
 
     return id_to_color
 
@@ -270,26 +281,48 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
     risc_data = events[core_id]
     risc_order = ["BRISC", "NCRISC", "TRISC_0", "TRISC_1", "TRISC_2"]
 
-    # [NEW] Filter out basic overlapping zones
+    # Filter out basic overlapping zones AFTER compression
+    # This ensures that gaps created by large FW/Kernel blocks are preserved as real time
     IGNORED_ZONES = {"BRISC-FW", "BRISC-KERNEL", "NCRISC-FW", "NCRISC-KERNEL", "TRISC-FW", "TRISC-KERNEL"}
+
+    # Collect distinct (risc, zone_name) pairs and their events
+    # We want to maintain risc_order, and then maybe sort zones alphabetically or by appearance?
+    # Let's sort zones alphabetically for consistency.
+
+    zone_map = defaultdict(list)  # Key: (risc, zone_name) -> list of events
 
     # Filter valid
     all_starts = []
     all_ends = []
     all_iter_ids = set()
 
-    # Collect stats
     for r in risc_order:
-        # Filter raw list first
-        filtered_zones = [z for z in risc_data.get(r, []) if z["name"] not in IGNORED_ZONES]
-        # Update the list in place or usage
-        risc_data[r] = filtered_zones
+        # Loop over ALL zones first
+        raw_zones = risc_data.get(r, [])
+        filtered_zones_for_plot = []
 
-        for ev in filtered_zones:
+        for z in raw_zones:
+            # Always collect ID
+            all_iter_ids.add(z["iter_id"])
+
+            if z["name"] in IGNORED_ZONES:
+                # Log usage
+                # print(f"[Info] Ignored zone: {z['name']} (Iter: {z['iter_id']})")
+                pass
+            else:
+                filtered_zones_for_plot.append(z)
+
+        # Update the list in place or usage
+        risc_data[r] = filtered_zones_for_plot
+
+        for ev in filtered_zones_for_plot:
             if ev["end"] > ev["start"]:
                 all_starts.append(ev["start"])
                 all_ends.append(ev["end"])
-                all_iter_ids.add(ev["iter_id"])
+            else:
+                print(f"Invalid zone: {ev}")
+
+            zone_map[(r, ev["name"])].append(ev)
 
     if not all_starts:
         print("No valid time range.")
@@ -300,42 +333,55 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
 
     print(f"Time Range: {global_min} - {global_max} ({global_max - global_min} cycles)")
     print(f"Iterations: {sorted(all_iter_ids)}")
+    print(f"Global Iterations: {sorted(global_iter_ids)}, Count: {len(global_iter_ids)}")
 
     colors = generate_colors(all_iter_ids)
 
-    # Plot
-    # Increased Height for readability
-    fig, ax = plt.subplots(figsize=(24, 12))
+    # Prepare Y-axis rows
+    # Rows should be ordered by RISC type, then Zone Name
+    row_keys = []
+    for r in risc_order:
+        # Find all zones for this RISC
+        zones_for_risc = sorted(list(set(k[1] for k in zone_map.keys() if k[0] == r)))
+        for zname in zones_for_risc:
+            row_keys.append((r, zname))
+
+    # Calculate figure size dynamically?
+    # Approx 0.8 inches per row
+    row_height = 0.8
+    total_height = max(8, len(row_keys) * row_height)
+
+    fig, ax = plt.subplots(figsize=(24, total_height))
 
     y_ticks = []
     y_labels = []
 
-    # Loop RISCs
-    for i, risc in enumerate(risc_order):
-        y_center = len(risc_order) - 1 - i
+    # Plot rows
+    # We plot from top to bottom, so index 0 is at top? No, matplotlib 0 is bottom.
+    # So we iterate reversed if we want RISC order top-down.
+
+    for i, (risc, zone_name) in enumerate(reversed(row_keys)):
+        y_center = i
         y_ticks.append(y_center)
-        y_labels.append(risc)
+        # Label: "RISC - Zone"
+        # Clean up zone name slightly for display
+        dname = zone_name.replace("KERNEL_", "").replace("ZONE_", "")
+        y_labels.append(f"{risc}\n{dname}")
 
-        zones = risc_data.get(risc, [])
-        # Sort by duration descending to print big zones first
-        zones.sort(key=lambda x: (x["end"] - x["start"]), reverse=True)
+        events_list = zone_map[(risc, zone_name)]
 
-        # Track lane for cleaner look? No, standard Gannt.
-
-        for ev in zones:
+        for ev in events_list:
             s_cyc = ev["start"]
             e_cyc = ev["end"]
 
             # Skip noise < 2000 cycles (~1-2 us)
-            if (e_cyc - s_cyc) < 2000:
-                continue
+            # if (e_cyc - s_cyc) < 2000:
+            #     continue
 
             start_ms = (s_cyc - global_min) / (freq_mhz * 1000.0)
             dur_ms = (e_cyc - s_cyc) / (freq_mhz * 1000.0)
 
             iid = ev["iter_id"]
-            name = ev["name"]
-
             c = colors.get(iid, "black")
 
             # Draw
@@ -343,40 +389,43 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
                 [(start_ms, dur_ms)], (y_center - 0.4, 0.8), facecolors=c, edgecolor="none", linewidth=0, alpha=1.0
             )
 
-            # Label huge zones only (> 0.5 ms)
-            if dur_ms > 0.5:
-                # Clean name
-                dname = name.replace("KERNEL_", "").replace("ZONE_", "")
-                ax.text(
-                    start_ms + dur_ms / 2,
-                    y_center,
-                    dname,
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    color="white" if iid > 0 else "black",
-                    clip_on=True,
-                    fontweight="bold",
-                )
+            # Label inside? User said "Leave the labels on it".
+            # We already have row labels, but let's keep iteration info or name if huge.
+            # if dur_ms > 0.1:
+            #     ax.text(
+            #         start_ms + dur_ms / 2,
+            #         y_center,
+            #         f"{dname}\n({iid})",
+            #         ha="center",
+            #         va="center",
+            #         fontsize=8,
+            #         color="white" if iid > 0 else "black",
+            #         clip_on=True,
+            #         fontweight="bold",
+            #     )
 
     ax.set_yticks(y_ticks)
     ax.set_yticklabels(y_labels)
     ax.set_xlabel("Time (ms)")
     ax.set_title(f"RISC-V Timeline - Core {core_id}")
     ax.grid(True, axis="x", which="both", linestyle="--", alpha=0.5)
-
-    ax.set_title(f"RISC-V Timeline - Core {core_id}")
-    ax.grid(True, axis="x", which="both", linestyle="--", alpha=0.5)
-
+    # Add horizontal grid to separate rows
+    ax.grid(True, axis="y", which="major", linestyle="-", alpha=0.3)
     # ---------------------------------------------------------
     # LEGEND GENERATION
     # ---------------------------------------------------------
 
     # 1. Warmup
     warmup_handles = []
-    if any(i <= 0 for i in all_iter_ids):
+    if any(i == 0 for i in all_iter_ids):
         c = colors.get(0, "#DDDDDD")
         warmup_handles.append(mpatches.Patch(color=c, label="Warmup"))
+
+    # 2. Unknown
+    unknown_handles = []
+    if any(i < 0 or i >= 1000 for i in all_iter_ids):
+        c = colors.get(-1, "#DDDDDD")
+        unknown_handles.append(mpatches.Patch(color=c, label="Unknown"))
 
     # 2. Large Batches (IDs < 100, > 0)
     lb_ids = sorted([i for i in all_iter_ids if 0 < i < 100])
@@ -387,7 +436,7 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
         lb_handles.append(mpatches.Patch(color=colors[iid], label=label))
 
     # 3. Mini Batches (IDs >= 100)
-    mb_ids = sorted([i for i in all_iter_ids if i >= 100])
+    mb_ids = sorted([i for i in all_iter_ids if i >= 100 and i < 1000])
     # Group by tens
     mb_groups = sorted(list(set(i // 10 for i in mb_ids)))
     mb_handles = []
@@ -407,6 +456,11 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
         l1 = ax.legend(handles=warmup_handles, title="Status", bbox_to_anchor=(1.01, 1.0), loc="upper left")
         ax.add_artist(l1)
         extra_artists.append(l1)
+
+    if unknown_handles:
+        l2 = ax.legend(handles=unknown_handles, title="Status", bbox_to_anchor=(1.01, 0.95), loc="upper left")
+        ax.add_artist(l2)
+        extra_artists.append(l2)
 
     # Large Batches (Below Warmup - est Y=0.9)
     if lb_handles:
