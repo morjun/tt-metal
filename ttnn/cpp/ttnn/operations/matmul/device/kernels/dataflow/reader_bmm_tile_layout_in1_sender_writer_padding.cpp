@@ -534,27 +534,39 @@ void kernel_main() {
                                 subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
                             }
 
-                            cb_wait_front(cb_id_out0, out_subblock_tile_count);
+                            {
+                                DeviceZoneScopedN("WAIT-FOR-OUT-TILES");
+                                cb_wait_front(cb_id_out0, out_subblock_tile_count);
+                            }
                             uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
 
-                            for (uint32_t h = 0; h < out_subblock_h_; ++h) {
-                                uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
-                                for (uint32_t w = 0; w < out_subblock_w_; ++w) {
-                                    if (bw < num_blocks_w_dim_) {
-                                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                            {
+                                DeviceZoneScopedN("WRITE-OUTPUT-TILES");
+                                for (uint32_t h = 0; h < out_subblock_h_; ++h) {
+                                    uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
+                                    for (uint32_t w = 0; w < out_subblock_w_; ++w) {
+                                        if (bw < num_blocks_w_dim_) {
+                                            noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                                        }
+
+                                        l1_read_addr += output_single_tile_size_bytes;
+
+                                        out_tensor_tile_id += out_tensor_stride_w;
                                     }
-
-                                    l1_read_addr += output_single_tile_size_bytes;
-
-                                    out_tensor_tile_id += out_tensor_stride_w;
+                                    // Skip padded tiles in subblock along row
+                                    l1_read_addr += subblock_tiles_addr_skip;
+                                    out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                                 }
-                                // Skip padded tiles in subblock along row
-                                l1_read_addr += subblock_tiles_addr_skip;
-                                out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                             }
 
-                            noc_async_write_barrier();
-                            cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                            {
+                                DeviceZoneScopedN("NOC-BARRIER-WAIT-OUT-PADDING");
+                                noc_async_write_barrier();
+                            }
+                            {
+                                DeviceZoneScopedN("CB-POP-FRONT-OUT");
+                                cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                            }
                             out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
                         }
                         // Pop fully padded subblocks along the row

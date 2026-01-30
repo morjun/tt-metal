@@ -279,7 +279,15 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
         return
 
     risc_data = events[core_id]
-    risc_order = ["BRISC", "NCRISC", "TRISC_0", "TRISC_1", "TRISC_2"]
+    risc_order = ["NCRISC", "BRISC", "TRISC_0", "TRISC_1", "TRISC_2"]
+
+    RISC_ROLE_MAP = {
+        "NCRISC": "WEIGHT READER",
+        "BRISC": "DATA READER & DISPATCHER",
+        "TRISC_0": "UNPACKER",
+        "TRISC_1": "MATH",
+        "TRISC_2": "PACKER",
+    }
 
     # Filter out basic overlapping zones AFTER compression
     # This ensures that gaps created by large FW/Kernel blocks are preserved as real time
@@ -337,12 +345,23 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
 
     colors = generate_colors(all_iter_ids)
 
+    # Calculate min start time for each zone to order them by execution flow
+    zone_min_start = {}
+    for (r, zname), ev_list in zone_map.items():
+        if ev_list:
+            zone_min_start[(r, zname)] = min(ev["start"] for ev in ev_list)
+        else:
+            zone_min_start[(r, zname)] = float("inf")
+
     # Prepare Y-axis rows
-    # Rows should be ordered by RISC type, then Zone Name
+    # Rows should be ordered by RISC type, then by execution order (Timestamp)
     row_keys = []
     for r in risc_order:
         # Find all zones for this RISC
-        zones_for_risc = sorted(list(set(k[1] for k in zone_map.keys() if k[0] == r)))
+        zones_for_risc = list(set(k[1] for k in zone_map.keys() if k[0] == r))
+        # Sort by min start time
+        zones_for_risc.sort(key=lambda z: zone_min_start.get((r, z), float("inf")))
+
         for zname in zones_for_risc:
             row_keys.append((r, zname))
 
@@ -363,10 +382,10 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
     for i, (risc, zone_name) in enumerate(reversed(row_keys)):
         y_center = i
         y_ticks.append(y_center)
-        # Label: "RISC - Zone"
-        # Clean up zone name slightly for display
+        # Label: "RISC\n(Role)\nZone"
+        role = RISC_ROLE_MAP.get(risc, risc)
         dname = zone_name.replace("KERNEL_", "").replace("ZONE_", "")
-        y_labels.append(f"{risc}\n{dname}")
+        y_labels.append(f"{risc}\n({role})\n{dname}")
 
         events_list = zone_map[(risc, zone_name)]
 
@@ -488,7 +507,11 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("csv_path", nargs="?", default="generated/profiler/.logs/profile_log_device.csv")
+    parser.add_argument(
+        "csv_path",
+        nargs="?",
+        default="research_codes/profile_log_device_minimized_gemm_sharding_w0m1_minionly.csv",
+    )
     parser.add_argument("--output", "-o", default="riscv_timeline.png")
     parser.add_argument("--core", nargs=2, type=int)
     args = parser.parse_args()
