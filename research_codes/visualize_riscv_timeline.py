@@ -510,7 +510,7 @@ def main():
     parser.add_argument(
         "csv_path",
         nargs="?",
-        default="research_codes/profile_log_device_minimized_gemm_sharding_w0m1_minionly.csv",
+        default="generated/profiler/.logs/profile_log_device.csv",
     )
     parser.add_argument("--output", "-o", default="riscv_timeline.png")
     parser.add_argument("--core", nargs=2, type=int)

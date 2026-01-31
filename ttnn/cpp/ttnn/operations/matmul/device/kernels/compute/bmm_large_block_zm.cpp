@@ -18,7 +18,7 @@
 namespace NAMESPACE {
 void MAIN {
     // ✅ ADD THIS: Main profiling scope
-    DeviceZoneScopedMainChildN("TRISC-MATMUL-COMPUTE");
+    // DeviceZoneScopedMainChildN("TRISC-MATMUL-COMPUTE");
 
     uint32_t in0_block_w = get_compile_time_arg_val(0);
     uint32_t in0_num_subblocks = get_compile_time_arg_val(1);
@@ -35,13 +35,13 @@ void MAIN {
 
     {
         // ✅ ADD THIS: Profile MM initialization
-        DeviceZoneScopedN("MM-INIT");
+        // DeviceZoneScopedN("MM-INIT");
         mm_init(tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24);
     }
 
     for (uint32_t b = 0; b < batch; b++) {
         // ✅ ADD THIS: Profile each batch
-        DeviceZoneScopedN("BATCH-ITERATION");
+        // DeviceZoneScopedN("BATCH-ITERATION");
 
         bool spill = num_blocks > 1;
         bool enable_reload = false;
@@ -49,20 +49,20 @@ void MAIN {
 
         for (uint32_t block = 0; block < num_blocks; block++) {
             // ✅ ADD THIS: Profile each block
-            DeviceZoneScopedN("BLOCK-ITERATION");
+            // DeviceZoneScopedN("BLOCK-ITERATION");
 
             bool last_out = block == (num_blocks - 1);
 
             {
                 // ✅ ADD THIS: Measure CB wait time (IDLE!)
-                DeviceZoneScopedN("CB-WAIT-FRONT");
+                // DeviceZoneScopedN("CB-WAIT-FRONT");
                 cb_wait_front(tt::CBIndex::c_0, in0_block_num_tiles);
                 cb_wait_front(tt::CBIndex::c_1, in1_block_num_tiles);
             }
 
             // ✅ ADD THIS: New zone to isolate processing from synchronization
             {
-                DeviceZoneScopedN("GEMM-PROCESSING");
+                // DeviceZoneScopedN("GEMM-PROCESSING");
 
                 int in0_index_subblock_offset = 0;
                 for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -70,13 +70,13 @@ void MAIN {
                     for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
                         {
                             // ✅ ADD THIS: Measure DST acquisition
-                            DeviceZoneScopedN("ACQUIRE-DST");
+                            // DeviceZoneScopedN("ACQUIRE-DST");
                             acquire_dst();
                         }
 
                         if (enable_reload) {
                             // ✅ ADD THIS: Profile reload operation
-                            DeviceZoneScopedN("RELOAD-PARTIAL");
+                            // DeviceZoneScopedN("RELOAD-PARTIAL");
 
                             copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_1, tt::CBIndex::c_24);
                             cb_wait_front(tt::CBIndex::c_24, out_subblock_num_tiles);
@@ -89,7 +89,7 @@ void MAIN {
 
                         {
                             // ✅ ADD THIS: THE ACTUAL MATMUL COMPUTATION
-                            DeviceZoneScopedN("MATMUL-TILES");
+                            // DeviceZoneScopedN("MATMUL-TILES");
 
                             // Compute output sub-block from in0_subblock x in1_subblock
                             int dst_index = 0;
@@ -117,7 +117,7 @@ void MAIN {
 
                         {
                             // ✅ ADD THIS: Profile packing/output
-                            DeviceZoneScopedN("PACK-OUTPUT");
+                            // DeviceZoneScopedN("PACK-OUTPUT");
 
                             if (last_out) {
                                 // Pack out to output buffer
@@ -143,7 +143,7 @@ void MAIN {
 
                         {
                             // ✅ ADD THIS: Profile DST release
-                            DeviceZoneScopedN("RELEASE-DST");
+                            // DeviceZoneScopedN("RELEASE-DST");
                             release_dst();
                         }
 
@@ -155,7 +155,7 @@ void MAIN {
 
             {
                 // ✅ ADD THIS: Profile CB pop
-                DeviceZoneScopedN("CB-POP-FRONT");
+                // DeviceZoneScopedN("CB-POP-FRONT");
                 cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
                 cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
             }

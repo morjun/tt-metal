@@ -158,7 +158,7 @@ void MAIN {
             in0_cb_id, in1_cb_id, mm_partials_cb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
     }
     for (uint32_t b = 0; b < batch; b++) {
-        // DeviceZoneScopedN("BATCH-ITERATION");
+        DeviceZoneScopedN("BATCH-ITERATION");
         if constexpr (get_batch_from_reader) {
             // Check whether this batch is valid
             bool is_batch_valid = false;
@@ -203,7 +203,7 @@ void MAIN {
                     }
 
                     {
-                        DeviceZoneScopedN("GEMM-PROCESSING");
+                        // DeviceZoneScopedN("GEMM-PROCESSING");
 
                         int in0_index_subblock_offset = 0;
                         for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -230,7 +230,7 @@ void MAIN {
                             // ✅ COMPUTE zone temporarily disabled to reduce profiler buffer usage
                             // Compute output sub-block
                             {
-                                // DeviceZoneScopedN("MATMUL-TILES");
+                                DeviceZoneScopedN("MATMUL-TILES");
                                 uint32_t dst_index =
                                     0;  // start at 0, each call to matmul_block internally increments dst_index
                                 uint32_t in0_index = in0_index_subblock_offset;  // offset into in0 block
@@ -259,17 +259,27 @@ void MAIN {
 #endif  // SKIP_COMPUTE
 
                             if (last_out) {
-                                // DeviceZoneScopedN("PACK-OUTPUT");
+                                DeviceZoneScopedN("PACK-OUTPUT");
 // If we fuse bias, we will pack out and run bias + optional sfpu in a separate loop
 #if not defined FUSE_BIAS and defined SFPU_OP_INIT_ACTIVATION
                                 for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
                                     SFPU_OP_FUNC_ACTIVATION
                                 }
 #endif
+                                // Artificial delay to test Packer synchronization
+                                // MATH({
+                                //     asm volatile("" ::: "memory");
+                                //     for(volatile int i=0; i<500000; i++);
+                                //     asm volatile("" ::: "memory");
+                                // });
+
                                 tile_regs_commit();
                                 // Pack out to output buffer
                                 cb_reserve_back(mm_out_cb_id, out_subblock_num_tiles);
-                                tile_regs_wait();
+                                {
+                                    DeviceZoneScopedN("PACK-WAIT");
+                                    tile_regs_wait();
+                                }
 
 #if defined FP32_DEST_ACC_EN or defined PACKER_L1_ACC
                                 PACK((pack_reconfig_data_format(mm_out_cb_id)));
@@ -294,7 +304,7 @@ void MAIN {
                                 cb_push_back(mm_out_cb_id, out_subblock_num_tiles);
 
                             } else {
-                                // DeviceZoneScopedN("PACK-PARTIAL");
+                                DeviceZoneScopedN("PACK-PARTIAL");
                                 tile_regs_commit();
                                 // Wait for tiles in output buffer to be written out since interm and output share
                                 // memory
@@ -304,7 +314,10 @@ void MAIN {
                                 }
                                 // Move partial result to interm buffer
                                 cb_reserve_back(mm_partials_cb_id, out_subblock_num_tiles);
-                                tile_regs_wait();
+                                {
+                                    DeviceZoneScopedN("PACK-WAIT-PARTIAL");
+                                    tile_regs_wait();
+                                }
 
 #ifdef PACKER_L1_ACC
                                 if (block == 0) {  // no accumulation for first iteration
@@ -326,7 +339,7 @@ void MAIN {
                         in0_index_subblock_offset += in0_subblock_num_tiles;
                         }
                         {
-                            //  DeviceZoneScopedN("RELEASE-DST");
+                            // DeviceZoneScopedN("RELEASE-DST");
                             tile_regs_release();
                         }
 

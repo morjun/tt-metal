@@ -15,7 +15,6 @@ KERNEL_OTHER              BRISC-KERNEL                                  brisck.c
 NOC_WAIT_MATMUL           NOC-MCAST-WAIT-PADDING                        reader_bmm_tile_layout_in1_receiver_writer_padding.cpp 244      0.0101     0.0120     2.4708
 NOC_WAIT_MATMUL           NOC-BARRIER-WAIT-IN1-PADDING                  reader_bmm_tile_layout_in1_sender_writer_padding.cpp 244      0.0018     0.0037     0.4330
 SUBZONE_MATMUL            READ-IN1-DRAM-TO-SRAM-PADDING                 reader_bmm_tile_layout_in1_sender_writer_padding.cpp 244      0.0044     0.0052     1.0784
-SUBZONE_MATMUL            IN1-STREAM-MCAST                              reader_bmm_tile_layout_in1_sender_writer_padding.cpp 244      0.0040     0.0040     0.9644
 
 [NCRISC]
 Category                  Zone Name                                     Source File                         Count    Avg/Iter   Max/Iter   Max(ms)
