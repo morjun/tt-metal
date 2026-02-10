@@ -24,6 +24,7 @@
 #include <tt-metalium/distributed.hpp>
 #include <type_traits>
 #include "ttnn/mesh_device_operation_adapter.hpp"
+#include "ttnn/util/timer.hpp"
 #include "ttnn/operation_concepts.hpp"
 #include "ttnn/mesh_device_operation_utils.hpp"
 #include "ttnn/distributed/types.hpp"
@@ -258,6 +259,7 @@ void create_and_cache_mesh_workload(
     ttnn::MeshDevice* mesh_device,
     tt::tt_metal::program_cache::detail::ProgramCache& program_cache,
     tt::stl::hash::hash_t program_hash) {
+    ttnn::Timer timer("compile_and_cache_program");
     mesh_device_operation_t::validate_on_program_cache_miss(operation_attributes, tensor_args);
 
     auto program_factory = mesh_device_operation_t::select_program_factory(operation_attributes, tensor_args);

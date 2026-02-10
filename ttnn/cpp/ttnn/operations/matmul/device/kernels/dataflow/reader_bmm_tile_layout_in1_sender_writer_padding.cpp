@@ -7,9 +7,18 @@
 #include "dataflow_api.h"
 #include "hostdevcommon/common_values.hpp"
 #include "ttnn/operations/ccl/kernel_common/worker_sync_utils.hpp"
+// ✅ ADD THIS: Enable kernel profiling
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
+    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
+    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-WRITER-IN1-SENDER");
     // READER
+    // Read iter index from L1 (written by host)
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(120000);
+    uint32_t iter_idx = *ptr;
+    DeviceTimestampedData("FORWARD_PASS", (uint64_t)iter_idx);
+
     uint32_t rt_args_idx = 0;
     // in1 tensor args
     const uint32_t in1_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
@@ -308,56 +317,69 @@ void kernel_main() {
                         uint64_t in1_start_address =
                             l1_write_addr_in1;  // copy start address of block, to be used for mcasting
 
-                        // Copy in1 block into CB, as the default kernel
-                        uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
-                        for (uint32_t h = 0; h < in1_block_h; ++h) {
-                            uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
-                            for (uint32_t w = 0; w < in1_block_w; ++w) {
-                                if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
-#ifndef INTERMEDIATE_CB_READ
-                                    noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
-#else
-                                    noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_helper);
-                                    noc_async_read_barrier();
-                                    memcpy(
-                                        /*dst=*/reinterpret_cast<void*>(l1_write_addr_in1),
-                                        /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
-                                        /*size=*/in1_single_tile_size_bytes);
-#endif  // INTERMEDIATE_CB_READ
-                                }
-                                l1_write_addr_in1 += in1_single_tile_size_bytes;
-                                in1_tensor_tile_id += in1_tensor_stride_w;
-                            }
-                            in1_tensor_row_start_tile_id += in1_tensor_stride_h;
-                        }
-                        in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+                        {
+                            // Measure IN1 (activations in transposed workload) reading
+                            // DeviceZoneScopedN("READ-IN1-DRAM-TO-SRAM-PADDING");
 
-                        // Barrier! make sure the reads are done
-                        noc_async_read_barrier();
+                            // Copy in1 block into CB, as the default kernel
+                            uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
+                            for (uint32_t h = 0; h < in1_block_h; ++h) {
+                                uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
+                                for (uint32_t w = 0; w < in1_block_w; ++w) {
+                                    if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
+#ifndef INTERMEDIATE_CB_READ
+                                        noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
+#else
+                                        noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_helper);
+                                        noc_async_read_barrier();
+                                        memcpy(
+                                            /*dst=*/reinterpret_cast<void*>(l1_write_addr_in1),
+                                            /*src=*/reinterpret_cast<const void*>(l1_write_addr_helper),
+                                            /*size=*/in1_single_tile_size_bytes);
+#endif  // INTERMEDIATE_CB_READ
+                                    }
+                                    l1_write_addr_in1 += in1_single_tile_size_bytes;
+                                    in1_tensor_tile_id += in1_tensor_stride_w;
+                                }
+                                in1_tensor_row_start_tile_id += in1_tensor_stride_h;
+                            }
+                            in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+                        }
+
+                        {
+                            // Measure NOC barrier wait time for IN1 (activations)
+                            DeviceZoneScopedN("NOC-BARRIER-WAIT-IN1-PADDING");
+                            // Barrier! make sure the reads are done
+                            noc_async_read_barrier();
+                        }
 #endif  // IN1_SHARDED
 #endif  // IN1_DRAM_SHARDED
 
 #ifndef SKIP_MCAST
-                        // wait until all in1 mcast destinations have atomically incremented the in1 semaphore_addr
-                        // (i.e. its value should be in0_mcast_num_dests), then reset the semaphore_addr value back to
-                        // zero for the next block
-                        noc_semaphore_wait(in1_mcast_sender_semaphore_addr_ptr, in1_mcast_num_dests);
-                        noc_semaphore_set(in1_mcast_sender_semaphore_addr_ptr, 0);
+                        {
+                            // Multicast IN1 (activations) to receiver cores
+                            DeviceZoneScopedN("IN1-STREAM-MCAST");
 
-                        // Now we have the block in the CB address, we can mcast to dests!
-                        uint64_t in1_multicast_data_addr = in1_multicast_data_noc | in1_start_address;
+                            // wait until all in1 mcast destinations have atomically incremented the in1 semaphore_addr
+                            // (i.e. its value should be in0_mcast_num_dests), then reset the semaphore_addr value back
+                            // to zero for the next block
+                            noc_semaphore_wait(in1_mcast_sender_semaphore_addr_ptr, in1_mcast_num_dests);
+                            noc_semaphore_set(in1_mcast_sender_semaphore_addr_ptr, 0);
 
-                        // num_dests must not include source, since we are NOT really doing a local copy!
-                        noc_async_write_multicast(
-                            in1_start_address,
-                            in1_multicast_data_addr,
-                            in1_block_size_bytes,
-                            in1_mcast_num_cores,
-                            true);
+                            // Now we have the block in the CB address, we can mcast to dests!
+                            uint64_t in1_multicast_data_addr = in1_multicast_data_noc | in1_start_address;
 
-                        // Note: no need for write barrier, since these two multicasts are done on the same noc id and
-                        // same vc even though cmd bufs are different Also, this only works because we are setting VCs
-                        // statically (using NOC_CMD_STATIC_VC).
+                            // num_dests must not include source, since we are NOT really doing a local copy!
+                            noc_async_write_multicast(
+                                in1_start_address,
+                                in1_multicast_data_addr,
+                                in1_block_size_bytes,
+                                in1_mcast_num_cores,
+                                true);
+
+                            // Note: no need for write barrier, since these two multicasts are done on the same noc id
+                            // and same vc even though cmd bufs are different Also, this only works because we are
+                            // setting VCs statically (using NOC_CMD_STATIC_VC).
 #ifdef ARCH_BLACKHOLE
                         // On Blackhole the flush is needed because NoC latency is higher than L1 <-> RISCV latency
                         // which means data could be changed before
@@ -371,6 +393,7 @@ void kernel_main() {
                             in1_mcast_receiver_semaphore_addr,
                             in1_mcast_receiver_semaphore_noc_addr,
                             in1_mcast_num_cores);
+                        }
 #endif  // SKIP_MCAST
 
 #ifndef IN1_SHARDED
@@ -511,27 +534,39 @@ void kernel_main() {
                                 subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
                             }
 
-                            cb_wait_front(cb_id_out0, out_subblock_tile_count);
+                            {
+                                DeviceZoneScopedN("WAIT-FOR-OUT-TILES");
+                                cb_wait_front(cb_id_out0, out_subblock_tile_count);
+                            }
                             uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
 
-                            for (uint32_t h = 0; h < out_subblock_h_; ++h) {
-                                uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
-                                for (uint32_t w = 0; w < out_subblock_w_; ++w) {
-                                    if (bw < num_blocks_w_dim_) {
-                                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                            {
+                                DeviceZoneScopedN("WRITE-OUTPUT-TILES");
+                                for (uint32_t h = 0; h < out_subblock_h_; ++h) {
+                                    uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
+                                    for (uint32_t w = 0; w < out_subblock_w_; ++w) {
+                                        if (bw < num_blocks_w_dim_) {
+                                            noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                                        }
+
+                                        l1_read_addr += output_single_tile_size_bytes;
+
+                                        out_tensor_tile_id += out_tensor_stride_w;
                                     }
-
-                                    l1_read_addr += output_single_tile_size_bytes;
-
-                                    out_tensor_tile_id += out_tensor_stride_w;
+                                    // Skip padded tiles in subblock along row
+                                    l1_read_addr += subblock_tiles_addr_skip;
+                                    out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                                 }
-                                // Skip padded tiles in subblock along row
-                                l1_read_addr += subblock_tiles_addr_skip;
-                                out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                             }
 
-                            noc_async_write_barrier();
-                            cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                            {
+                                DeviceZoneScopedN("NOC-BARRIER-WAIT-OUT-PADDING");
+                                noc_async_write_barrier();
+                            }
+                            {
+                                DeviceZoneScopedN("CB-POP-FRONT-OUT");
+                                cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                            }
                             out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
                         }
                         // Pop fully padded subblocks along the row

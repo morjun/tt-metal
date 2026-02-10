@@ -28,6 +28,12 @@ namespace ttnn::core {
 void py_module_types(py::module& module) { py::class_<ttnn::Config>(module, "Config"); }
 
 void py_module(py::module& module) {
+    module.def(
+        "get_timer_duration",
+        &ttnn::Timer::get_duration,
+        py::arg("name"),
+        "Get the duration of a timer in microseconds");
+
     using tt::tt_metal::LightMetalBeginCapture;
     using tt::tt_metal::LightMetalBinary;
     using tt::tt_metal::LightMetalEndCapture;

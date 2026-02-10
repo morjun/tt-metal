@@ -10,8 +10,10 @@
 #include "ttnn/operations/data_movement/permute/device/permute_device_operation.hpp"
 #include "ttnn/operations/data_movement/transpose/transpose.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/util/timer.hpp"
 
 #include <tt-metalium/hal.hpp>
+#include <tt-metalium/distributed.hpp>
 
 namespace ttnn::operations::data_movement {
 
@@ -85,6 +87,7 @@ ttnn::Tensor ExecuteTranspose::invoke(
     const int64_t& dim2,
     const std::optional<MemoryConfig>& memory_config_arg,
     const std::optional<float>& pad_value) {
+    ttnn::Timer timer("transpose");
     const auto& input_shape = input_tensor.logical_shape();
     uint32_t normalized_dim1 = input_shape.get_normalized_index(dim1);
     uint32_t normalized_dim2 = input_shape.get_normalized_index(dim2);
@@ -97,7 +100,14 @@ ttnn::Tensor ExecuteTranspose::invoke(
         normalized_dim1 += rank_diff;
         normalized_dim2 += rank_diff;
     } else if (initial_rank > 4) {
-        return detail::transpose_nd(input_tensor, normalized_dim1, normalized_dim2, memory_config_arg, pad_value);
+        auto output =
+            detail::transpose_nd(input_tensor, normalized_dim1, normalized_dim2, memory_config_arg, pad_value);
+        if (output.device()) {
+            if (auto* mesh_device = dynamic_cast<MeshDevice*>(output.device())) {
+                tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
+            }
+        }
+        return output;
     }
 
     bool wh = (normalized_dim1 == 2 && normalized_dim2 == 3) || (normalized_dim2 == 2 && normalized_dim1 == 3);
@@ -142,7 +152,13 @@ ttnn::Tensor ExecuteTranspose::invoke(
         output = detail::transpose_(input_typecasted, transpose_dim, memory_config, pad_value);
     }
     output = initial_rank < 4u ? ttnn::squeeze_from_4D(output, initial_rank) : output;
-    return typecast ? ttnn::typecast(output, DataType::BFLOAT8_B) : output;
+    auto final_output = typecast ? ttnn::typecast(output, DataType::BFLOAT8_B) : output;
+    if (final_output.device()) {
+        if (auto* mesh_device = dynamic_cast<MeshDevice*>(final_output.device())) {
+            tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
+        }
+    }
+    return final_output;
 }
 
 ttnn::Tensor ExecuteTranspose::invoke(

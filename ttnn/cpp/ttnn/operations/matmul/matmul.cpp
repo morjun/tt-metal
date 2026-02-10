@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "matmul.hpp"
+#include "matmul.hpp"
+#include "ttnn/util/timer.hpp"
+#include <tt-metalium/distributed.hpp>
 
 #include <variant>
 #include "ttnn/operations/core/core.hpp"
@@ -11,6 +14,7 @@
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
 #include "ttnn/operations/creation.hpp"
+#include <tt-logger/tt-logger.hpp>
 
 namespace ttnn {
 
@@ -221,6 +225,7 @@ Tensor MatmulOperation::invoke(
     std::optional<Tensor> optional_output_tensor,
     const std::optional<const GlobalCircularBuffer>& global_cb,
     const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    ttnn::Timer timer("matmul");
     std::optional<CoreCoord> user_core_coord;
     if (core_grid.has_value()) {
         user_core_coord = CoreCoord(core_grid->x, core_grid->y);
@@ -231,7 +236,14 @@ Tensor MatmulOperation::invoke(
                 std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(program_config.value())
             ? std::get<MatmulMultiCoreReuseMultiCast1DProgramConfig>(program_config.value()).untilize_out
             : false;
-    return bound_matmul(
+
+    if (program_config.has_value()) {
+        log_debug(tt::LogOp, "MatmulOperation::invoke: program_config has value");
+    } else {
+        log_debug(tt::LogOp, "MatmulOperation::invoke: program_config is nullopt");
+    }
+
+    auto output = bound_matmul(
         input_tensor_a,
         input_tensor_b,
         /*bias=*/std::nullopt,
@@ -251,6 +263,12 @@ Tensor MatmulOperation::invoke(
             global_cb,
             sub_device_id},
         optional_output_tensor);
+
+    // Synchronize to ensure timer captures full execution including data movement
+    if (output.device()) {
+        tt::tt_metal::distributed::Synchronize(output.device(), std::nullopt, {});
+    }
+    return output;
 }
 
 Tensor LinearOperation::invoke(
@@ -269,6 +287,7 @@ Tensor LinearOperation::invoke(
     std::optional<ttnn::Tensor> optional_output_tensor,
     const std::optional<const GlobalCircularBuffer>& global_cb,
     const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    ttnn::Timer timer("linear");
     std::optional<CoreCoord> user_core_coord;
     if (core_grid.has_value()) {
         user_core_coord = CoreCoord(core_grid->x, core_grid->y);
@@ -276,7 +295,7 @@ Tensor LinearOperation::invoke(
     bool b_is_batched = detail::is_input_batched(input_tensor_b.logical_shape());
     TT_FATAL(!(b_is_batched && bias.has_value()), "Batched input not supported when bias exists (linear operation).");
 
-    return bound_matmul(
+    auto output = bound_matmul(
         input_tensor_a,
         input_tensor_b,
         bias,
@@ -296,6 +315,13 @@ Tensor LinearOperation::invoke(
             global_cb,
             sub_device_id},
         optional_output_tensor);
+
+    // Synchronize to ensure timer captures full execution including data movement
+    // Synchronize to ensure timer captures full execution including data movement
+    if (output.device()) {
+        tt::tt_metal::distributed::Synchronize(output.device(), std::nullopt, {});
+    }
+    return output;
 }
 
 std::vector<Tensor> MatmulBatchedWeightsOperation::invoke(
