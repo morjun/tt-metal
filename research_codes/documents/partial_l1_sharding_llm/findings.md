@@ -37,6 +37,10 @@ Your observation is correct. `tt_transformers` explicitly configures **Model Wei
 *   **Purpose**:
     1.  **Capacity**: To store multibillion-parameter models that exceed L1 size.
     2.  **Bandwidth**: Loading sharded weights from GDDR6 in parallel across $N$ devices provides $N \times$ bandwidth.
+    3.  **Structure (Confirmed)**:
+        *   **Step 1 (Global Sharding)**: The original weight matrix is split into $N$ chunks (where $N$ is the number of devices) using `torch.chunk`. Each device receives one chunk (1/N of the total).
+        *   **Step 2 (Local DRAM Sharding)**: Inside each device, that 1/N chunk is further sharded across the local DRAM banks (e.g., 12 banks on Wormhole) using `WIDTH_SHARDED` layout. This optimizes local memory bandwidth.
+
 
 ## 4. Weight Reconstruction & Partitioning
 

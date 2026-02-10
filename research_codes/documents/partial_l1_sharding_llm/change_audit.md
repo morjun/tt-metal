@@ -248,97 +248,220 @@ A `per_core_N` ternary expression and a trailing comma were reformatted. Cosmeti
 
 ## 5. `attention.py` — Attention Module
 
-### Change 5a: L1 row calculation in `__init__` (top of constructor)
+### 5.1 Initialization: Splitting Weights
+
+The core logic for partial L1 sharding is implemented in `__init__` via the `get_split_tensors` inner helper function. This function partitions a weight tensor $W$ of shape $[Out, In]$ into two components based on a calculated `l1_rows` budget:
+
+1.  **$W_{L1}$ (L1 Resident)**:
+    -   Contains the first `l1_rows` of the weight matrix.
+    -   **Layout**: `TILE_LAYOUT`
+    -   **Memory Config**: `HEIGHT_SHARDED`, `ROW_MAJOR` (Stored permanently in L1).
+    -   **Shape**: `[l1_rows, In]`
+
+2.  **$W_{DRAM}$ (DRAM Resident)**:
+    -   Contains the remaining rows ($TotalRows - l1\_rows$).
+    -   **Layout**: `TILE_LAYOUT`
+    -   **Memory Config**: `DRAM_MEMORY_CONFIG` (Interleaved).
+    -   **Shape**: `[RemainingRows, In]`
+
+**Detailed Explanation of Arguments:**
+
+-   **`row_size_bytes` argument**: This value, passed to `get_l1_sharded_rows`, represents the size in bytes of a single row of the tensor *as it will be stored in L1*.
+    -   For **WQKV** (Attention Weights): The tensor is `[LocalQKV, Dim]`. The row width is `Dim` (Embedding Dimension, e.g., 4096). Since we use BFLOAT16 (2 bytes), the value provided is `configuration.dim * 2` (e.g., 8192 bytes).
+    -   For **WO** (Output Weight): The tensor is `[Dim, Hidden/Users]`. The row width is `Hidden/Users` (e.g., 14336/8 = 1792). The value provided is `(configuration.hidden_dim // configuration.num_devices) * 2` (e.g., 3584 bytes).
+
+-   **`alignment`**: The number of rows must be a multiple of `alignment` to ensuring correct tiling across all cores.
+    -   Formula: `num_cores * 32`.
+    -   `32` comes from the tile height (32x32 tiles).
+    -   `num_cores` ensures that every core gets the same integer number of tile rows. If we didn't align this way, some cores would have more data than others, complicating the sharding logic.
+
+-   **Terminology**:
+    -   **WQKV (Query, Key, Value)**: These weights project the input embedding into Query, Key, and Value vectors needed for the attention mechanism. In Llama, these are often fused into a single tensor `[Dim, Heads * HeadDim]`.
+    -   **WO (Output)**: This weight projects the concatenated attention output from all heads back to the embedding dimension.
+
+**Code Diff (Attention Logic):**
 
 ```python
-if configuration.use_l1_weight_sharding and layer_num == 0:
-    wqkv_l1_rows = configuration.get_l1_sharded_rows(...)  # 384KB/core
-    wo_l1_rows = configuration.get_l1_sharded_rows(...)     # 1MB/core
-else:
-    wqkv_l1_rows = 0
-    wo_l1_rows = 0
++        # L1 Partitioning Logic
++        # Split weights along output dimension into L1-resident (fast) and DRAM-resident (remaining) portions.
++        # self.wqkv and self.wo (created above) are always kept for prefill use.
++        if wqkv_l1_rows > 0 or wo_l1_rows > 0:
++
++            def get_split_tensors(full_w, dim_arg, l1_rows):
++                """Split weight [Out, In] into L1 HEIGHT-sharded and DRAM INTERLEAVED portions."""
++                total_rows = full_w.shape[0]
++                grid = self.mesh_device.compute_with_storage_grid_size()
++                num_cores = grid.x * grid.y
++                alignment = num_cores * 32
++
++                l1_rows_actual = min(total_rows, l1_rows)
++                l1_rows_actual = (l1_rows_actual // alignment) * alignment
++
++                w_l1_torch = full_w[:l1_rows_actual, :]
++                w_dram_torch = full_w[l1_rows_actual:, :]
+...
++            # Split WQKV: qkv_cat is [1, 1, Dim, LocalQKV], transpose to [LocalQKV, Dim] for height splitting
++            qkv_cat_local = qkv_cat.squeeze(0).squeeze(0).transpose(-1, -2)
++            self.wqkv_l1, self.wqkv_dram = get_split_tensors(qkv_cat_local, configuration.dim, wqkv_l1_rows)
 ```
 
-**Explanation**: Only layer 0 is sharded to avoid L1 OOM.
+### 5.2 Forward Pass: Hybrid Execution
 
-### Change 5b: L1 weight partitioning logic in `__init__`
+In `forward_decode`, the matrix multiplication is split into two parallel paths that are later concatenated.
 
-When `wqkv_l1_rows > 0 or wo_l1_rows > 0`, weights are split via `get_split_tensors()`:
-- L1 portion → HEIGHT-sharded in L1 (transposed, for use as first arg in `ttnn.matmul`)
-- DRAM portion → INTERLEAVED in DRAM (standard layout for `ttnn.linear`)
-- `self.wqkv` / `self.wo` (the original full weights) are always kept for prefill use
+**Path A: L1-Resident Calculation (Transposed Matmul)**
+Because $W_{L1}$ is stored as a sharded tensor of shape `[Rows, Cols]`, we perform a "transposed matmul" sequence to align dimensions and keep data in L1:
+1.  **Transpose Input $X$**: `[Batch, 1, In]` $\to$ `[Batch, 1, In, 1]` $\to$ `[Batch, 1, 1, In]` (via `transpose(-2, -1)`).
+2.  **Matmul**: $W_{L1} \times X^T$ produces partial output $Y_{L1}^T$.
+3.  **Transpose Output**: $Y_{L1}^T \to Y_{L1}$ via `transpose(-2, -1)` to return to original shape.
 
-When disabled (`else` branch):
-```python
-self.wqkv_l1 = None;  self.wqkv_dram = self.wqkv  # alias
-self.wo_l1 = None;     self.wo_dram = self.wo        # alias
-```
+**Path B: DRAM-Resident Calculation (Standard Linear)**
+Standard linear operation using the remainder of the weights ($W_{DRAM}$):
+1.  Linear: $X \times W_{DRAM} \to Y_{DRAM}$ (using default generic kernel).
+2.  **Note**: This path does *not* use explicit transposes.
 
-### Change 5c: KV cache guard — Restored
-
-The original guard `if not use_paged_kv_cache:` was removed in the sharding commit.
-It has been **restored**.
-
-### Change 5d: `forward_decode` — WQKV matmul (branched)
-
-```python
-if self.wqkv_l1 is not None:
-    # L1 path: transposed matmul → DRAM path: standard linear → concat
-    ...
-else:
-    # Disabled path: exact original call signature
-    xqkv_fused_sharded = ttnn.linear(
-        x, self.wqkv_dram,
-        memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-        program_config=self.model_config["XQKV_DECODE_PROGCFG"],
-        compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-        dtype=...,
-    )
-```
-
-### Change 5e: `forward_decode` — WO matmul (branched)
-
-```python
-if self.wo_l1 is not None:
-    # L1 path: transposed matmul → DRAM path: linear → concat
-    ...
-else:
-    # Disabled path: exact original call (ttnn.matmul with core_grid and program_config)
-    dense_out_sharded = ttnn.matmul(
-        attn_output, self.wo_dram,
-        core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
-        program_config=self.model_config["ATTN_OUTPUT_PROGCFG"] if not self.TG else None,
-        memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-        dtype=...,
-        compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
-    )
-```
-
-### Change 5f: `forward_prefill` — No changes
-
-Prefill uses `self.wqkv` and `self.wo` directly (always available).
+**Combination**:
+The results are concatenated along the last dimension (width/features):
+$$ Y_{Total} = \text{Concat}(Y_{L1}, Y_{DRAM}, \text{dim}=-1) $$
 
 ---
 
 ## 6. `mlp.py` — MLP Module
 
-### Change 6a: L1 row calculation in `__init__`
+### 6.1 Initialization
 
-Same pattern as attention: calculates split rows for W1/W3 (512KB/core) and W2 (512KB/core).
+The MLP module applies the same `get_split_tensors` logic to three weight matrices:
 
-### Change 6b: Weight splitting in `__init__`
+-   **W1 (Gate Projection)**: Projects the input embedding up to the hidden dimension. It acts as the "Gate" in the SwiGLU activation function.
+-   **W3 (Up Projection)**: Also projects input up to the hidden dimension (often called "Up"). It is multiplied element-wise with the swish-activated Gate output.
+-   **W2 (Down Projection)**: Projects the intermediate hidden state back down to the embedding dimension.
 
-`get_split_tensors(name, dim_arg, l1_rows)` splits each weight. When disabled, `_dram`
-aliases point to the original weight tensors.
+**Target Budgets & Space Specification**:
+The code explicitly specifies the target L1 space for these shards in `mlp.py`.
+-   **W1 & W3**: `target_size_per_core=128 * 1024` (128KB). They share the same `l1_rows` calculation input (`args.dim * 2` row size).
+-   **W2**: `target_size_per_core=64 * 1024` (64KB). Uses `(args.hidden_dim // args.num_devices) * 2` row size.
 
-### Change 6c–6e: `forward` — W1, W3, W2 matmuls (branched)
+**Code Diff (MLP Logic):**
 
-Each follows the same pattern. The disabled (`else`) paths correctly preserve **all**
-original parameters: `compute_kernel_config`, `program_config`, `core_grid`, `memory_config`.
+```python
++        if args.use_l1_weight_sharding and layer_num == 0:
++            w1_w3_l1_rows = args.get_l1_sharded_rows(self.mesh_device, args.dim * 2, target_size_per_core=128 * 1024)
++            w2_l1_rows = args.get_l1_sharded_rows(
++                self.mesh_device, (args.hidden_dim // args.num_devices) * 2, target_size_per_core=64 * 1024
++            )
++
++            self.w1_l1, self.w1_dram = get_split_tensors("w1", args.dim, w1_w3_l1_rows)
++            self.w2_l1, self.w2_dram = get_split_tensors("w2", args.hidden_dim // args.num_devices, w2_l1_rows)
++            self.w3_l1, self.w3_dram = get_split_tensors("w3", args.dim, w1_w3_l1_rows)
+```
+
+### 6.2 Forward Pass
+
+For each linear layer (W1, W3, W2), the forward logic checks if L1 sharding is enabled (`self.wX_l1 is not None` and `mode == "decode"`):
+
+1.  **L1 Path (Transposed Matmul)**:
+    -   Transpose `X` to `X_T`.
+    -   Atomic Matmul: `Y_L1_T = ttnn.matmul(W_L1, X_T)`.
+    -   Transpose Output `Y_L1 = ttnn.transpose(Y_L1_T, -2, -1)`.
+2.  **DRAM Path (Standard Linear)**: `Linear(X, W_dram) -> Y_dram` (No transposes).
+3.  **Merge**: `Concat([Y_l1, Y_dram], dim=-1)`
+
+This hybrid approach allows the most frequently accessed top rows of the weights to stay in the fast L1 cache, while the bulk of the parameters reside in DRAM, optimizing for the limited L1 capacity of the Tenstorrent architecture.
 
 ---
 
-## 7. `generator.py` — Decode Forward Fix
+## 7. L1 SRAM Layout Visualization
+
+To visualize the impact of Partial L1 Sharding, consider the layout of a single Tensix Core's L1 Memory (1MB).
+
+### 7.1 Without Sharding (Base Case)
+Weights are streamed from DRAM through circular buffers (CBs). They do not persist in L1.
+
+**Note on Circular Buffers**: In this scenario, we often allocate **larger** circular buffers (e.g., double or triple buffered) because the entire 1MB (minus reserve) is available. This maximizes bandwidth by hiding DRAM latency.
+
+```text
++------------------------------------------------------+ 0KB
+|             L1 Memory (1MB Total)                    |
+|                                                      |
+|  Reserved (System / Mailbox / FW)                    |
++------------------------------------------------------+ ~100KB
+|                                                      |
+|  [CB: Inputs]  (Activations from neighbors/DRAM)     |
+|                                                      |
+|  [CB: Weights] (LARGE Double-buffer, e.g. 100s KB)   |  <-- Can be large
+|                                                      |
+|  [CB: Outputs] (Results to neighbors/DRAM)           |
+|                                                      |
+|  [CB: Intermediates] (Math intermediate tiles)       |
+|                                                      |
++------------------------------------------------------+ ~800KB
+|                                                      |
+|               FREE SPACE / UNUSED                    |
+|                                                      |
++------------------------------------------------------+ 1MB
+```
+
+### 7.2 With Partial L1 Weight Sharding
+Top rows of WQKV, WO, W1, W2, W3 are statically allocated in L1. This drastically reduces the available space.
+
+**Impact on Circular Buffers**:
+1.  **Static Shards**: Consume a significant fixed portion (e.g., ~400KB total).
+2.  **No Weight CB for L1 Part**: The L1-resident calculation (`Path A`) does **not** need a Weight CB; it uses the static shard directly.
+3.  **Smaller DRAM Weight CB**: For the `Path B` (DRAM) calculation, we still need a Weight CB, but we must make it **smaller** (e.g., single buffered or smaller blocks) to fit in the remaining space.
+4.  **Reduced Free Space**: The margin for error is very small. Over-allocating static shards (like the 1MB WO target we fixed) causes the "Memory Clash" because the remaining space isn't enough even for the minimal CBs needed for `Path B` and Inputs/Outputs.
+
+```text
++------------------------------------------------------+ 0KB
+|             L1 Memory (1MB Total)                    |
+|  Reserved (System / Mailbox / FW)                    |
++------------------------------------------------------+ ~100KB
+|  [Static] WQKV L1 Shard                              |
++------------------------------------------------------+
+|  [Static] WO L1 Shard                                |
++------------------------------------------------------+
+|  [Static] MLP W1/W3 L1 Shards                        |
++------------------------------------------------------+
+|  [Static] MLP W2 L1 Shard                            | <--- (Missed in previous version)
++------------------------------------------------------+ ~560KB (e.g.)
+|                                                      |
+|  [CB: Inputs]                                        |
+|  [CB: DRAM Weights] (MUST be smaller now)            | <-- Smaller CB
+|  [CB: Outputs]                                       |
+|  [CB: Intermediates]                                 |
+|                                                      |
++------------------------------------------------------+ ~980KB
+|         Useable Free Space (Example: ~20KB)          | <-- Very tight!
++------------------------------------------------------+ 1MB
+```
+
+**Key Constraint**: The sum of `Reserved + Static Shards + Circular Buffers` must be $< 1MB$. The "Memory Clash" bugs occur when this limit is exceeded.
+
+---
+
+### 7.3 Code Audit: Hybrid Strategy & CB Sizing
+
+The "Sharded Case" uses a hybrid strategy that treats L1 and DRAM resident weights differently to fit within memory constraints.
+
+**1. L1 Resident Part (The "Transposed" Path)**
+-   **Weight Shape**: `[Out_Rows, In_Cols]`.
+-   **Operation**: `Matmul(W_L1, X_T)`.
+-   **Memory**: Statically allocated in L1. **No Weight Circular Buffer** is required because the weight is already resident.
+-   **Efficiency**: High math utilization, zero DRAM bandwidth for weights.
+
+**2. DRAM Resident Part (The "Standard" Path)**
+-   **Weight Shape**: `[In_Cols, Out_Rows]` (Transposed relative to L1 part).
+-   **Operation**: `ttnn.linear(X, W_DRAM)`.
+-   **Config**: Uses **default** configuration (Generic Kernel), unlike the optimized `ATTN_OUTPUT_PROGCFG` used in the non-sharded case.
+-   **CB Implication**:
+    -   *Non-Sharded (Optimized)*: `in0_block_w=4` $\to$ **~512KB CB**. (Would crash if used with static shards).
+    -   *Sharded DRAM (Generic)*: Default `in0_block_w` (usually 1 or 2) $\to$ **~128KB CB**.
+-   **Memory**: The smaller default CB allows this path to run alongside the large static L1 shards without causing an OOM.
+
+**Conclusion**: The user correctly recalled a "special one with transposes" — this is the **L1 Path**. The **DRAM Path** remains a standard linear op, but crucially relies on arguably less-optimized (smaller) buffer sizes to ensure memory safety.
+
+---
+
+## 8. `generator.py` — Decode Forward Fix
 
 ### Change 7a: `argmax_on_device` → `sampling_on_device`
 
