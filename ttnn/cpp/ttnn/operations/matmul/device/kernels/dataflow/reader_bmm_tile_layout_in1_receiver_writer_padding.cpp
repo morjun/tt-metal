@@ -7,12 +7,8 @@
 #include "dataflow_api.h"
 #include "hostdevcommon/common_values.hpp"
 #include "ttnn/operations/ccl/kernel_common/worker_sync_utils.hpp"
-// ✅ ADD THIS: Enable kernel profiling
-#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
-    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
-    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-WRITER-IN1-RECEIVER");
     // READER
     uint32_t rt_args_idx = 0;
     // in1 mcast args
@@ -122,12 +118,8 @@ void kernel_main() {
                     // Atomic increment source core counter
                     noc_semaphore_inc(in1_mcast_sender_semaphore_noc_addr, 1);
 
-                    {
-                        // Measure IN1 (activations) multicast wait time
-                        DeviceZoneScopedN("NOC-MCAST-WAIT-PADDING");
-                        // wait on in1 semaphore value to become VALID (set by mcast sender after it multicasts data)
-                        noc_semaphore_wait(in1_mcast_receiver_semaphore_addr_ptr, VALID);
-                    }
+                    // wait on in1 semaphore value to become VALID (set by mcast sender after it multicasts data)
+                    noc_semaphore_wait(in1_mcast_receiver_semaphore_addr_ptr, VALID);
 
                     cb_push_back(cb_id_in1, in1_block_num_tiles);
                 }
@@ -180,40 +172,28 @@ void kernel_main() {
                             subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
                         }
 
-                        {
-                            DeviceZoneScopedN("WAIT-FOR-OUT-TILES");
-                            cb_wait_front(cb_id_out0, out_subblock_tile_count);
-                        }
+                        cb_wait_front(cb_id_out0, out_subblock_tile_count);
                         uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
 
-                        {
-                            DeviceZoneScopedN("WRITE-OUTPUT-TILES");
-                            for (uint32_t h = 0; h < out_subblock_h_; ++h) {
-                                uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
-                                for (uint32_t w = 0; w < out_subblock_w_; ++w) {
-                                    if (bh < num_blocks_h_dim_ && bw < num_blocks_w_dim_) {
-                                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
-                                    }
-
-                                    l1_read_addr += output_single_tile_size_bytes;
-
-                                    out_tensor_tile_id += out_tensor_stride_w;
+                        for (uint32_t h = 0; h < out_subblock_h_; ++h) {
+                            uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
+                            for (uint32_t w = 0; w < out_subblock_w_; ++w) {
+                                if (bh < num_blocks_h_dim_ && bw < num_blocks_w_dim_) {
+                                    noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
                                 }
-                                // Skip padded tiles in subblock along row
-                                l1_read_addr += subblock_tiles_addr_skip;
-                                out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
+
+                                l1_read_addr += output_single_tile_size_bytes;
+
+                                out_tensor_tile_id += out_tensor_stride_w;
                             }
+                            // Skip padded tiles in subblock along row
+                            l1_read_addr += subblock_tiles_addr_skip;
+                            out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                         }
 
-                        {
-                            DeviceZoneScopedN("NOC-BARRIER-WAIT-OUT-PADDING");
-                            noc_async_write_barrier();
-                        }
+                        noc_async_write_barrier();
 
-                        {
-                            DeviceZoneScopedN("CB-POP-FRONT-OUT");
-                            cb_pop_front(cb_id_out0, out_subblock_tile_count);
-                        }
+                        cb_pop_front(cb_id_out0, out_subblock_tile_count);
                         out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
                     }
                     // Pop fully padded subblocks along the row

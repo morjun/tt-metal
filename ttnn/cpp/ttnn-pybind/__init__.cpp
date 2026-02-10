@@ -27,7 +27,6 @@
 #include "ttnn-pybind/tensor_accessor_args.hpp"
 #include "ttnn-pybind/reports.hpp"
 #include "ttnn-pybind/tensor.hpp"
-#include "ttnn-pybind/timer.hpp"
 #include "ttnn-pybind/types.hpp"
 
 #include "ttnn/core.hpp"
@@ -287,9 +286,6 @@ PYBIND11_MODULE(_ttnn, module) {
     ttnn::profiler::py_module(m_profiler);
     ttnn::reports::py_module(m_reports);
     ttnn::tensor_accessor_args::py_module(m_tensor_accessor_args);
-
-    auto m_timer = module.def_submodule("timer", "timer utilities");
-    ttnn::timer::py_module(m_timer);
 
     // ttnn operations have to come before the deprecated ones,
     // because ttnn defines additional type bindings.

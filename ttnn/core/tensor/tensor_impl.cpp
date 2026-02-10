@@ -27,7 +27,6 @@
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/distributed/api.hpp"
-#include "ttnn/util/timer.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -604,7 +603,6 @@ DeviceStorage replicate_to_mesh_buffer(
     const std::shared_ptr<distributed::MeshBuffer>& mesh_buffer,
     const TensorSpec& tensor_spec,
     std::optional<tt::tt_metal::QueueId> cq_id) {
-    ZoneScoped;
     auto* mesh_device = mesh_buffer->device();
     auto data_to_write = buffer.view_bytes();
     const auto expected_packed_buffer_size_bytes = tensor_spec.compute_packed_buffer_size_bytes();
@@ -631,7 +629,6 @@ DeviceStorage write_to_mesh_buffer(
     const DistributedHostBuffer& distributed_host_buffer,
     const std::shared_ptr<distributed::MeshBuffer>& mesh_buffer,
     std::optional<tt::tt_metal::QueueId> cq_id) {
-    ZoneScoped;
     std::optional<uint8_t> cq_id_int = cq_id.has_value() ? std::make_optional(cq_id.value().get()) : std::nullopt;
     mesh_buffer->device()->mesh_command_queue(cq_id_int).enqueue_write(
         mesh_buffer, distributed_host_buffer, /*blocking=*/false);
@@ -688,8 +685,6 @@ Tensor to_device(
     distributed::MeshDevice* mesh_device,
     ttsl::optional_reference<const MemoryConfig> memory_config,
     std::optional<tt::tt_metal::QueueId> cq_id) {
-    ZoneScoped;
-    ttnn::Timer timer("to_device");
     if (tensor.storage_type() == StorageType::DEVICE) {
         return tensor;  // Tensor already on device
     }
@@ -707,7 +702,6 @@ Tensor to_device(
     auto mesh_buffer = allocate_device_buffer(mesh_device, *tensor_spec);
     auto [mesh_storage, topology] = to_device_mesh_buffer<T>(
         tensor.storage(), mesh_buffer, *tensor_spec, *tensor.tensor_attributes, tensor.tensor_topology(), cq_id);
-    tt::tt_metal::distributed::Synchronize(mesh_device, std::nullopt, {});
     return Tensor(std::move(mesh_storage), *tensor_spec, topology);
 }
 

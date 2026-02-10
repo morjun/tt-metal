@@ -6,12 +6,8 @@
 
 #include "dataflow_api.h"
 #include "pad_tile.hpp"
-// ✅ ADD THIS: Enable kernel profiling
-#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
-    // ✅ DISABLED: Main profiling scope - causes buffer overflow with 130+ cores
-    // DeviceZoneScopedMainChildN("BRISC-MATMUL-READER-IN0");
     // in0/in1 common args
     const uint32_t num_blocks = get_arg_val<uint32_t>(0);
 
@@ -95,11 +91,7 @@ void kernel_main() {
             }
             in0_tensor_current_block_start_tile_id += in0_tensor_next_block_stride;
 
-            {
-                // ✅ DISABLED: Measure NOC barrier wait time - causes buffer overflow
-                DeviceZoneScopedN("NOC-BARRIER-WAIT");
-                noc_async_read_barrier();
-            }
+            noc_async_read_barrier();
 
             cb_push_back(cb_id_in0, in0_block_num_tiles);
 

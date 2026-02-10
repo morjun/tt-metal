@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dataflow_api.h"
-#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
     // out tensor args
@@ -41,34 +40,22 @@ void kernel_main() {
             for (uint32_t sbw = 0; sbw < out_num_subblocks_w; sbw++) {
                 uint32_t out_tensor_sb_row_start_tile_id = out_tensor_sbw_start_tile_id;
 
-                {
-                    DeviceZoneScopedN("WAIT-FOR-OUT-TILES");
-                    cb_wait_front(cb_id_out0, out_subblock_tile_count);
-                }
+                cb_wait_front(cb_id_out0, out_subblock_tile_count);
                 uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
 
-                {
-                    DeviceZoneScopedN("WRITE-OUTPUT-TILES");
-                    for (uint32_t h = 0; h < out_subblock_h; h++) {
-                        uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
-                        for (uint32_t w = 0; w < out_subblock_w; w++) {
-                            noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
-                            l1_read_addr += single_tile_size_bytes;
+                for (uint32_t h = 0; h < out_subblock_h; h++) {
+                    uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
+                    for (uint32_t w = 0; w < out_subblock_w; w++) {
+                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                        l1_read_addr += single_tile_size_bytes;
 
-                            out_tensor_tile_id += out_tensor_stride_w;
-                        }
-                        out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
+                        out_tensor_tile_id += out_tensor_stride_w;
                     }
+                    out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                 }
 
-                {
-                    DeviceZoneScopedN("NOC-BARRIER-WAIT-OUT");
-                    noc_async_write_barrier();
-                }
-                {
-                    DeviceZoneScopedN("CB-POP-FRONT-OUT");
-                    cb_pop_front(cb_id_out0, out_subblock_tile_count);
-                }
+                noc_async_write_barrier();
+                cb_pop_front(cb_id_out0, out_subblock_tile_count);
                 out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
             }
             out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;

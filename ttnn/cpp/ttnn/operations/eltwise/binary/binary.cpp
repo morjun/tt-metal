@@ -11,8 +11,6 @@
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
-#include "ttnn/util/timer.hpp"
-#include <tt-metalium/distributed.hpp>
 
 namespace ttnn::operations::binary {
 namespace detail {
@@ -340,18 +338,6 @@ inline auto invoke_binary_ng(
     tt::stl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> rhs_activations,
     const std::optional<bool>& use_legacy,
     const std::optional<bool>& fast_and_approximate_mode) {
-    std::optional<ttnn::Timer> timer;
-    if (binary_op_type == BinaryOpType::ADD) {
-        timer.emplace("add");
-    }
-
-    auto return_with_sync = [&](Tensor result) {
-        if (timer && lhs.storage_type() == StorageType::DEVICE) {
-            tt::tt_metal::distributed::Synchronize(lhs.device(), std::nullopt, {});
-        }
-        return result;
-    };
-
     if (use_legacy ? *use_legacy
                    : binary::is_legacy_only(lhs, rhs, memory_config, output, lhs_activations, rhs_activations) and
                          (not detail::is_binary_ng_only(lhs, rhs, binary_op_type))) {
@@ -362,11 +348,10 @@ inline auto invoke_binary_ng(
         if constexpr (requires { detail::preprocess_inputs(binary_op_type, lhs, rhs); }) {
             auto [a, b] = detail::preprocess_inputs(binary_op_type, lhs, rhs);
 
-            return return_with_sync(
-                ttnn::prim::binary(a, b, binary_op_type, dtype, memory_config, output, activations, lhs_activation));
+            return ttnn::prim::binary(a, b, binary_op_type, dtype, memory_config, output, activations, lhs_activation);
         } else {
-            return return_with_sync(ttnn::prim::binary(
-                lhs, rhs, binary_op_type, dtype, memory_config, output, activations, lhs_activation));
+            return ttnn::prim::binary(
+                lhs, rhs, binary_op_type, dtype, memory_config, output, activations, lhs_activation);
         }
     }
 
@@ -415,10 +400,10 @@ inline auto invoke_binary_ng(
         // since there's no consensus here, avoiding the conversion if we have an excuse to is likely the best option
         // since it leads to better perf
         if (input_a_rm and input_b_rm) {
-            return return_with_sync(detail::to_layout(result, Layout::ROW_MAJOR));
+            return detail::to_layout(result, Layout::ROW_MAJOR);
         }
 
-        return return_with_sync(result);
+        return result;
     } else {
         const auto input_a = detail::to_dtype(lhs, DataType::BFLOAT16);
         const auto input_b = detail::to_dtype(rhs, DataType::BFLOAT16);
@@ -437,7 +422,7 @@ inline auto invoke_binary_ng(
             rhs_activations,
             post_activations);
 
-        return return_with_sync(typecast_out ? ttnn::typecast(result, out_dtype, mem_config, output) : result);
+        return typecast_out ? ttnn::typecast(result, out_dtype, mem_config, output) : result;
     }
 }
 

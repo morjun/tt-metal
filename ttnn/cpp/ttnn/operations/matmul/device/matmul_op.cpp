@@ -15,7 +15,6 @@
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/run_operation.hpp"
 #include "ttnn/types.hpp"
-#include <tt-logger/tt-logger.hpp>
 
 using namespace tt;
 using namespace tt::constants;
@@ -129,14 +128,14 @@ operation::OpPerformanceModel create_op_performance_model_for_matmul(
 
     operation::OpPerformanceModel result(input_tensors, output_tensors, ideal_dev_clock_cycles);
 #if 0
-    log_debug(tt::LogOp, "Matmul PerfModel:");
+    log_info(tt::LogOp, "Matmul PerfModel:");
     for (auto i = 0; i < out_shape.rank() - 2; i++) {
-        log_debug(tt::LogOp, "\t Batch Values: (Index: {}, Value: {})", i, out_shape[i]);
+        log_info(tt::LogOp, "\t Batch Values: (Index: {}, Value: {})", i, out_shape[i]);
     }
-    log_debug(tt::LogOp, "\t In A (H, W): ({}, {})", in_a_shape[-2], in_a_shape[-1]);
-    log_debug(tt::LogOp, "\t In B (H, W): ({}, {})", in_b_shape[-2], in_b_shape[-1]);
-    log_debug(tt::LogOp, "\t Out (H, W): ({}, {})", out_shape[-2], out_shape[-1]);
-    log_debug(tt::LogOp, "\t ideal_dev_clock_cycles: {}", ideal_dev_clock_cycles);
+    log_info(tt::LogOp, "\t In A (H, W): ({}, {})", in_a_shape[-2], in_a_shape[-1]);
+    log_info(tt::LogOp, "\t In B (H, W): ({}, {})", in_b_shape[-2], in_b_shape[-1]);
+    log_info(tt::LogOp, "\t Out (H, W): ({}, {})", out_shape[-2], out_shape[-1]);
+    log_info(tt::LogOp, "\t ideal_dev_clock_cycles: {}", ideal_dev_clock_cycles);
 #endif
     return result;
 }
@@ -1152,16 +1151,7 @@ inline MatmulProgramConfig get_program_config(
     const uint32_t bias_single_tile_size,
     const struct Matmul* matmul) {
     if (matmul->program_config.has_value()) {
-        auto config = matmul->program_config.value();
-        if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
-            log_debug(tt::LogMetal, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCast1DProgramConfig");
-        } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-            log_debug(
-                tt::LogMetal, "Matmul Program Config (User): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
-        } else {
-            log_debug(tt::LogMetal, "Matmul Program Config (User): Other");
-        }
-        return config;
+        return matmul->program_config.value();
     }
     auto config = generate_matmul_program_config(
         input_tensor_a,
@@ -1173,29 +1163,7 @@ inline MatmulProgramConfig get_program_config(
         matmul->user_fused_activation,
         matmul->user_run_batched,
         matmul->output_dtype.value_or(input_tensor_a.dtype()));
-
-    if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config)) {
-        auto c = std::get<MatmulMultiCoreReuseMultiCast1DProgramConfig>(config);
-        log_debug(tt::LogMetal, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCast1DProgramConfig");
-        log_debug(tt::LogMetal, "  mcast_in0: {}", c.mcast_in0);
-        log_debug(tt::LogMetal, "  gather_in0: {}", c.gather_in0);
-        log_debug(tt::LogMetal, "  per_core_M: {}", c.per_core_M);
-        log_debug(tt::LogMetal, "  per_core_N: {}", c.per_core_N);
-        log_debug(tt::LogMetal, "  in0_block_w: {}", c.in0_block_w);
-        log_debug(tt::LogMetal, "  out_subblock_h: {}", c.out_subblock_h);
-        log_debug(tt::LogMetal, "  out_subblock_w: {}", c.out_subblock_w);
-        log_debug(
-            tt::LogMetal,
-            "  compute_with_storage_grid_size: {}, {}",
-            c.compute_with_storage_grid_size.x,
-            c.compute_with_storage_grid_size.y);
-    } else if (std::holds_alternative<MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>(config)) {
-        log_debug(tt::LogMetal, "Matmul Program Config (Auto): MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig");
-    } else {
-        log_debug(tt::LogMetal, "Matmul Program Config (Auto): Other");
-    }
-
-    log_debug(tt::LogMetal, "Auto generated program config: {}", config);
+    log_debug(tt::LogOp, "Auto generated program config: {}", config);
 
     // Sanity checks for matmul program configs
     std::visit(
@@ -1743,64 +1711,6 @@ void Matmul::validate(
     }
     MatmulProgramConfig chosen_program_config =
         get_program_config(input_tensor_a, input_tensor_b, bias_single_tile_size, this);
-
-    std::visit(
-        [&](const auto& config) {
-            using T = std::decay_t<decltype(config)>;
-            if constexpr (std::is_same_v<T, MatmulMultiCoreReuseProgramConfig>) {
-                log_debug(
-                    tt::LogOp,
-                    "Matmul Config: MultiCoreReuse - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: {}, "
-                    "out_subblock_h: {}, out_subblock_w: {}",
-                    config.compute_with_storage_grid_size,
-                    config.per_core_M,
-                    config.per_core_N,
-                    config.in0_block_w,
-                    config.out_subblock_h,
-                    config.out_subblock_w);
-            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCastProgramConfig>) {
-                log_debug(
-                    tt::LogOp,
-                    "Matmul Config: MultiCoreReuseMultiCast - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: "
-                    "{}, out_subblock_h: {}, out_subblock_w: {}, out_block_h: {}, out_block_w: {}, transpose_mcast: "
-                    "{}",
-                    config.compute_with_storage_grid_size,
-                    config.per_core_M,
-                    config.per_core_N,
-                    config.in0_block_w,
-                    config.out_subblock_h,
-                    config.out_subblock_w,
-                    config.out_block_h,
-                    config.out_block_w,
-                    config.transpose_mcast);
-            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCast1DProgramConfig>) {
-                log_debug(
-                    tt::LogOp,
-                    "Matmul Config: MultiCoreReuseMultiCast1D - Grid: {}, per_core_M: {}, per_core_N: {}, in0_block_w: "
-                    "{}, out_subblock_h: {}, out_subblock_w: {}, out_block_h: {}, out_block_w: {}, mcast_in0: {}, "
-                    "gather_in0: {}, hop_cores: {}",
-                    config.compute_with_storage_grid_size,
-                    config.per_core_M,
-                    config.per_core_N,
-                    config.in0_block_w,
-                    config.out_subblock_h,
-                    config.out_subblock_w,
-                    config.out_block_h,
-                    config.out_block_w,
-                    config.mcast_in0,
-                    config.gather_in0,
-                    config.hop_cores);
-            } else if constexpr (std::is_same_v<T, MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>) {
-                log_debug(
-                    tt::LogOp,
-                    "Matmul Config: MultiCoreReuseMultiCastDRAMSharded - per_core_M: {}, per_core_N: {}, in0_block_w: "
-                    "{}",
-                    config.per_core_M,
-                    config.per_core_N,
-                    config.in0_block_w);
-            }
-        },
-        chosen_program_config);
 
     if (std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(chosen_program_config) &&
         this->global_cb.has_value() && input_tensor_b.is_sharded() && input_tensor_b.buffer()->is_dram()) {
