@@ -289,6 +289,29 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
         "TRISC_2": "PACKER",
     }
 
+    ROLE_SPECIFIC_IGNORED = {
+        "TRISC_0": {
+            "PACK-OUTPUT",
+            "PACK-WAIT",
+            "CB-POP-FRONT",
+            "PACK-UNTILIZE",
+            "RECONFIG-TAIL",
+            "PACK-PARTIAL",
+            "PACK-WAIT-PARTIAL",
+        },
+        "TRISC_1": {
+            "PACK-OUTPUT",
+            "PACK-WAIT",
+            "CB-WAIT-FRONT",
+            "CB-POP-FRONT",
+            "PACK-UNTILIZE",
+            "RECONFIG-TAIL",
+            "PACK-PARTIAL",
+            "PACK-WAIT-PARTIAL",
+        },
+        "TRISC_2": {"CB-WAIT-FRONT", "MATMUL-TILES"},
+    }
+
     # Filter out basic overlapping zones AFTER compression
     # This ensures that gaps created by large FW/Kernel blocks are preserved as real time
     IGNORED_ZONES = {"BRISC-FW", "BRISC-KERNEL", "NCRISC-FW", "NCRISC-KERNEL", "TRISC-FW", "TRISC-KERNEL"}
@@ -316,6 +339,8 @@ def plot_timeline(events, core_id, freq_mhz, output_path):
             if z["name"] in IGNORED_ZONES:
                 # Log usage
                 # print(f"[Info] Ignored zone: {z['name']} (Iter: {z['iter_id']})")
+                pass
+            elif z["name"] in ROLE_SPECIFIC_IGNORED.get(r, set()):
                 pass
             else:
                 filtered_zones_for_plot.append(z)

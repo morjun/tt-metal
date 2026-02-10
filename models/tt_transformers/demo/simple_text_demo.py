@@ -206,6 +206,7 @@ def prepare_generator_args(
     page_params,
     paged_attention,
     num_layers,
+    use_l1_weight_sharding=False,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -235,6 +236,7 @@ def prepare_generator_args(
             dtype=ttnn.bfloat8_b,
             state_dict=state_dict,
             num_layers=num_layers,
+            use_l1_weight_sharding=use_l1_weight_sharding,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -781,6 +783,7 @@ def test_demo_text(
     enable_trace = request.config.getoption("--enable_trace") or enable_trace
     num_layers = request.config.getoption("--num_layers") or num_layers
     mode = request.config.getoption("--mode") or mode
+    use_l1_weight_sharding = request.config.getoption("--use_l1_weight_sharding")
 
     if stress_test and token_accuracy:
         pytest.skip("Stress test cannot be run with token accuracy mode")
@@ -874,6 +877,7 @@ def test_demo_text(
         page_params=page_params,
         paged_attention=paged_attention,
         num_layers=num_layers,
+        use_l1_weight_sharding=use_l1_weight_sharding,
     )
 
     # Skip ci-eval tests on P100 devices

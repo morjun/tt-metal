@@ -73,3 +73,9 @@ def pytest_addoption(parser):
         type=str,
         help="Mode to use for full model demo tests (values can be 'prefill','decode','full')",
     )
+    parser.addoption(
+        "--use_l1_weight_sharding",
+        action="store_true",
+        default=False,
+        help="Whether to enable L1 weight sharding",
+    )

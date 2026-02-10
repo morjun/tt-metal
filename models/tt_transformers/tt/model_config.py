@@ -463,7 +463,9 @@ class ModelArgs:
         optimizations=None,
         cache_hf=False,  # Set to False to reduce memory usage by not caching HF model
         subdevice=None,
+        use_l1_weight_sharding=False,
     ):
+        self.use_l1_weight_sharding = use_l1_weight_sharding
         if subdevice:
             self.num_devices = 1
         else:
@@ -838,9 +840,9 @@ class ModelArgs:
                 k=self.dim // self.cluster_shape[0],
                 n=n_w1_w3,
                 grid_size=mlp1_3_grid(seq_len),
-                per_core_N=math.ceil(n_w1_w3 / (self.tile_size * dram_shard_grid_width))
-                if mlp_w_dram_sharded
-                else None,
+                per_core_N=(
+                    math.ceil(n_w1_w3 / (self.tile_size * dram_shard_grid_width)) if mlp_w_dram_sharded else None
+                ),
             )
             n_w2 = self.dim
             self.model_config["PREFILL_MLP_W2_PRG_CONFIG"] = lambda seq_len: self.matmul_config(
@@ -1849,6 +1851,9 @@ class ModelArgs:
         There is no support to pass them as a tensor, and then inside the trace read it as a number.
         # TODO: Support sliding window attention - This PR disabled tracing if a model uses sliding window attention, because this PR mainly covers models without sliding window attention. (for example,Llama-8B).
         """
+        return False
+
+        # Original logic below (commented out or removed)
         # Trace in prefill is currently supported only for Llama-3.1-8B, Llama-3.1-70B, Llama-3.3-70B
         # TODO: (https://github.com/tenstorrent/tt-metal/issues/25722) Support all other models that use tt_transformers
         if self.base_model_name not in ["Llama-3.1-8B", "Llama-3.1-70B", "Llama-3.3-70B"]:
@@ -1951,7 +1956,7 @@ class ModelArgs:
                     self.CKPT_DIR,
                     torch_dtype="auto",
                     trust_remote_code=self.trust_remote_code_hf,
-                    local_files_only=os.getenv("CI") == "true"
+                    local_files_only=os.getenv("CI") == "true",
                     # Note that the default setting is torch.dtype.float32, but model weights are
                     # may come in any dtype. If the model's weights are in torch.dtype.bfloat16, this would result in 2x memory usage from an
                     # unnecessary cast.
@@ -2068,6 +2073,36 @@ class ModelArgs:
             self.dram_weight_grid, (k, padded_size // dram_cores), ttnn.ShardOrientation.ROW_MAJOR
         )
         return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)
+
+    def get_l1_sharded_rows(self, device, row_size_bytes, target_size_per_core=1024 * 1024):
+        """
+        Calculate how many rows of weights can fit into L1 memory, targeting ~1MB per core.
+
+        Args:
+            device: ttnn.Device
+            row_size_bytes: Size in bytes of a single row of the weight matrix
+            target_size_per_core: Target L1 usage per core in bytes (default 1MB)
+
+        Returns:
+            int: Number of rows that fit in L1, aligned to tile size (32).
+        """
+        # Get compute grid size
+        grid = device.compute_with_storage_grid_size()
+        num_cores = grid.x * grid.y
+
+        # Target ~1MB per core
+        # target_size_per_core = 1024 * 1024  # 1MB
+        total_l1_capacity = target_size_per_core * num_cores
+
+        # Calculate max rows
+        max_rows = total_l1_capacity // row_size_bytes
+
+        # Align to num_cores * 32 to ensure valid sharding
+        alignment = num_cores * 32
+        max_rows = (max_rows // alignment) * alignment
+
+        # Clamp to ensure at least one tile
+        return max(32, max_rows)
 
     def matmul_config(
         self,
