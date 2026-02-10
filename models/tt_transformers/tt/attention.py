@@ -35,13 +35,13 @@ class Attention(LightweightModule):
         # Restrict to first layer only to avoid OOM (L1 budget is global)
         if configuration.use_l1_weight_sharding and layer_num == 0:
             wqkv_l1_rows = configuration.get_l1_sharded_rows(
-                self.mesh_device, configuration.dim * 2, target_size_per_core=384 * 1024
+                self.mesh_device, configuration.dim * 2, target_size_per_core=128 * 1024
             )
-            # WO Budget: 1MB (Needs ~900KB)
+            # WO Budget: Reduced to fit with CBs
             wo_l1_rows = configuration.get_l1_sharded_rows(
                 self.mesh_device,
                 (configuration.hidden_dim // configuration.num_devices) * 2,
-                target_size_per_core=1024 * 1024,
+                target_size_per_core=64 * 1024,
             )
         else:
             wqkv_l1_rows = 0

@@ -47,11 +47,16 @@ class MLP(LightweightModule):
         w2_mem_config = args.create_dram_sharded_mem_config(args.hidden_dim // args.num_devices, args.dim)
 
         # L1 Partitioning Logic
-        # Restrict to first layer only to avoid OOM (L1 budget is global)
+        # Restrict to first layer only to avoid OOM (L1 budget is global).
+        # All L1-sharded weights for layer 0 (both attention and MLP) coexist on
+        # every core. Combined budget must leave room for matmul circular buffers
+        # (~600KB/core). Minimum viable: num_cores*32 rows, giving 256KB/core for
+        # dim=4096. W2 rows are too wide (hidden_dim) so L1 sharding is skipped
+        # for W2 (alignment rounds to 0).
         if args.use_l1_weight_sharding and layer_num == 0:
-            w1_w3_l1_rows = args.get_l1_sharded_rows(self.mesh_device, args.dim * 2, target_size_per_core=512 * 1024)
+            w1_w3_l1_rows = args.get_l1_sharded_rows(self.mesh_device, args.dim * 2, target_size_per_core=128 * 1024)
             w2_l1_rows = args.get_l1_sharded_rows(
-                self.mesh_device, args.hidden_dim * 2, target_size_per_core=512 * 1024
+                self.mesh_device, (args.hidden_dim // args.num_devices) * 2, target_size_per_core=64 * 1024
             )
         else:
             w1_w3_l1_rows = 0
@@ -95,12 +100,13 @@ class MLP(LightweightModule):
         if w1_w3_l1_rows > 0:
 
             def get_split_tensors(name, dim_arg, l1_rows):
-                # name e.g. "w1"
-                # w1 dims (-2, -1) -> [Out, In]
-                # torch_weight returns [Out, In]
-                # We want to slice along Out (Dim 0)
+                """Split weight [Out, In] into L1 HEIGHT-sharded and DRAM INTERLEAVED portions.
 
-                full_w = torch_weight(name)
+                torch_weight() returns [In, Out] (transposed PyTorch convention).
+                We transpose to [Out, In] so that dim-0 slicing splits the OUTPUT dimension,
+                matching the attention.py convention.
+                """
+                full_w = torch_weight(name).transpose(-1, -2)  # [In, Out] → [Out, In]
                 total_rows = full_w.shape[0]
 
                 grid = self.mesh_device.compute_with_storage_grid_size()
@@ -213,9 +219,12 @@ class MLP(LightweightModule):
             )
             w1_out = ttnn.concat([w1_l1_out, w1_dram_out], dim=-1)
         else:
+            # In prefill or when L1 sharding is disabled, use the original full weight.
+            # self.w1_dram is aliased to self.w1 when disabled, but is only a partial
+            # weight when L1 sharding is enabled — so always use self.w1 here.
             w1_out = ttnn.linear(
                 x,
-                self.w1_dram,  # Aliased to self.w1 if disabled
+                self.w1,
                 dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
                 compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -238,7 +247,7 @@ class MLP(LightweightModule):
         else:
             w3_out = ttnn.linear(
                 x,
-                self.w3_dram,  # Aliased
+                self.w3,  # Always use full weight for prefill / non-sharding decode
                 dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
                 compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -360,7 +369,7 @@ class MLP(LightweightModule):
         else:
             w2_out = ttnn.linear(
                 w2_in,
-                self.w2_dram,
+                self.w2,  # Always use full weight for prefill / non-sharding decode
                 compute_kernel_config=li_ff2_compute_kernel_cfg,
                 dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
                 program_config=pc_2,
