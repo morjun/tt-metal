@@ -31,17 +31,22 @@ class Attention(LightweightModule):
 
         self.mesh_device = mesh_device
         self.tt_ccl = tt_ccl
-        # WQKV Budget: 384KB to allow WO to fit 1MB
+        # L1 Partitioning: query hardware L1 budget, subtract CB reserve,
+        # split equally among 4 coexisting weights (WQKV, WO, W1_W3, W2).
         # Restrict to first layer only to avoid OOM (L1 budget is global)
         if configuration.use_l1_weight_sharding and layer_num == 0:
+            l1_unreserved = ttnn.get_max_worker_l1_unreserved_size()  # ~1.4MB on BH P150
+            cb_reserve = 200 * 1024  # 200KB for matmul CBs + activation tensors
+            num_coexisting_weights = 4  # WQKV, WO, W1_W3, W2
+            per_weight_budget = max(0, (l1_unreserved - cb_reserve) // num_coexisting_weights)
+
             wqkv_l1_rows = configuration.get_l1_sharded_rows(
-                self.mesh_device, configuration.dim * 2, target_size_per_core=128 * 1024
+                self.mesh_device, configuration.dim * 2, target_l1_per_core=per_weight_budget
             )
-            # WO Budget: Reduced to fit with CBs
             wo_l1_rows = configuration.get_l1_sharded_rows(
                 self.mesh_device,
                 (configuration.hidden_dim // configuration.num_devices) * 2,
-                target_size_per_core=64 * 1024,
+                target_l1_per_core=per_weight_budget,
             )
         else:
             wqkv_l1_rows = 0

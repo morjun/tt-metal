@@ -49,14 +49,20 @@ class MLP(LightweightModule):
         # L1 Partitioning Logic
         # Restrict to first layer only to avoid OOM (L1 budget is global).
         # All L1-sharded weights for layer 0 (both attention and MLP) coexist on
-        # every core. Combined budget must leave room for matmul circular buffers
-        # (~600KB/core). Minimum viable: num_cores*32 rows, giving 256KB/core for
-        # dim=4096. W2 rows are too wide (hidden_dim) so L1 sharding is skipped
-        # for W2 (alignment rounds to 0).
+        # every core.  We query the hardware unreserved L1 size, subtract a
+        # reserve for matmul circular buffers / activation tensors, and split the
+        # remainder equally among the 4 weight matrices (WQKV, WO, W1_W3, W2).
         if args.use_l1_weight_sharding and layer_num == 0:
-            w1_w3_l1_rows = args.get_l1_sharded_rows(self.mesh_device, args.dim * 2, target_size_per_core=128 * 1024)
+            l1_unreserved = ttnn.get_max_worker_l1_unreserved_size()  # ~1.4MB on BH P150
+            cb_reserve = 200 * 1024  # 200KB for matmul CBs + activation tensors
+            num_coexisting_weights = 4  # WQKV, WO, W1_W3, W2
+            per_weight_budget = max(0, (l1_unreserved - cb_reserve) // num_coexisting_weights)
+
+            w1_w3_l1_rows = args.get_l1_sharded_rows(
+                self.mesh_device, args.dim * 2, target_l1_per_core=per_weight_budget
+            )
             w2_l1_rows = args.get_l1_sharded_rows(
-                self.mesh_device, (args.hidden_dim // args.num_devices) * 2, target_size_per_core=64 * 1024
+                self.mesh_device, (args.hidden_dim // args.num_devices) * 2, target_l1_per_core=per_weight_budget
             )
         else:
             w1_w3_l1_rows = 0

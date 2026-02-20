@@ -2072,14 +2072,19 @@ class ModelArgs:
         )
         return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)
 
-    def get_l1_sharded_rows(self, device, row_size_bytes, target_size_per_core=1024 * 1024):
+    def get_l1_sharded_rows(self, device, row_size_bytes, target_l1_per_core):
         """
-        Calculate how many rows of weights can fit into L1 memory, targeting ~1MB per core.
+        Calculate how many rows of weights can fit into L1 memory.
+
+        IMPORTANT: target_l1_per_core is the budget for THIS weight only.
+        All L1-sharded weights for a layer coexist on every core, so the
+        caller must partition the total available L1 among all weights.
 
         Args:
             device: ttnn.Device
             row_size_bytes: Size in bytes of a single row of the weight matrix
-            target_size_per_core: Target L1 usage per core in bytes (default 1MB)
+            target_l1_per_core: L1 bytes budgeted for this weight on each core.
+                Must account for other weights sharing the same L1.
 
         Returns:
             int: Number of rows that fit in L1, aligned to tile size (32).
@@ -2088,9 +2093,7 @@ class ModelArgs:
         grid = device.compute_with_storage_grid_size()
         num_cores = grid.x * grid.y
 
-        # Target ~1MB per core
-        # target_size_per_core = 1024 * 1024  # 1MB
-        total_l1_capacity = target_size_per_core * num_cores
+        total_l1_capacity = target_l1_per_core * num_cores
 
         # Calculate max rows
         max_rows = total_l1_capacity // row_size_bytes
