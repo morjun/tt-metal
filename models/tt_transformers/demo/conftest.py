@@ -17,7 +17,11 @@ def pytest_addoption(parser):
     )
     parser.addoption("--data_parallel", action="store", type=int, help="Number of data parallel workers")
     parser.addoption(
-        "--paged_attention", action="store", type=bool, help="Whether to use paged attention or default attention"
+        "--paged_attention",
+        action="store",
+        type=int,
+        default=None,
+        help="Whether to use paged attention (1) or default attention (0)",
     )
     parser.addoption("--page_params", action="store", type=dict, help="Page parameters for paged attention")
     parser.addoption("--sampling_params", action="store", type=dict, help="Sampling parameters for decoding")
@@ -78,4 +82,11 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Whether to enable L1 weight sharding",
+    )
+    parser.addoption(
+        "--l1_kv_window_size",
+        action="store",
+        default=0,
+        type=int,
+        help="L1 KV cache window size (0 = disabled, e.g. 256 for ring-buffer cache)",
     )

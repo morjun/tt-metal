@@ -464,8 +464,10 @@ class ModelArgs:
         cache_hf=False,  # Set to False to reduce memory usage by not caching HF model
         subdevice=None,
         use_l1_weight_sharding=False,
+        l1_kv_window_size=0,  # 0 = disabled; set to e.g. 256 for L1 KV cache window
     ):
         self.use_l1_weight_sharding = use_l1_weight_sharding
+        self.l1_kv_window_size = l1_kv_window_size
         if subdevice:
             self.num_devices = 1
         else:

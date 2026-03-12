@@ -207,6 +207,7 @@ def prepare_generator_args(
     paged_attention,
     num_layers,
     use_l1_weight_sharding=False,
+    l1_kv_window_size=0,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -237,6 +238,7 @@ def prepare_generator_args(
             state_dict=state_dict,
             num_layers=num_layers,
             use_l1_weight_sharding=use_l1_weight_sharding,
+            l1_kv_window_size=l1_kv_window_size,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -286,7 +288,7 @@ def prepare_generator_args(
             1024,  # max_seq_len
             1,  # batch_size
             200,  # max_generated_tokens
-            True,  # paged_attention
+            False,  # paged_attention
             {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024},  # page_params
             {"temperature": 0, "top_p": 0.08, "top_k": 32},  # sampling_params (argmax)
             True,  # stop_at_eos
@@ -294,7 +296,7 @@ def prepare_generator_args(
             1,
             False,  # token_accuracy
             False,  # stress_test
-            True,  # enable_trace
+            False,  # enable_trace
             None,  # num_layers, if None -> defaults to all layers
             "full",  # performs both prefill and decode
         ),
@@ -453,7 +455,7 @@ def prepare_generator_args(
             4,  # data_parallel
             False,  # token_accuracy
             False,  # stress_test
-            True,  # enable_trace
+            False,  # enable_trace
             None,  # num_layers, if None -> defaults to all layers
             "full",  # performs both prefill and decode
         ),
@@ -772,7 +774,8 @@ def test_demo_text(
     batch_size = request.config.getoption("--batch_size") or batch_size
     max_generated_tokens = request.config.getoption("--max_generated_tokens") or max_generated_tokens
     data_parallel = request.config.getoption("--data_parallel") or data_parallel
-    paged_attention = request.config.getoption("--paged_attention") or paged_attention
+    if request.config.getoption("--paged_attention") is not None:
+        paged_attention = request.config.getoption("--paged_attention")
     page_params = request.config.getoption("--page_params") or page_params
     if isinstance(page_params, str):  # Required for proper load of a dictionary from the override command
         page_params = json.loads(page_params)
@@ -781,9 +784,11 @@ def test_demo_text(
     token_accuracy = request.config.getoption("--token_accuracy") or token_accuracy
     stress_test = request.config.getoption("--stress_test") or stress_test
     enable_trace = request.config.getoption("--enable_trace") or enable_trace
+    enable_trace = False  # FORECE DISABLE FOR DPRINT DEBUGGING
     num_layers = request.config.getoption("--num_layers") or num_layers
     mode = request.config.getoption("--mode") or mode
     use_l1_weight_sharding = request.config.getoption("--use_l1_weight_sharding")
+    l1_kv_window_size = request.config.getoption("--l1_kv_window_size")
 
     if stress_test and token_accuracy:
         pytest.skip("Stress test cannot be run with token accuracy mode")
@@ -878,6 +883,7 @@ def test_demo_text(
         paged_attention=paged_attention,
         num_layers=num_layers,
         use_l1_weight_sharding=use_l1_weight_sharding,
+        l1_kv_window_size=l1_kv_window_size,
     )
 
     # Skip ci-eval tests on P100 devices
@@ -958,6 +964,7 @@ def test_demo_text(
                 page_table=page_table,
                 kv_cache=tt_kv_cache,
                 prompt_lens=decoding_pos,
+                enable_trace=enable_trace,
             )
             profiler.end(f"compile_prefill", iteration=batch_idx)
             logger.info("Finished prefill warmup")
@@ -969,6 +976,7 @@ def test_demo_text(
                 page_table=page_table,
                 kv_cache=tt_kv_cache,
                 prompt_lens=decoding_pos,
+                enable_trace=enable_trace,
             )
             prefilled_token = torch.argmax(logits, dim=-1)
             profiler.end(f"inference_prefill", iteration=batch_idx)

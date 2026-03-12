@@ -683,6 +683,7 @@ def create_tt_model(
     num_layers=None,
     subdevice=None,
     use_l1_weight_sharding=False,
+    l1_kv_window_size=0,
 ):
     from models.tt_transformers.tt.model import Transformer
     from models.tt_transformers.tt.model_config import ModelArgs
@@ -695,6 +696,7 @@ def create_tt_model(
         max_seq_len=max_seq_len,
         subdevice=subdevice,
         use_l1_weight_sharding=use_l1_weight_sharding,
+        l1_kv_window_size=l1_kv_window_size,
     )
     if num_layers is not None:
         tt_model_args.n_layers = num_layers
