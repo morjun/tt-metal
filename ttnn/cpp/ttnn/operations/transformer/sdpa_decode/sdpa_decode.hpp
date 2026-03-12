@@ -25,7 +25,9 @@ struct ExecuteScaledDotProductAttentionDecode {
         std::optional<uint32_t> sliding_window_size = std::nullopt,
         const std::optional<MemoryConfig>& memory_config = std::nullopt,
         std::optional<SDPAProgramConfig> program_config = std::nullopt,
-        std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
+        std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+        const std::optional<const Tensor>& l1_k_tensor = std::nullopt,
+        const std::optional<const Tensor>& l1_v_tensor = std::nullopt);
 };
 
 struct ExecutePagedScaledDotProductAttentionDecode {

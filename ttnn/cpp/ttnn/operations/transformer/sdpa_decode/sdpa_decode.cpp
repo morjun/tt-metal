@@ -44,7 +44,9 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+    const std::optional<const Tensor>& l1_k_tensor,
+    const std::optional<const Tensor>& l1_v_tensor) {
     [[maybe_unused]] auto arch =
         input_tensor_q.storage_type() == StorageType::DEVICE
             ? input_tensor_q.device()->arch()
@@ -82,7 +84,7 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
                    .k_chunk_size = k_chunk_size,
                    .paged_attention = false},
                {input_tensor_q, input_tensor_k, input_tensor_v},
-               {cur_pos_tensor, std::nullopt, attn_mask, attention_sink},
+               {cur_pos_tensor, std::nullopt, attn_mask, attention_sink, l1_k_tensor, l1_v_tensor},
                {})
         .at(0);
 }

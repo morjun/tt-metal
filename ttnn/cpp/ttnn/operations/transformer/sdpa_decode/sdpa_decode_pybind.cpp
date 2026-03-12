@@ -67,7 +67,9 @@ void py_bind_sdpa_decode(py::module& module) {
                std::optional<uint32_t> sliding_window_size,
                const std::optional<MemoryConfig>& memory_config,
                std::optional<SDPAProgramConfig> program_config,
-               std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+               std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+               const std::optional<const Tensor>& l1_k_tensor,
+               const std::optional<const Tensor>& l1_v_tensor) {
                 return self(
                     input_tensor_q,
                     input_tensor_k,
@@ -81,7 +83,9 @@ void py_bind_sdpa_decode(py::module& module) {
                     sliding_window_size,
                     memory_config,
                     program_config,
-                    compute_kernel_config);
+                    compute_kernel_config,
+                    l1_k_tensor,
+                    l1_v_tensor);
             },
             py::arg("input_tensor_q").noconvert(),
             py::arg("input_tensor_k").noconvert(),
@@ -96,7 +100,9 @@ void py_bind_sdpa_decode(py::module& module) {
             py::arg("sliding_window_size").noconvert() = std::nullopt,
             py::arg("memory_config").noconvert() = std::nullopt,
             py::arg("program_config").noconvert() = std::nullopt,
-            py::arg("compute_kernel_config").noconvert() = std::nullopt});
+            py::arg("compute_kernel_config").noconvert() = std::nullopt,
+            py::arg("l1_k_tensor").noconvert() = std::nullopt,
+            py::arg("l1_v_tensor").noconvert() = std::nullopt});
 
     using PagedOperationType = decltype(ttnn::transformer::paged_scaled_dot_product_attention_decode);
     ttnn::bind_registered_operation(
