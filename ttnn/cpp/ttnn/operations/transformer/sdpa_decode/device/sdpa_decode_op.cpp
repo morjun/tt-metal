@@ -75,11 +75,12 @@ void ScaledDotProductAttentionDecode::validate(
     }
 
     for (std::size_t i = 1; i < input_tensors.size(); i++) {
+        auto buf_type = input_tensors.at(i).buffer()->buffer_type();
         TT_FATAL(
-            input_tensors.at(i).buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM,
-            "Input tensor {} buffer type must be DRAM but got {}",
+            buf_type == tt::tt_metal::BufferType::DRAM || buf_type == tt::tt_metal::BufferType::L1,
+            "Input tensor {} buffer type must be DRAM or L1 but got {}",
             i,
-            input_tensors.at(i).buffer()->buffer_type());
+            buf_type);
     }
     // Output memconfig must be height sharded or DRAM
     if (this->output_mem_config.is_sharded()) {
@@ -341,6 +342,8 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
     auto& page_table_tensor = optional_input_tensors.at(1);
     auto& attn_mask = optional_input_tensors.at(2);
     auto& attention_sink = optional_input_tensors.at(3);
+    auto l1_k_tensor = (optional_input_tensors.size() > 4) ? optional_input_tensors.at(4) : std::nullopt;
+    auto l1_v_tensor = (optional_input_tensors.size() > 5) ? optional_input_tensors.at(5) : std::nullopt;
 
     auto& output_tensor = output_tensors.at(0);
 
@@ -371,7 +374,9 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
         this->share_cache,
         this->use_mla.value_or(false),
         this->head_dim_v.value_or(0),
-        sliding_window_size);
+        sliding_window_size,
+        l1_k_tensor,
+        l1_v_tensor);
 }
 
 operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
@@ -379,6 +384,9 @@ operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
     const std::vector<std::optional<const Tensor>>& optional_input_tensors) const {
     bool has_cur_pos = optional_input_tensors.at(0).has_value();
     bool has_attn_mask = optional_input_tensors.at(2).has_value();
+    bool has_l1_kv = (optional_input_tensors.size() > 5)
+                         ? (optional_input_tensors.at(4).has_value() && optional_input_tensors.at(5).has_value())
+                         : false;
     return operation::hash_operation<ScaledDotProductAttentionDecode>(
         this->scale,
         this->output_mem_config,
@@ -392,6 +400,7 @@ operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
         this->sliding_window_size,
         has_attn_mask,
         has_cur_pos,
+        has_l1_kv,
         input_tensors,
         // Hash on page_table_tensor to properly size page table CB
         optional_input_tensors.at(1),
