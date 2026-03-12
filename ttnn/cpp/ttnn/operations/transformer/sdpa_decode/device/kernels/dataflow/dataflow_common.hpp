@@ -603,3 +603,147 @@ void read_kv_mask_chunks(
         k_start_tile_id += k_chunk_tiles;
     }
 }
+
+// Dual-source version: reads from L1 for chunks in the L1 window, DRAM otherwise.
+// l1_window_start_tile: the tile row in the full sequence where the L1 window begins.
+// l1_window_size_tiles: number of tile rows in the L1 window.
+// l1_k_reader/l1_v_reader: TensorAccessors pointing to the L1 KV cache tensors.
+template <
+    uint32_t DHt,
+    uint32_t vDHt,
+    uint32_t barrier_threshold,
+    uint32_t mask_tile_bytes,
+    uint32_t PNHt,
+    bool use_attention_mask,
+    uint32_t cb_k_in,
+    uint32_t cb_v_in,
+    uint32_t cb_mask_in,
+    bool reuse_k,
+    typename KReaderType,
+    typename VReaderType,
+    typename MaskReaderType,
+    typename L1KReaderType,
+    typename L1VReaderType>
+void read_kv_mask_chunks_dual_source(
+    uint32_t k_chunk_start,
+    uint32_t k_chunk_end,
+    uint32_t k_start_tile_id,
+    uint32_t mask_start_tile_id,
+    uint32_t Sk_chunk_t,
+    uint32_t k_chunk_tiles,
+    uint32_t v_chunk_tiles,
+    uint32_t mask_chunk_tiles,
+    const KReaderType& k_reader,
+    const VReaderType& v_reader,
+    const MaskReaderType& mask_reader,
+    uint32_t k_tile_bytes,
+    uint32_t v_tile_bytes,
+    uint32_t PSt,
+    // L1 dual-source params
+    const L1KReaderType& l1_k_reader,
+    const L1VReaderType& l1_v_reader,
+    uint32_t l1_window_start_tile,
+    uint32_t l1_window_size_tiles,
+    uint32_t l1_k_start_tile_id_for_head,
+    uint32_t l1_v_start_tile_id_for_head) {
+    uint32_t barrier_count = 0;
+    for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        // Determine the sequence tile row for this chunk
+        uint32_t chunk_seq_tile = k_chunk * Sk_chunk_t;
+#define DEBUG_PRINT 1
+#if defined(DEBUG_PRINT)
+        uint32_t k_l1_hits = 0;
+        uint32_t k_dram_hits = 0;
+        uint32_t v_l1_hits = 0;
+        uint32_t v_dram_hits = 0;
+#endif
+
+        // We must check L1 inclusion at tile granularity, because a chunk may straddle the L1 boundary.
+        cb_reserve_back(cb_k_in, k_chunk_tiles);
+        uint32_t k_write_ptr = get_write_ptr(cb_k_in);
+        uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
+        barrier_count = 0;
+
+        for (uint32_t col = 0; col < DHt; ++col) {
+            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+                uint32_t global_seq_tile = chunk_seq_tile + row;
+                bool in_l1 = (global_seq_tile >= l1_window_start_tile) &&
+                             (global_seq_tile < l1_window_start_tile + l1_window_size_tiles);
+
+                if (in_l1) {
+                    uint32_t l1_tile_row = global_seq_tile % l1_window_size_tiles;
+                    uint32_t l1_k_tile_id = l1_k_start_tile_id_for_head + l1_tile_row * DHt + col;
+                    noc_async_read_tile(l1_k_tile_id, l1_k_reader, k_write_ptr);
+#if defined(DEBUG_PRINT)
+                    k_l1_hits++;
+#endif
+                } else {
+                    uint32_t dram_k_tile_id = k_start_tile_id + col + row * DHt;
+                    noc_async_read_tile(dram_k_tile_id, k_reader, k_write_ptr);
+#if defined(DEBUG_PRINT)
+                    k_dram_hits++;
+#endif
+                }
+                k_write_ptr += k_tile_bytes;  // Linear sequential write matching DRAM layout
+
+                if (++barrier_count == barrier_threshold) {
+                    noc_async_read_barrier();
+                    barrier_count = 0;
+                }
+            }
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_k_in, k_chunk_tiles);
+
+        if constexpr (use_attention_mask) {
+            mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
+                PSt, Sk_chunk_t, mask_chunk_tiles, mask_start_tile_id, mask_reader);
+        }
+
+        // Read V chunk row by row
+        cb_reserve_back(cb_v_in, v_chunk_tiles);
+        uint32_t v_write_ptr = get_write_ptr(cb_v_in);
+        barrier_count = 0;
+
+        for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+            uint32_t global_seq_tile = chunk_seq_tile + row;
+            bool in_l1 = (global_seq_tile >= l1_window_start_tile) &&
+                         (global_seq_tile < l1_window_start_tile + l1_window_size_tiles);
+
+            uint32_t dram_v_tile_id = k_start_tile_id + row * DHt;
+            uint32_t l1_v_tile_id = 0;
+            if (in_l1) {
+                uint32_t l1_tile_row = global_seq_tile % l1_window_size_tiles;
+                l1_v_tile_id = l1_v_start_tile_id_for_head + l1_tile_row * vDHt;
+            }
+
+            for (uint32_t col = 0; col < vDHt; ++col) {
+                if (in_l1) {
+                    noc_async_read_tile(l1_v_tile_id + col, l1_v_reader, v_write_ptr);
+#if defined(DEBUG_PRINT)
+                    v_l1_hits++;
+#endif
+                } else {
+                    noc_async_read_tile(dram_v_tile_id + col, v_reader, v_write_ptr);
+#if defined(DEBUG_PRINT)
+                    v_dram_hits++;
+#endif
+                }
+                v_write_ptr += v_tile_bytes;
+                if (++barrier_count == barrier_threshold) {
+                    noc_async_read_barrier();
+                    barrier_count = 0;
+                }
+            }
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_v_in, v_chunk_tiles);
+
+#if defined(DEBUG_PRINT)
+        DPRINT << "CHUNK " << k_chunk << " | K(L1:" << k_l1_hits << " DRAM:" << k_dram_hits << ") | V(L1:" << v_l1_hits
+               << " DRAM:" << v_dram_hits << ")" << ENDL();
+#endif
+
+        k_start_tile_id += k_chunk_tiles;
+    }
+}

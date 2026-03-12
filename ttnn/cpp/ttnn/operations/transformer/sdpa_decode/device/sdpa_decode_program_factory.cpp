@@ -40,7 +40,10 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     std::optional<bool> share_cache,
     bool use_mla,
     uint32_t head_dim_v,
-    std::optional<uint32_t> sliding_window_size) {
+    std::optional<uint32_t> sliding_window_size,
+    std::optional<const Tensor> l1_k_tensor,
+    std::optional<const Tensor> l1_v_tensor) {
+    bool use_l1_kv_cache = l1_k_tensor.has_value() && l1_v_tensor.has_value();
     /*
     Q: 1 x B x PNH x DH
     K: B x NKV x S x DH
@@ -765,6 +768,17 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         reader_compile_time_args_common.push_back(0);
     }
 
+    // L1 KV cache: flag + accessor args
+    reader_compile_time_args_common.push_back(use_l1_kv_cache ? 1 : 0);
+    if (use_l1_kv_cache) {
+        tt_metal::TensorAccessorArgs(l1_k_tensor->buffer()).append_to(reader_compile_time_args_common);
+        tt_metal::TensorAccessorArgs(l1_v_tensor->buffer()).append_to(reader_compile_time_args_common);
+    } else {
+        log_debug(tt::LogOp, "Pushing zero placeholders for L1 KV args");
+        reader_compile_time_args_common.push_back(0);  // For l1_k_args
+        reader_compile_time_args_common.push_back(0);  // For l1_v_args
+    }
+
     std::vector<uint32_t> writer_compile_time_args_common = {
         B,
         PNHt,
@@ -912,6 +926,14 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t page_table_addr = is_paged_attention ? page_table_tensor.value().buffer()->address() : 0;
     uint32_t attn_mask_addr = use_attention_mask ? attn_mask.value().buffer()->address() : 0;
     uint32_t attention_sink_addr = use_attention_sink ? attention_sink.value().buffer()->address() : 0;
+    uint32_t l1_k_addr = use_l1_kv_cache ? l1_k_tensor->buffer()->address() : 0;
+    uint32_t l1_v_addr = use_l1_kv_cache ? l1_v_tensor->buffer()->address() : 0;
+    // L1 window: the L1 KV tensor covers the most recent tokens
+    uint32_t l1_window_size_tiles = 0;
+    if (use_l1_kv_cache) {
+        auto l1_k_shape = l1_k_tensor->padded_shape();
+        l1_window_size_tiles = l1_k_shape[2] / TILE_HEIGHT;  // S dimension of L1 KV cache in tiles
+    }
     uint32_t out_addr = out0_buffer->address();
 
     // Set rt args
@@ -941,6 +963,18 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         log_debug(tt::LogOp, "core_num_in_output: {}", core_num_in_output);
         log_debug(tt::LogOp, "cur_pos: {}", cur_pos);
 
+        // Compute L1 window start for this batch
+        // The L1 tensor stores the most recent tokens. The window start in the DRAM
+        // sequence is: max(0, cur_pos + 1 - l1_window_size_tiles * TILE_HEIGHT) / TILE_HEIGHT
+        // For simplicity in the PoC, the caller sets l1_window_start_tile based on how they built the L1 cache.
+        // Here we compute it dynamically from cur_pos if available.
+        uint32_t cur_l1_window_start_tile = 0;
+        if (use_l1_kv_cache && l1_window_size_tiles > 0) {
+            // The L1 cache covers the last l1_window_size_tiles tile rows of the sequence
+            uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
+            cur_l1_window_start_tile = (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+        }
+
         // reader runtime args
         std::vector<uint32_t> reader_rt_args = {
             q_addr,
@@ -957,7 +991,11 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             cur_batch,
             core_num_in_reduce,
             core_num_in_output,
-            cur_pos};
+            cur_pos,
+            l1_k_addr,
+            l1_v_addr,
+            cur_l1_window_start_tile,
+            l1_window_size_tiles};
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
@@ -992,8 +1030,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         for (uint32_t i = 0; i < core_group_idle.size(); ++i) {
             CoreCoord core = core_group_idle[i];
             log_debug(tt::LogOp, "Setting core {} to idle", core);
-            // reader runtime args
-            std::vector<uint32_t> reader_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            // reader runtime args (15 original + 4 L1 KV args = 19)
+            std::vector<uint32_t> reader_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
             // writer runtime args
             std::vector<uint32_t> writer_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -1096,6 +1134,9 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 reader_args[arg_idx++] = core_num_in_reduce;
                 reader_args[arg_idx++] = core_num_in_output;
                 reader_args[arg_idx++] = cur_pos;
+                // L1 KV args are not updated in the override callback (addresses don't change)
+                // but we skip past them to avoid out-of-bounds if further args are read
+                arg_idx += 4;  // l1_k_addr, l1_v_addr, l1_window_start_tile, l1_window_size_tiles
 
                 // writer runtime args
                 arg_idx = 0;

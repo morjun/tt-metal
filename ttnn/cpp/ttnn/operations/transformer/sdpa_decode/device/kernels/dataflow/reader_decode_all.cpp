@@ -55,6 +55,12 @@ void kernel_main() {
     constexpr auto page_table_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
     constexpr auto attention_sink_args = TensorAccessorArgs<page_table_args.next_compile_time_args_offset()>();
 
+    // L1 KV cache dual-source args
+    constexpr uint32_t l1_kv_flag_offset = attention_sink_args.next_compile_time_args_offset();
+    constexpr bool use_l1_kv_cache = get_compile_time_arg_val(l1_kv_flag_offset) == 1;
+    constexpr auto l1_k_args = TensorAccessorArgs<l1_kv_flag_offset + 1>();
+    constexpr auto l1_v_args = TensorAccessorArgs<l1_k_args.next_compile_time_args_offset()>();
+
     uint32_t arg_idx = 0;
     const uint32_t q_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t k_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -71,6 +77,11 @@ void kernel_main() {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
+    // L1 KV cache runtime args (consumed even when use_l1_kv_cache is false, just zeroed)
+    const uint32_t l1_k_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_v_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_window_start_tile = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_window_size_tiles = get_arg_val<uint32_t>(arg_idx++);
 
     // idle core
     if (q_addr == 0) {
@@ -111,6 +122,14 @@ void kernel_main() {
 
     auto Sk_chunk_t_dynamic = get_dynamic_Sk_chunk_t<Sk_chunk_t, max_dynamic_chunk_size>(cur_pos);
     auto k_chunk_size_dynamic = Sk_chunk_t_dynamic * tt::constants::TILE_HEIGHT;
+
+    uint32_t cur_l1_window_start_tile = l1_window_start_tile;
+    if constexpr (use_l1_kv_cache) {
+        if (l1_window_size_tiles > 0) {
+            uint32_t seq_tiles = (cur_pos + 1 + tt::constants::TILE_HEIGHT - 1) / tt::constants::TILE_HEIGHT;
+            cur_l1_window_start_tile = (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+        }
+    }
 
     // Sequence length assignment
     auto [PSt, k_num_chunks, k_chunk_start, k_chunk_end, window_start_unaligned, window_start_chunk] = get_runtime_args(
@@ -369,31 +388,79 @@ void kernel_main() {
             const uint32_t k_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic * DHt;
             uint32_t k_start_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
 
-            read_kv_mask_chunks<
-                DHt,
-                vDHt,
-                barrier_threshold,
-                mask_tile_bytes,
-                PNHt,
-                use_attention_mask,
-                cb_k_in,
-                cb_v_in,
-                cb_mask_in,
-                reuse_k>(
-                k_chunk_start,
-                k_chunk_end,
-                k_start_tile_id,
-                mask_start_tile_id,
-                Sk_chunk_t_dynamic,
-                k_chunk_tiles,
-                v_chunk_tiles,
-                mask_chunk_tiles,
-                k_reader,
-                v_reader,
-                mask_reader,
-                k_tile_bytes,
-                v_tile_bytes,
-                PSt);
+            if constexpr (use_l1_kv_cache) {
+                // Construct L1 KV readers
+                const auto l1_k_reader = TensorAccessor(l1_k_args, l1_k_addr, k_tile_bytes);
+                const auto l1_v_reader = TensorAccessor(l1_v_args, l1_v_addr, v_tile_bytes);
+
+                const uint32_t l1_k_batch_offset =
+                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_window_size_tiles * DHt;
+                const uint32_t l1_k_head_offset = cur_head * l1_window_size_tiles * DHt;
+                const uint32_t l1_k_start_tile_id_for_head = l1_k_batch_offset + l1_k_head_offset;
+
+                const uint32_t l1_v_batch_offset =
+                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_window_size_tiles * vDHt;
+                const uint32_t l1_v_head_offset = cur_head * l1_window_size_tiles * vDHt;
+                const uint32_t l1_v_start_tile_id_for_head = l1_v_batch_offset + l1_v_head_offset;
+
+                read_kv_mask_chunks_dual_source<
+                    DHt,
+                    vDHt,
+                    barrier_threshold,
+                    mask_tile_bytes,
+                    PNHt,
+                    use_attention_mask,
+                    cb_k_in,
+                    cb_v_in,
+                    cb_mask_in,
+                    reuse_k>(
+                    k_chunk_start,
+                    k_chunk_end,
+                    k_start_tile_id,
+                    mask_start_tile_id,
+                    Sk_chunk_t_dynamic,
+                    k_chunk_tiles,
+                    v_chunk_tiles,
+                    mask_chunk_tiles,
+                    k_reader,
+                    v_reader,
+                    mask_reader,
+                    k_tile_bytes,
+                    v_tile_bytes,
+                    PSt,
+                    l1_k_reader,
+                    l1_v_reader,
+                    cur_l1_window_start_tile,
+                    l1_window_size_tiles,
+                    l1_k_start_tile_id_for_head,
+                    l1_v_start_tile_id_for_head);
+            } else {
+                read_kv_mask_chunks<
+                    DHt,
+                    vDHt,
+                    barrier_threshold,
+                    mask_tile_bytes,
+                    PNHt,
+                    use_attention_mask,
+                    cb_k_in,
+                    cb_v_in,
+                    cb_mask_in,
+                    reuse_k>(
+                    k_chunk_start,
+                    k_chunk_end,
+                    k_start_tile_id,
+                    mask_start_tile_id,
+                    Sk_chunk_t_dynamic,
+                    k_chunk_tiles,
+                    v_chunk_tiles,
+                    mask_chunk_tiles,
+                    k_reader,
+                    v_reader,
+                    mask_reader,
+                    k_tile_bytes,
+                    v_tile_bytes,
+                    PSt);
+            }
         }
     }
 }

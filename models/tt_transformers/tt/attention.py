@@ -107,6 +107,7 @@ class Attention(LightweightModule):
 
         self.max_seq_len = configuration.max_seq_len
         self.grid_size = configuration.max_grid_size
+        self.l1_kv_window_size = getattr(configuration, "l1_kv_window_size", 0)
 
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
         self.compute_kernel_config_hifi2_fp16 = configuration.compute_kernel_config_hifi2_fp16
@@ -470,6 +471,29 @@ class Attention(LightweightModule):
             for k_or_v in [cache_k, cache_v]
         ]
 
+        # Phase 3: Initialize L1 KV cache for dual-source SDPA reading
+        if self.l1_kv_window_size > 0 and not self.paged_attention_config:
+            l1_seq_len = self.l1_kv_window_size
+            l1_cache_k = torch.zeros(
+                (self.batch_size_per_device_group, self.n_local_kv_heads, l1_seq_len, self.head_dim)
+            )
+            l1_cache_v = torch.zeros(
+                (self.batch_size_per_device_group, self.n_local_kv_heads, l1_seq_len, self.head_dim)
+            )
+            self.l1_kv_cache = [
+                ttnn.as_tensor(
+                    k_or_v,
+                    dtype=self.kv_cache_dtype,
+                    layout=self.model_config["ATTN_W_LAYOUT_TILE"],
+                    device=self.mesh_device,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+                for k_or_v in [l1_cache_k, l1_cache_v]
+            ]
+        else:
+            self.l1_kv_cache = None
+
     def forward_decode(self, x: ttnn.Tensor, current_pos, rot_mats=None, page_table=None, kv_cache=None) -> ttnn.Tensor:
         """
         x: (seq_len, 1, batch, dim)
@@ -598,6 +622,29 @@ class Attention(LightweightModule):
             values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
         )
 
+        # Phase 3: L1 KV cache — Update ring buffer
+        # The L1 KV cache is populated for prefill in `forward_prefill` if the seq_len
+        # is small enough. For decode, we use token-level modulo to write to L1, and
+        # the SDPA kernel dynamically maps `global_seq_tile` to `l1_tile_row = seq_tile % l1_size`.
+        if self.l1_kv_cache is not None and not page_table:
+            # Wrap position for ring buffer: pos % window_size
+            # Device remainder/typecast on non-sharded tensors requires TILE layout.
+            l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
+            l1_pos = ttnn.typecast(l1_pos, ttnn.bfloat16)
+            l1_pos = ttnn.remainder(l1_pos, float(self.l1_kv_window_size))
+            l1_pos = ttnn.typecast(l1_pos, ttnn.int32)
+            l1_pos = ttnn.to_layout(l1_pos, ttnn.ROW_MAJOR_LAYOUT)
+
+            # Paged update cache already correctly reads `current_pos` modulo logic would be handled within
+            # Wait, `paged_update_cache` needs the literal token index for linear cache. So `current_pos` is correct!
+            print(f"DEBUG: k_heads_1BKD shape {k_heads_1BKD.shape} padded {k_heads_1BKD.padded_shape}")
+            print(f"DEBUG: l1_k_tensor shape {self.l1_kv_cache[0].shape} padded {self.l1_kv_cache[0].padded_shape}")
+            print(f"DEBUG: current_pos array {current_pos.shape}")
+
+            ttnn.experimental.paged_update_cache(self.l1_kv_cache[0], k_heads_1BKD, update_idxs_tensor=current_pos)
+            ttnn.experimental.paged_update_cache(self.l1_kv_cache[1], v_heads_1BKD, update_idxs_tensor=current_pos)
+            ttnn.deallocate(l1_pos)
+
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
 
@@ -605,30 +652,35 @@ class Attention(LightweightModule):
         # For example, a prompt w/ 1 user vs, the same prompt repeated N times for N users, will produce different outputs
         # This is because the SDPA op in decode mode has different number of reductions depending on batch size
         # Which leads to slightly different outputs from attention (due to accumulated errors)
+        sdpa_kwargs = {
+            "cur_pos_tensor": current_pos,
+            "scale": self.scale,
+            "sliding_window_size": self.sliding_window,
+            "program_config": self.model_config["SDPA_DECODE_PROGCFG"],
+            "compute_kernel_config": self.sdpa_decode_compute_kernel_cfg,
+            "memory_config": ttnn.DRAM_MEMORY_CONFIG,
+        }
+        if self.l1_kv_window_size > 0 and self.l1_kv_cache is not None:
+            # TEST: Disable L1 reads in SDPA but keep L1 writes
+            if True:
+                sdpa_kwargs["l1_k_tensor"] = self.l1_kv_cache[0]
+                sdpa_kwargs["l1_v_tensor"] = self.l1_kv_cache[1]
+            else:
+                print(f"DEBUG: L1 cache WRITE-ONLY test - NOT passing l1 tensors to sdpa", flush=True)
+        else:
+            print(
+                f"DEBUG: skipped l1_k_tensor! window_size={self.l1_kv_window_size}, cache={self.l1_kv_cache}",
+                flush=True,
+            )
+
         if page_table:
+            sdpa_kwargs["page_table_tensor"] = page_table
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
-                q_heads_1BQD,
-                keys,
-                values,
-                cur_pos_tensor=current_pos,
-                page_table_tensor=page_table,
-                scale=self.scale,
-                sliding_window_size=self.sliding_window,
-                program_config=self.model_config["SDPA_DECODE_PROGCFG"],
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                q_heads_1BQD, keys, values, **sdpa_kwargs
             )
         else:
             attn_output_1G4D = ttnn.transformer.scaled_dot_product_attention_decode(
-                q_heads_1BQD,
-                keys,
-                values,
-                cur_pos_tensor=current_pos,
-                scale=self.scale,
-                sliding_window_size=self.sliding_window,
-                program_config=self.model_config["SDPA_DECODE_PROGCFG"],
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
+                q_heads_1BQD, keys, values, **sdpa_kwargs
             )
 
         ttnn.deallocate(q_heads_1BQD)
@@ -932,6 +984,23 @@ class Attention(LightweightModule):
                 v_fill,
                 user_id % self.batch_size_per_device_group,
             )
+            # Populate L1 KV cache for the PoC (only if the whole sequence fits in L1 window)
+            if (
+                self.l1_kv_cache is not None
+                and seq_len <= self.l1_kv_window_size
+                and (chunk_start_idx is None or chunk_start_idx == 0)
+            ):
+                ttnn.fill_cache(
+                    self.l1_kv_cache[0],
+                    k_fill,
+                    user_id % self.batch_size_per_device_group,
+                )
+                ttnn.fill_cache(
+                    self.l1_kv_cache[1],
+                    v_fill,
+                    user_id % self.batch_size_per_device_group,
+                )
+
         if seq_len >= self.min_kv_prefill_shard_seqlen and not self.TG and not page_table:
             ttnn.deallocate(k_fill)
             ttnn.deallocate(v_fill)
