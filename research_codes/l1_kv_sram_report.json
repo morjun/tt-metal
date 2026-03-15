@@ -1,0 +1,26 @@
+{
+  "dram_only_persistent_l1_kv_bytes": 0,
+  "dram_only_persistent_l1_kv_mib": 0.0,
+  "effective_hot_bytes_estimate": 262144.0,
+  "effective_hot_mib_estimate": 0.25,
+  "inputs": {
+    "batch_size": 1,
+    "dprint_chunks_csv": "/home/masterjunmo/codes/tt-metal/research_codes/dprint_v2_2_512_chunks.csv",
+    "head_dim": 128,
+    "k_chunk_size": 512,
+    "kv_dtype": "bfloat8_b",
+    "l1_kv_sink_size": 0,
+    "l1_kv_window_size": 128,
+    "num_kv_heads": 8,
+    "num_q_heads": 32,
+    "output_json": "/home/masterjunmo/codes/tt-metal/research_codes/l1_kv_sram_report.json",
+    "output_md": "/home/masterjunmo/codes/tt-metal/research_codes/l1_kv_sram_report.md"
+  },
+  "observed_hit_ratio": 1.0,
+  "persistent_l1_kv_bytes": 262144.0,
+  "persistent_l1_kv_mib": 0.25,
+  "persistent_l1_kv_over_dram_only_bytes": 262144.0,
+  "persistent_l1_kv_over_dram_only_mib": 0.25,
+  "transient_sdpa_cb_bytes_estimate": 286720,
+  "transient_sdpa_cb_mib_estimate": 0.2734375
+}

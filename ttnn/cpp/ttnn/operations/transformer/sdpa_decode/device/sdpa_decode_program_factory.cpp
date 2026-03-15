@@ -4,6 +4,7 @@
 
 #include "sdpa_decode_program_factory.hpp"
 
+#include <cmath>
 #include <optional>
 #include <string>
 
@@ -41,6 +42,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     bool use_mla,
     uint32_t head_dim_v,
     std::optional<uint32_t> sliding_window_size,
+    uint32_t l1_sink_size,
+    float l1_min_expected_hit_ratio,
     std::optional<const Tensor> l1_k_tensor,
     std::optional<const Tensor> l1_v_tensor) {
     bool use_l1_kv_cache = l1_k_tensor.has_value() && l1_v_tensor.has_value();
@@ -928,12 +931,15 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t attention_sink_addr = use_attention_sink ? attention_sink.value().buffer()->address() : 0;
     uint32_t l1_k_addr = use_l1_kv_cache ? l1_k_tensor->buffer()->address() : 0;
     uint32_t l1_v_addr = use_l1_kv_cache ? l1_v_tensor->buffer()->address() : 0;
-    // L1 window: the L1 KV tensor covers the most recent tokens
-    uint32_t l1_window_size_tiles = 0;
+    uint32_t l1_sink_size_tiles = l1_sink_size == 0 ? 0 : tt::div_up(l1_sink_size, TILE_HEIGHT);
+    uint32_t l1_total_size_tiles = 0;
     if (use_l1_kv_cache) {
         auto l1_k_shape = l1_k_tensor->padded_shape();
-        l1_window_size_tiles = l1_k_shape[2] / TILE_HEIGHT;  // S dimension of L1 KV cache in tiles
+        l1_total_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
     }
+    uint32_t l1_recent_window_size_tiles =
+        l1_total_size_tiles > l1_sink_size_tiles ? (l1_total_size_tiles - l1_sink_size_tiles) : 0;
+    uint32_t l1_min_expected_hit_ratio_mille = static_cast<uint32_t>(std::round(l1_min_expected_hit_ratio * 1000.0f));
     uint32_t out_addr = out0_buffer->address();
 
     // Set rt args
@@ -968,11 +974,12 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         // sequence is: max(0, cur_pos + 1 - l1_window_size_tiles * TILE_HEIGHT) / TILE_HEIGHT
         // For simplicity in the PoC, the caller sets l1_window_start_tile based on how they built the L1 cache.
         // Here we compute it dynamically from cur_pos if available.
-        uint32_t cur_l1_window_start_tile = 0;
-        if (use_l1_kv_cache && l1_window_size_tiles > 0) {
-            // The L1 cache covers the last l1_window_size_tiles tile rows of the sequence
+        uint32_t cur_l1_recent_window_start_tile = l1_sink_size_tiles;
+        if (use_l1_kv_cache && l1_recent_window_size_tiles > 0) {
             uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
-            cur_l1_window_start_tile = (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+            uint32_t unclamped_recent_start =
+                (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
+            cur_l1_recent_window_start_tile = std::max(l1_sink_size_tiles, unclamped_recent_start);
         }
 
         // reader runtime args
@@ -994,8 +1001,10 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             cur_pos,
             l1_k_addr,
             l1_v_addr,
-            cur_l1_window_start_tile,
-            l1_window_size_tiles};
+            cur_l1_recent_window_start_tile,
+            l1_recent_window_size_tiles,
+            l1_sink_size_tiles,
+            l1_min_expected_hit_ratio_mille};
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
@@ -1030,8 +1039,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         for (uint32_t i = 0; i < core_group_idle.size(); ++i) {
             CoreCoord core = core_group_idle[i];
             log_debug(tt::LogOp, "Setting core {} to idle", core);
-            // reader runtime args (15 original + 4 L1 KV args = 19)
-            std::vector<uint32_t> reader_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            // reader runtime args (15 original + 6 L1 KV args = 21)
+            std::vector<uint32_t> reader_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
             // writer runtime args
             std::vector<uint32_t> writer_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -1062,7 +1071,9 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
          use_attention_sink,
          is_paged_attention,
          is_causal,
-         use_mla](
+         use_mla,
+         l1_sink_size,
+         l1_min_expected_hit_ratio](
             const void* operation,
             Program& program,
             const std::vector<Tensor>& input_tensors,
@@ -1095,11 +1106,16 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                                       optional_input_tensors.at(5).has_value();
             uint32_t l1_k_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(4).value().buffer()->address() : 0;
             uint32_t l1_v_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(5).value().buffer()->address() : 0;
-            uint32_t l1_window_size_tiles = 0;
+            uint32_t l1_total_size_tiles = 0;
             if (use_l1_kv_cache_rt) {
                 auto l1_k_shape = optional_input_tensors.at(4).value().padded_shape();
-                l1_window_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
+                l1_total_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
             }
+            uint32_t l1_sink_size_tiles = l1_sink_size == 0 ? 0 : tt::div_up(l1_sink_size, TILE_HEIGHT);
+            uint32_t l1_recent_window_size_tiles =
+                l1_total_size_tiles > l1_sink_size_tiles ? (l1_total_size_tiles - l1_sink_size_tiles) : 0;
+            uint32_t l1_min_expected_hit_ratio_mille =
+                static_cast<uint32_t>(std::round(l1_min_expected_hit_ratio * 1000.0f));
             auto page_table_buffer = is_paged_attention ? optional_input_tensors.at(1).value().buffer() : nullptr;
             uint32_t page_table_stick_size = is_paged_attention ? page_table_buffer->aligned_page_size() : 0;
 
@@ -1143,16 +1159,19 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 reader_args[arg_idx++] = core_num_in_reduce;
                 reader_args[arg_idx++] = core_num_in_output;
                 reader_args[arg_idx++] = cur_pos;
-                uint32_t cur_l1_window_start_tile = 0;
-                if (use_l1_kv_cache_rt && l1_window_size_tiles > 0) {
+                uint32_t cur_l1_recent_window_start_tile = l1_sink_size_tiles;
+                if (use_l1_kv_cache_rt && l1_recent_window_size_tiles > 0) {
                     uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
-                    cur_l1_window_start_tile =
-                        (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+                    uint32_t unclamped_recent_start =
+                        (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
+                    cur_l1_recent_window_start_tile = std::max(l1_sink_size_tiles, unclamped_recent_start);
                 }
                 reader_args[arg_idx++] = l1_k_addr;
                 reader_args[arg_idx++] = l1_v_addr;
-                reader_args[arg_idx++] = cur_l1_window_start_tile;
-                reader_args[arg_idx++] = l1_window_size_tiles;
+                reader_args[arg_idx++] = cur_l1_recent_window_start_tile;
+                reader_args[arg_idx++] = l1_recent_window_size_tiles;
+                reader_args[arg_idx++] = l1_sink_size_tiles;
+                reader_args[arg_idx++] = l1_min_expected_hit_ratio_mille;
 
                 // writer runtime args
                 arg_idx = 0;

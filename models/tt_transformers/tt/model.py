@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 
 import torch
 from tqdm import tqdm
@@ -10,6 +11,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.tt_sampling import TTSampling
+from models.tt_transformers.tt import l1_kv_perf
 from models.tt_transformers.tt.ccl import TT_CCL
 from models.tt_transformers.tt.common import copy_host_to_device
 from models.tt_transformers.tt.decoder import TransformerBlock
@@ -254,9 +256,12 @@ class Transformer(LightweightModule):
         Its implementation can take advantage of a few other functions which the
         model must implement.
         """
-        host_inputs = self.prepare_decode_inputs_host(*inputs)
-        device_inputs = copy_host_to_device(host_inputs, mesh_device=self.mesh_device)  # Helper function
-        return device_inputs
+        with l1_kv_perf.timed("decode.prepare_inputs_host"):
+            host_inputs = self.prepare_decode_inputs_host(*inputs)
+        l1_write_enabled = host_inputs[-1]
+        with l1_kv_perf.timed("decode.host_to_device"):
+            device_inputs = copy_host_to_device(host_inputs[:-1], mesh_device=self.mesh_device)  # Helper function
+        return (*device_inputs, l1_write_enabled)
 
     def prepare_decode_inputs_host(self, tokens, current_pos, page_table=None):
         """
@@ -295,6 +300,49 @@ class Transformer(LightweightModule):
             ),
         )
 
+        l1_update_pos_tt = None
+        l1_write_enabled = True
+        total_l1_tokens = self.args.l1_kv_sink_size + self.args.l1_kv_window_size
+        if total_l1_tokens > 0:
+            sink_size = self.args.l1_kv_sink_size
+            ring_size = self.args.l1_kv_window_size
+            l1_update_pos = current_pos.clone()
+            if sink_size > 0:
+                if ring_size > 0:
+                    recent_pos = sink_size + torch.remainder(torch.clamp(current_pos - sink_size, min=0), ring_size)
+                    l1_update_pos = torch.where(current_pos < sink_size, current_pos, recent_pos)
+                else:
+                    l1_update_pos = torch.clamp(current_pos, max=max(sink_size - 1, 0))
+            elif ring_size > 0:
+                l1_update_pos = torch.remainder(current_pos, ring_size)
+
+            l1_update_pos_tt = ttnn.from_torch(
+                l1_update_pos,
+                device=None,
+                dtype=ttnn.int32,
+                mesh_mapper=ttnn.ShardTensor2dMesh(
+                    self.mesh_device,
+                    dims=(None, 0) if (self.args.is_galaxy and B > 1) else (None, None),
+                    mesh_shape=self.args.cluster_shape,
+                ),
+            )
+
+            seq_tiles = torch.div(torch.clamp(current_pos, min=0) + 32, 32, rounding_mode="floor")
+            sink_tiles = math.ceil(sink_size / 32) if sink_size > 0 else 0
+            ring_tiles = math.ceil(ring_size / 32) if ring_size > 0 else 0
+            hot_tiles = torch.clamp(seq_tiles, max=sink_tiles)
+            if ring_tiles > 0:
+                hot_tiles = hot_tiles + torch.clamp(seq_tiles - sink_tiles, min=0, max=ring_tiles)
+            expected_hit_ratio = torch.where(
+                seq_tiles > 0, hot_tiles.float() / seq_tiles.float(), torch.zeros_like(seq_tiles, dtype=torch.float32)
+            )
+            expected_hit_ratio_mean = expected_hit_ratio.mean().item()
+            l1_kv_perf.add_sample("decode.expected_l1_hit_ratio", expected_hit_ratio_mean)
+            if self.args.l1_kv_min_expected_hit_ratio > 0.0:
+                l1_write_enabled = bool(torch.any(expected_hit_ratio >= self.args.l1_kv_min_expected_hit_ratio).item())
+                if not l1_write_enabled:
+                    l1_update_pos_tt = None
+
         if page_table is not None:
             page_table = ttnn.from_torch(
                 page_table,
@@ -306,7 +354,7 @@ class Transformer(LightweightModule):
                     mesh_shape=self.args.cluster_shape,
                 ),
             )
-        return tokens, current_pos_tt, rope_idxs, page_table
+        return tokens, current_pos_tt, rope_idxs, page_table, l1_update_pos_tt, l1_write_enabled
 
     def _transform_decode_inputs_device(self, tokens):
         """
@@ -372,6 +420,7 @@ class Transformer(LightweightModule):
         page_table=None,
         chunk_page_table=None,
         chunk_start_idx=None,
+        valid_seq_len=None,
         get_last_token=-1,
         kv_cache=None,
     ):
@@ -389,6 +438,7 @@ class Transformer(LightweightModule):
             page_table=page_table,
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
+            valid_seq_len=valid_seq_len,
             get_last_token=get_last_token,
             kv_cache=kv_cache,
         )
@@ -403,6 +453,8 @@ class Transformer(LightweightModule):
         current_pos,
         rot_mat_idxs=None,
         page_table=None,
+        l1_update_pos=None,
+        l1_write_enabled=True,
         kv_cache=None,
         sampling_on_device=False,
     ):
@@ -412,20 +464,25 @@ class Transformer(LightweightModule):
         """
         rot_mats_global = self.rope_setup.get_rot_mats(rot_mat_idxs)
         rot_mats_local = self.rope_local_setup.get_rot_mats(rot_mat_idxs) if hasattr(self, "rope_local_setup") else None
-        x_embed = self._transform_decode_inputs_device(x)
-        tt_logits = self.forward(
-            x_embed,
-            current_pos,
-            rot_mats_global=rot_mats_global,
-            rot_mats_local=rot_mats_local,
-            mode="decode",
-            page_table=page_table,
-            kv_cache=kv_cache,
-        )
+        with l1_kv_perf.timed("decode.transform_inputs_device"):
+            x_embed = self._transform_decode_inputs_device(x)
+        with l1_kv_perf.timed("decode.model_forward"):
+            tt_logits = self.forward(
+                x_embed,
+                current_pos,
+                rot_mats_global=rot_mats_global,
+                rot_mats_local=rot_mats_local,
+                mode="decode",
+                page_table=page_table,
+                l1_update_pos=l1_update_pos,
+                l1_write_enabled=l1_write_enabled,
+                kv_cache=kv_cache,
+            )
 
         if sampling_on_device and self.tt_sampling is not None:
             # Perform on-device sampling using TTSampling
-            tt_toks = self.tt_sampling(tt_logits, tt_out_tok=x)
+            with l1_kv_perf.timed("decode.device_sampling"):
+                tt_toks = self.tt_sampling(tt_logits, tt_out_tok=x)
             # Update device tensors for the next iteration
             self._increment_decode_positions_device(current_pos, rot_mat_idxs)
             return tt_toks
@@ -434,26 +491,29 @@ class Transformer(LightweightModule):
         if self.args.num_devices > 1:
             cluster_axis = 0 if self.args.is_galaxy else None
             num_links = 2 if self.args.is_galaxy else 1
-            tt_logits = ttnn.experimental.all_gather_async(
-                tt_logits,
-                persistent_output_buffer=None,
-                dim=3,
-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
-                num_links=num_links,
-                memory_config=tt_logits.memory_config(),
-                cluster_axis=cluster_axis,
-                topology=self.args.ccl_topology(),
-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
-                chunks_per_sync=10,
-                num_workers_per_link=2,
-                num_buffers_per_channel=2,
-            )
+            with l1_kv_perf.timed("decode.output_all_gather"):
+                tt_logits = ttnn.experimental.all_gather_async(
+                    tt_logits,
+                    persistent_output_buffer=None,
+                    dim=3,
+                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
+                    num_links=num_links,
+                    memory_config=tt_logits.memory_config(),
+                    cluster_axis=cluster_axis,
+                    topology=self.args.ccl_topology(),
+                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+                    chunks_per_sync=10,
+                    num_workers_per_link=2,
+                    num_buffers_per_channel=2,
+                )
 
-        tt_logits = ttnn.untilize(tt_logits, use_multicore=True)
+        with l1_kv_perf.timed("decode.output_untilize"):
+            tt_logits = ttnn.untilize(tt_logits, use_multicore=True)
 
         if not self.args.is_galaxy:
             # Send output logits to DRAM so L1 is not reserved for ttnn tracing and can be used by subsequent operations
-            tt_logits = ttnn.to_memory_config(tt_logits, ttnn.DRAM_MEMORY_CONFIG)
+            with l1_kv_perf.timed("decode.output_to_dram"):
+                tt_logits = ttnn.to_memory_config(tt_logits, ttnn.DRAM_MEMORY_CONFIG)
 
         return tt_logits
 
@@ -466,8 +526,11 @@ class Transformer(LightweightModule):
         user_id=0,
         mode="decode",
         page_table=None,
+        l1_update_pos=None,
+        l1_write_enabled=True,
         chunk_page_table=None,
         chunk_start_idx=None,
+        valid_seq_len=None,
         get_last_token=-1,
         kv_cache=None,
     ):
@@ -489,8 +552,11 @@ class Transformer(LightweightModule):
                 user_id=user_id,
                 mode=mode,
                 page_table=page_table,
+                l1_update_pos=l1_update_pos,
+                l1_write_enabled=l1_write_enabled,
                 chunk_page_table=chunk_page_table,
                 chunk_start_idx=chunk_start_idx,
+                valid_seq_len=valid_seq_len,
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
             )
 

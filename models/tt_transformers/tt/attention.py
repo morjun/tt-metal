@@ -9,6 +9,7 @@ import torch
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
+from models.tt_transformers.tt import l1_kv_perf
 from models.tt_transformers.tt.ccl import tt_all_gather, tt_all_reduce
 from models.tt_transformers.tt.model_config import OpGroup, TensorGroup
 
@@ -108,6 +109,16 @@ class Attention(LightweightModule):
         self.max_seq_len = configuration.max_seq_len
         self.grid_size = configuration.max_grid_size
         self.l1_kv_window_size = getattr(configuration, "l1_kv_window_size", 0)
+        self.l1_kv_sink_size = getattr(configuration, "l1_kv_sink_size", 0)
+        self.l1_kv_use_sharded = getattr(configuration, "l1_kv_use_sharded", False)
+        self.l1_kv_min_expected_hit_ratio = getattr(configuration, "l1_kv_min_expected_hit_ratio", 0.0)
+        if self.l1_kv_sink_size > 0:
+            assert self.l1_kv_window_size > 0, "Pinned L1 sink tokens require a non-zero recent ring window"
+        self.l1_kv_total_size = self.l1_kv_sink_size + self.l1_kv_window_size
+        self.l1_kv_sink_size_tiles = math.ceil(self.l1_kv_sink_size / self.tile_size) if self.l1_kv_sink_size > 0 else 0
+        self.l1_kv_window_size_tiles = (
+            math.ceil(self.l1_kv_window_size / self.tile_size) if self.l1_kv_window_size > 0 else 0
+        )
 
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
         self.compute_kernel_config_hifi2_fp16 = configuration.compute_kernel_config_hifi2_fp16
@@ -471,12 +482,12 @@ class Attention(LightweightModule):
             for k_or_v in [cache_k, cache_v]
         ]
 
-        if self.l1_kv_window_size > 0 and not self.paged_attention_config:
+        if self.l1_kv_total_size > 0 and not self.paged_attention_config:
             l1_cache_k = torch.zeros(
                 (
                     self.batch_size_per_device_group,
                     self.n_local_kv_heads,
-                    self.l1_kv_window_size,
+                    self.l1_kv_total_size,
                     self.head_dim,
                 )
             )
@@ -484,7 +495,7 @@ class Attention(LightweightModule):
                 (
                     self.batch_size_per_device_group,
                     self.n_local_kv_heads,
-                    self.l1_kv_window_size,
+                    self.l1_kv_total_size,
                     self.head_dim,
                 )
             )
@@ -499,10 +510,130 @@ class Attention(LightweightModule):
                 )
                 for k_or_v in [l1_cache_k, l1_cache_v]
             ]
+            self.l1_kv_sharded_memcfg = (
+                self._create_l1_kv_sharded_memcfg(
+                    (self.batch_size_per_device_group, self.n_local_kv_heads, self.l1_kv_total_size, self.head_dim)
+                )
+                if self.l1_kv_use_sharded
+                else None
+            )
         else:
             self.l1_kv_cache = None
+            self.l1_kv_sharded_memcfg = None
 
-    def forward_decode(self, x: ttnn.Tensor, current_pos, rot_mats=None, page_table=None, kv_cache=None) -> ttnn.Tensor:
+    def _create_l1_kv_sharded_memcfg(self, shape):
+        if self.l1_kv_total_size <= 0:
+            return None
+        total_rows = max(1, shape[0] * shape[1] * math.ceil(shape[2] / self.tile_size))
+        max_cores = max(1, min(self.grid_size.x * self.grid_size.y, total_rows))
+        grid_x = min(self.grid_size.x, max_cores)
+        grid_y = max(1, min(self.grid_size.y, math.ceil(max_cores / grid_x)))
+        return ttnn.create_sharded_memory_config_(
+            shape,
+            ttnn.CoreGrid(x=grid_x, y=grid_y),
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.ShardOrientation.ROW_MAJOR,
+            tile_layout=True,
+        )
+
+    def _get_sdpa_l1_cache_tensors(self):
+        if self.l1_kv_cache is None:
+            return None, None, ()
+        if not self.l1_kv_use_sharded or self.l1_kv_sharded_memcfg is None:
+            return self.l1_kv_cache[0], self.l1_kv_cache[1], ()
+        with l1_kv_perf.timed("decode.l1_sharded_view"):
+            sharded_k = ttnn.to_memory_config(self.l1_kv_cache[0], self.l1_kv_sharded_memcfg)
+            sharded_v = ttnn.to_memory_config(self.l1_kv_cache[1], self.l1_kv_sharded_memcfg)
+        return sharded_k, sharded_v, (sharded_k, sharded_v)
+
+    def _build_l1_update_pos(self, current_pos):
+        if self.l1_kv_total_size <= 0:
+            return None
+        if self.l1_kv_window_size > 0:
+            return current_pos
+        return None
+
+    def _make_l1_index_tensor(self, positions: torch.Tensor):
+        return ttnn.from_torch(
+            positions,
+            device=self.mesh_device,
+            dtype=ttnn.int32,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
+
+    def _prefill_slice(self, tensor, start_idx, end_idx):
+        if start_idx == 0 and end_idx == tensor.shape[2]:
+            return tensor
+        starts = [0] * len(tensor.shape)
+        ends = list(tensor.shape)
+        starts[2] = start_idx
+        ends[2] = end_idx
+        return ttnn.slice(tensor, starts, ends)
+
+    def _prefill_write_l1_cache(self, k_fill_l1, v_fill_l1, seq_len, batch_idx):
+        if self.l1_kv_cache is None or self.l1_kv_total_size <= 0:
+            return
+
+        if k_fill_l1.is_sharded():
+            k_fill_interleaved = ttnn.sharded_to_interleaved(k_fill_l1, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            k_fill_interleaved = k_fill_l1
+        if v_fill_l1.is_sharded():
+            v_fill_interleaved = ttnn.sharded_to_interleaved(v_fill_l1, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            v_fill_interleaved = v_fill_l1
+
+        k_fill_cache = ttnn.typecast(k_fill_interleaved, dtype=self.kv_cache_dtype)
+        v_fill_cache = ttnn.typecast(v_fill_interleaved, dtype=self.kv_cache_dtype)
+
+        if seq_len <= self.l1_kv_total_size:
+            fill_k = self._prefill_slice(k_fill_cache, 0, seq_len)
+            fill_v = self._prefill_slice(v_fill_cache, 0, seq_len)
+            ttnn.fill_cache(self.l1_kv_cache[0], fill_k, batch_idx)
+            ttnn.fill_cache(self.l1_kv_cache[1], fill_v, batch_idx)
+            if fill_k is not k_fill_cache:
+                ttnn.deallocate(fill_k)
+            if fill_v is not v_fill_cache:
+                ttnn.deallocate(fill_v)
+            ttnn.deallocate(k_fill_cache)
+            ttnn.deallocate(v_fill_cache)
+            if k_fill_interleaved is not k_fill_l1:
+                ttnn.deallocate(k_fill_interleaved)
+            if v_fill_interleaved is not v_fill_l1:
+                ttnn.deallocate(v_fill_interleaved)
+            return
+
+        # For long prompts, the existing fill op cannot directly populate a wrapped ring layout.
+        # We still initialize the pinned sink rows so decode can immediately use them.
+        if self.l1_kv_sink_size > 0:
+            sink_k = self._prefill_slice(k_fill_cache, 0, self.l1_kv_sink_size)
+            sink_v = self._prefill_slice(v_fill_cache, 0, self.l1_kv_sink_size)
+            if sink_k.dtype != self.kv_cache_dtype:
+                sink_k_cache = ttnn.typecast(sink_k, dtype=self.kv_cache_dtype)
+                if sink_k is not k_fill_cache:
+                    ttnn.deallocate(sink_k)
+                sink_k = sink_k_cache
+            if sink_v.dtype != self.kv_cache_dtype:
+                sink_v_cache = ttnn.typecast(sink_v, dtype=self.kv_cache_dtype)
+                if sink_v is not v_fill_cache:
+                    ttnn.deallocate(sink_v)
+                sink_v = sink_v_cache
+            ttnn.fill_cache(self.l1_kv_cache[0], sink_k, batch_idx)
+            ttnn.fill_cache(self.l1_kv_cache[1], sink_v, batch_idx)
+            if sink_k is not k_fill_cache:
+                ttnn.deallocate(sink_k)
+            if sink_v is not v_fill_cache:
+                ttnn.deallocate(sink_v)
+        ttnn.deallocate(k_fill_cache)
+        ttnn.deallocate(v_fill_cache)
+        if k_fill_interleaved is not k_fill_l1:
+            ttnn.deallocate(k_fill_interleaved)
+        if v_fill_interleaved is not v_fill_l1:
+            ttnn.deallocate(v_fill_interleaved)
+
+    def forward_decode(
+        self, x, current_pos, rot_mats=None, page_table=None, l1_update_pos=None, l1_write_enabled=True, kv_cache=None
+    ):
         """
         x: (seq_len, 1, batch, dim)
         current_pos: (batch_size), current token position in the sequence for each user
@@ -623,37 +754,48 @@ class Attention(LightweightModule):
             keys = self.layer_past[0]
             values = self.layer_past[1]
 
-        if self.l1_kv_cache is not None and not page_table:
-            k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
-            v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
+        if self.l1_kv_cache is not None and not page_table and l1_write_enabled:
+            with l1_kv_perf.timed("decode.l1_clone_path"):
+                k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
+                v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
         else:
             k_heads_l1 = None
             v_heads_l1 = None
         # k_heads, [seqlen, n_kv_heads, bsz, head_dim]
         # v_heads [seqlen, n_kv_heads, bsz, head_dim]
         # keys, [max_batch_size, n_kv_heads // configuration.num_devices, max_seq_len, head_dim]
-        ttnn.experimental.paged_update_cache(keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table)
-        ttnn.experimental.paged_update_cache(
-            values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
-        )
+        with l1_kv_perf.timed("decode.dram_kv_write"):
+            ttnn.experimental.paged_update_cache(
+                keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+            )
 
-        if self.l1_kv_cache is not None and not page_table:
-            # Keep the hot KV window in SRAM using ring-buffer addressing.
-            orig_shape = current_pos.shape
-            l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
-            l1_pos = ttnn.typecast(l1_pos, ttnn.float32)
-            l1_pos = ttnn.remainder(l1_pos, float(self.l1_kv_window_size))
-            l1_pos = ttnn.typecast(l1_pos, ttnn.int32)
-            l1_pos = ttnn.to_layout(l1_pos, ttnn.ROW_MAJOR_LAYOUT)
-            padded_shape = l1_pos.shape
-            slice_starts = [0] * len(padded_shape)
-            slice_ends = list(padded_shape)
-            for i in range(len(orig_shape)):
-                slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
-            l1_pos = ttnn.slice(l1_pos, slice_starts, slice_ends)
-            ttnn.experimental.paged_update_cache(self.l1_kv_cache[0], k_heads_l1, update_idxs_tensor=l1_pos)
-            ttnn.experimental.paged_update_cache(self.l1_kv_cache[1], v_heads_l1, update_idxs_tensor=l1_pos)
-            ttnn.deallocate(l1_pos)
+        if self.l1_kv_cache is not None and not page_table and l1_write_enabled:
+            l1_pos = l1_update_pos
+            if l1_pos is None and self.l1_kv_window_size > 0:
+                with l1_kv_perf.timed("decode.l1_index_path"):
+                    orig_shape = current_pos.shape
+                    l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
+                    l1_pos = ttnn.typecast(l1_pos, ttnn.float32)
+                    l1_pos = ttnn.remainder(l1_pos, float(self.l1_kv_window_size))
+                    if self.l1_kv_sink_size > 0:
+                        l1_pos = ttnn.add(l1_pos, self.l1_kv_sink_size)
+                    l1_pos = ttnn.typecast(l1_pos, ttnn.int32)
+                    l1_pos = ttnn.to_layout(l1_pos, ttnn.ROW_MAJOR_LAYOUT)
+                    padded_shape = l1_pos.shape
+                    slice_starts = [0] * len(padded_shape)
+                    slice_ends = list(padded_shape)
+                    for i in range(len(orig_shape)):
+                        slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
+                    l1_pos = ttnn.slice(l1_pos, slice_starts, slice_ends)
+            if l1_pos is not None:
+                with l1_kv_perf.timed("decode.l1_kv_write"):
+                    ttnn.experimental.paged_update_cache(self.l1_kv_cache[0], k_heads_l1, update_idxs_tensor=l1_pos)
+                    ttnn.experimental.paged_update_cache(self.l1_kv_cache[1], v_heads_l1, update_idxs_tensor=l1_pos)
+                if l1_pos is not l1_update_pos:
+                    ttnn.deallocate(l1_pos)
 
         sdpa_kwargs = {
             "cur_pos_tensor": current_pos,
@@ -662,10 +804,14 @@ class Attention(LightweightModule):
             "program_config": self.model_config["SDPA_DECODE_PROGCFG"],
             "compute_kernel_config": self.sdpa_decode_compute_kernel_cfg,
             "memory_config": ttnn.DRAM_MEMORY_CONFIG,
+            "l1_sink_size": self.l1_kv_sink_size,
+            "l1_min_expected_hit_ratio": self.l1_kv_min_expected_hit_ratio,
         }
+        sharded_l1_tensors = ()
         if self.l1_kv_cache is not None:
-            sdpa_kwargs["l1_k_tensor"] = self.l1_kv_cache[0]
-            sdpa_kwargs["l1_v_tensor"] = self.l1_kv_cache[1]
+            sdpa_l1_k, sdpa_l1_v, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
+            sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k
+            sdpa_kwargs["l1_v_tensor"] = sdpa_l1_v
 
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
@@ -680,15 +826,19 @@ class Attention(LightweightModule):
         # Which leads to slightly different outputs from attention (due to accumulated errors)
         if page_table:
             sdpa_kwargs["page_table_tensor"] = page_table
-            attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
-                q_heads_1BQD, keys, values, **sdpa_kwargs
-            )
+            with l1_kv_perf.timed("decode.sdpa_call"):
+                attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                    q_heads_1BQD, keys, values, **sdpa_kwargs
+                )
         else:
-            attn_output_1G4D = ttnn.transformer.scaled_dot_product_attention_decode(
-                q_heads_1BQD, keys, values, **sdpa_kwargs
-            )
+            with l1_kv_perf.timed("decode.sdpa_call"):
+                attn_output_1G4D = ttnn.transformer.scaled_dot_product_attention_decode(
+                    q_heads_1BQD, keys, values, **sdpa_kwargs
+                )
 
         ttnn.deallocate(q_heads_1BQD)
+        for sharded_tensor in sharded_l1_tensors:
+            ttnn.deallocate(sharded_tensor)
 
         attn_output_11BH = ttnn.to_memory_config(
             attn_output_1G4D,
@@ -850,9 +1000,11 @@ class Attention(LightweightModule):
         page_table=None,
         chunk_page_table=None,
         chunk_start_idx=None,
+        valid_seq_len=None,
         kv_cache=None,
     ):
         seq_len = x_11SH.shape[-2]
+        valid_seq_len = seq_len if valid_seq_len is None else valid_seq_len
         assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
         ###
         # QKV matmuls
@@ -979,8 +1131,9 @@ class Attention(LightweightModule):
             ttnn.experimental.paged_fill_cache(keys_BKSD, k_fill_sliced, fill_page_table, batch_idx=user_id)
             ttnn.experimental.paged_fill_cache(values_BKSD, v_fill_sliced, fill_page_table, batch_idx=user_id)
         else:
-            k_fill_l1 = ttnn.mul(k_fill, 1.0)
-            v_fill_l1 = ttnn.mul(v_fill, 1.0)
+            with l1_kv_perf.timed("prefill.l1_clone_path"):
+                k_fill_l1 = ttnn.mul(k_fill, 1.0)
+                v_fill_l1 = ttnn.mul(v_fill, 1.0)
             ttnn.fill_cache(
                 keys_BKSD,
                 k_fill,
@@ -991,21 +1144,11 @@ class Attention(LightweightModule):
                 v_fill,
                 user_id % self.batch_size_per_device_group,
             )
-            if (
-                self.l1_kv_cache is not None
-                and seq_len <= self.l1_kv_window_size
-                and (chunk_start_idx is None or chunk_start_idx == 0)
-            ):
-                ttnn.fill_cache(
-                    self.l1_kv_cache[0],
-                    k_fill_l1,
-                    user_id % self.batch_size_per_device_group,
-                )
-                ttnn.fill_cache(
-                    self.l1_kv_cache[1],
-                    v_fill_l1,
-                    user_id % self.batch_size_per_device_group,
-                )
+            if self.l1_kv_cache is not None and (chunk_start_idx is None or chunk_start_idx == 0):
+                with l1_kv_perf.timed("prefill.l1_fill_cache"):
+                    self._prefill_write_l1_cache(
+                        k_fill_l1, v_fill_l1, valid_seq_len, user_id % self.batch_size_per_device_group
+                    )
             ttnn.deallocate(k_fill_l1)
             ttnn.deallocate(v_fill_l1)
         if seq_len >= self.min_kv_prefill_shard_seqlen and not self.TG and not page_table:
@@ -1113,8 +1256,11 @@ class Attention(LightweightModule):
         user_id=0,
         mode="decode",
         page_table=None,
+        l1_update_pos=None,
+        l1_write_enabled=True,
         chunk_page_table=None,
         chunk_start_idx=None,
+        valid_seq_len=None,
         kv_cache=None,
     ):
         if mode == "prefill":
@@ -1125,10 +1271,19 @@ class Attention(LightweightModule):
                 page_table=page_table,
                 chunk_page_table=chunk_page_table,
                 chunk_start_idx=chunk_start_idx,
+                valid_seq_len=valid_seq_len,
                 kv_cache=kv_cache,
             )
         else:
-            return self.forward_decode(x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache)
+            return self.forward_decode(
+                x,
+                current_pos,
+                rot_mats,
+                page_table=page_table,
+                l1_update_pos=l1_update_pos,
+                l1_write_enabled=l1_write_enabled,
+                kv_cache=kv_cache,
+            )
 
     def prefill_prepare_tensor_for_kv_cache(self, key_or_value_layer, user_id):
         tensor_copy = ttnn.clone(key_or_value_layer)

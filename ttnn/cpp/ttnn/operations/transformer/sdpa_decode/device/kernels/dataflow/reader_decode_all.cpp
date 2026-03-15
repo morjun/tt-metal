@@ -80,8 +80,10 @@ void kernel_main() {
     // L1 KV cache runtime args (consumed even when use_l1_kv_cache is false, just zeroed)
     const uint32_t l1_k_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t l1_v_addr = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_window_start_tile = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_window_size_tiles = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_recent_window_start_tile = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_recent_window_size_tiles = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_sink_size_tiles = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_min_expected_hit_ratio_mille = get_arg_val<uint32_t>(arg_idx++);
 
     // idle core
     if (q_addr == 0) {
@@ -122,12 +124,14 @@ void kernel_main() {
 
     auto Sk_chunk_t_dynamic = get_dynamic_Sk_chunk_t<Sk_chunk_t, max_dynamic_chunk_size>(cur_pos);
     auto k_chunk_size_dynamic = Sk_chunk_t_dynamic * tt::constants::TILE_HEIGHT;
-
-    uint32_t cur_l1_window_start_tile = l1_window_start_tile;
+    uint32_t cur_l1_recent_window_start_tile = l1_recent_window_start_tile;
     if constexpr (use_l1_kv_cache) {
-        if (l1_window_size_tiles > 0) {
+        if (l1_recent_window_size_tiles > 0) {
             uint32_t seq_tiles = (cur_pos + 1 + tt::constants::TILE_HEIGHT - 1) / tt::constants::TILE_HEIGHT;
-            cur_l1_window_start_tile = (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+            uint32_t unclamped_recent_start =
+                (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
+            cur_l1_recent_window_start_tile =
+                unclamped_recent_start < l1_sink_size_tiles ? l1_sink_size_tiles : unclamped_recent_start;
         }
     }
 
@@ -392,15 +396,16 @@ void kernel_main() {
                 // Construct L1 KV readers
                 const auto l1_k_reader = TensorAccessor(l1_k_args, l1_k_addr, k_tile_bytes);
                 const auto l1_v_reader = TensorAccessor(l1_v_args, l1_v_addr, v_tile_bytes);
+                const uint32_t l1_total_size_tiles = l1_sink_size_tiles + l1_recent_window_size_tiles;
 
                 const uint32_t l1_k_batch_offset =
-                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_window_size_tiles * DHt;
-                const uint32_t l1_k_head_offset = cur_head * l1_window_size_tiles * DHt;
+                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_total_size_tiles * DHt;
+                const uint32_t l1_k_head_offset = cur_head * l1_total_size_tiles * DHt;
                 const uint32_t l1_k_start_tile_id_for_head = l1_k_batch_offset + l1_k_head_offset;
 
                 const uint32_t l1_v_batch_offset =
-                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_window_size_tiles * vDHt;
-                const uint32_t l1_v_head_offset = cur_head * l1_window_size_tiles * vDHt;
+                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_total_size_tiles * vDHt;
+                const uint32_t l1_v_head_offset = cur_head * l1_total_size_tiles * vDHt;
                 const uint32_t l1_v_start_tile_id_for_head = l1_v_batch_offset + l1_v_head_offset;
 
                 read_kv_mask_chunks_dual_source<
@@ -430,8 +435,10 @@ void kernel_main() {
                     PSt,
                     l1_k_reader,
                     l1_v_reader,
-                    cur_l1_window_start_tile,
-                    l1_window_size_tiles,
+                    cur_l1_recent_window_start_tile,
+                    l1_recent_window_size_tiles,
+                    l1_sink_size_tiles,
+                    l1_min_expected_hit_ratio_mille,
                     l1_k_start_tile_id_for_head,
                     l1_v_start_tile_id_for_head);
             } else {

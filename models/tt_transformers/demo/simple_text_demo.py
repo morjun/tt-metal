@@ -195,6 +195,65 @@ def create_tt_page_table(global_batch_size, data_parallel, paged_attention_confi
     return page_table
 
 
+def _summarize_l1_memory_view(device):
+    view = ttnn.get_memory_view(device, ttnn.BufferType.L1)
+    chip_total_bytes = int(view.num_banks * view.total_bytes_per_bank)
+    chip_allocated_bytes = int(view.num_banks * view.total_bytes_allocated_per_bank)
+    chip_free_bytes = int(view.num_banks * view.total_bytes_free_per_bank)
+    largest_interleavable_free_bytes_estimate = int(view.num_banks * view.largest_contiguous_bytes_free_per_bank)
+
+    per_bank_allocated_pct = (
+        100.0 * view.total_bytes_allocated_per_bank / view.total_bytes_per_bank if view.total_bytes_per_bank else 0.0
+    )
+    per_bank_free_pct = (
+        100.0 * view.total_bytes_free_per_bank / view.total_bytes_per_bank if view.total_bytes_per_bank else 0.0
+    )
+    per_bank_largest_free_pct = (
+        100.0 * view.largest_contiguous_bytes_free_per_bank / view.total_bytes_per_bank
+        if view.total_bytes_per_bank
+        else 0.0
+    )
+
+    return {
+        "num_banks": int(view.num_banks),
+        "total_bytes_per_bank": int(view.total_bytes_per_bank),
+        "total_bytes_allocated_per_bank": int(view.total_bytes_allocated_per_bank),
+        "total_bytes_free_per_bank": int(view.total_bytes_free_per_bank),
+        "largest_contiguous_bytes_free_per_bank": int(view.largest_contiguous_bytes_free_per_bank),
+        "largest_interleavable_free_bytes_estimate": largest_interleavable_free_bytes_estimate,
+        "chip_total_allocatable_bytes": chip_total_bytes,
+        "chip_total_allocated_bytes": chip_allocated_bytes,
+        "chip_total_free_bytes": chip_free_bytes,
+        "per_bank_allocated_pct": per_bank_allocated_pct,
+        "per_bank_free_pct": per_bank_free_pct,
+        "per_bank_largest_contiguous_free_pct": per_bank_largest_free_pct,
+    }
+
+
+def _write_l1_memory_snapshot(device, output_path, label):
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot = _summarize_l1_memory_view(device)
+    snapshot["label"] = label
+
+    existing = []
+    if output.exists():
+        try:
+            current = json.loads(output.read_text())
+        except json.JSONDecodeError:
+            current = []
+        if isinstance(current, list):
+            existing = current
+        elif isinstance(current, dict):
+            existing = [current]
+
+    existing = [item for item in existing if item.get("label") != label]
+    existing.append(snapshot)
+    output.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+    logger.info(f"Wrote L1 memory snapshot '{label}' to {output}")
+
+
 def prepare_generator_args(
     num_devices,
     data_parallel,
@@ -798,6 +857,7 @@ def test_demo_text(
     l1_kv_sink_size = request.config.getoption("--l1_kv_sink_size")
     l1_kv_use_sharded = request.config.getoption("--l1_kv_use_sharded")
     l1_kv_min_expected_hit_ratio = request.config.getoption("--l1_kv_min_expected_hit_ratio")
+    l1_memory_view_path = request.config.getoption("--l1_memory_view_path")
 
     if stress_test and token_accuracy:
         pytest.skip("Stress test cannot be run with token accuracy mode")
@@ -912,6 +972,10 @@ def test_demo_text(
             )
 
     generator = Generator(model, model_args, mesh_device, processor=processor, tokenizer=tokenizer)
+
+    if l1_memory_view_path:
+        ttnn.synchronize_device(mesh_device)
+        _write_l1_memory_snapshot(mesh_device, l1_memory_view_path, "after_model_load")
 
     if token_accuracy:
         input_prompts[0] = token_acc.prepare_ref_tokens(tokenizer)
@@ -1190,6 +1254,10 @@ def test_demo_text(
 
     # Finish profiling at the end of inference for all repeated batches
     profiler.end("run")
+
+    if l1_memory_view_path:
+        ttnn.synchronize_device(mesh_device)
+        _write_l1_memory_snapshot(mesh_device, l1_memory_view_path, "after_inference")
 
     # Prepare profile benchmark metrics for the first repeat batch only
     compile_prefill_time = profiler.get_duration("compile_prefill") if mode != "decode" else 0

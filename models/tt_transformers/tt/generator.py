@@ -20,6 +20,7 @@ from models.common.llama_models import (
     sample_top_p,
 )
 from models.common.tt_sampling import format_sampling_params
+from models.tt_transformers.tt import l1_kv_perf
 from models.tt_transformers.tt.common import (
     copy_host_to_device,
     get_block_size,
@@ -362,6 +363,7 @@ class Generator:
                     page_table=page_table_tt,
                     chunk_page_table=chunk_page_table_tt,
                     chunk_start_idx=chunk_start,
+                    valid_seq_len=chunk_tokens.shape[-1],
                     get_last_token=(last_token_idx_in_chunk // 32) * 32,
                     kv_cache=kv_cache,
                     **kwargs,
@@ -390,6 +392,7 @@ class Generator:
                 rot_mats_local=rot_mats_local_prefill,
                 user_id=user_id,
                 page_table=page_table_tt,
+                valid_seq_len=last_token_idx + 1,
                 get_last_token=(last_token_idx // 32) * 32,
                 kv_cache=kv_cache,
             )
@@ -474,6 +477,8 @@ class Generator:
         tt_current_pos = []
         tt_rot_mat_idxs = []
         tt_page_table = []
+        tt_l1_update_pos = []
+        tt_l1_write_enabled = []
         for i in range(self.data_parallel):
             user_page_table = page_table[i] if page_table is not None else None
             model_i = self.model[i]
@@ -482,11 +487,15 @@ class Generator:
                 tt_current_pos_i,
                 tt_rot_mat_idxs_i,
                 tt_page_table_i,
+                tt_l1_update_pos_i,
+                tt_l1_write_enabled_i,
             ) = model_i.prepare_inputs_decode(tokens[i], current_pos[i], user_page_table)
             tt_tokens.append(tt_tokens_i)
             tt_current_pos.append(tt_current_pos_i)
             tt_rot_mat_idxs.append(tt_rot_mat_idxs_i)
             tt_page_table.append(tt_page_table_i)
+            tt_l1_update_pos.append(tt_l1_update_pos_i)
+            tt_l1_write_enabled.append(tt_l1_write_enabled_i)
 
         for i in range(self.data_parallel):
             user_kv_cache = kv_cache[i] if kv_cache is not None else None
@@ -495,6 +504,8 @@ class Generator:
                 tt_current_pos[i],
                 rot_mat_idxs=tt_rot_mat_idxs[i],
                 page_table=tt_page_table[i],
+                l1_update_pos=tt_l1_update_pos[i],
+                l1_write_enabled=tt_l1_write_enabled[i],
                 kv_cache=user_kv_cache,
                 sampling_on_device=sampling_on_device,
             )
@@ -531,11 +542,13 @@ class Generator:
         for i in range(self.data_parallel):
             user_page_table = page_table[i] if page_table is not None else None
 
-            host_inputs = self.model[i].prepare_decode_inputs_host(
-                tokens[i], current_pos[i], page_table=user_page_table
-            )
+            with l1_kv_perf.timed("decode.prepare_inputs_host"):
+                host_inputs = self.model[i].prepare_decode_inputs_host(
+                    tokens[i], current_pos[i], page_table=user_page_table
+                )
 
-            device_inputs_i = copy_host_to_device(host_inputs, mesh_device=self.model_args[i].mesh_device)
+            with l1_kv_perf.timed("decode.host_to_device"):
+                device_inputs_i = copy_host_to_device(host_inputs[:-1], mesh_device=self.model_args[i].mesh_device)
             device_inputs.append(device_inputs_i)
 
         for i in range(self.data_parallel):
@@ -583,12 +596,14 @@ class Generator:
         if reset_inputs:
             for i in range(self.data_parallel):
                 user_page_table = page_table[i] if page_table is not None else None
-                host_inputs_i = self.model[i].prepare_decode_inputs_host(tokens[i], current_pos[i], user_page_table)
+                with l1_kv_perf.timed("decode.prepare_inputs_host"):
+                    host_inputs_i = self.model[i].prepare_decode_inputs_host(tokens[i], current_pos[i], user_page_table)
 
-                copy_host_to_device(
-                    host_tensors=host_inputs_i,
-                    device_tensors=self.trace_inputs_decode[sampling_on_device][i],
-                )
+                with l1_kv_perf.timed("decode.host_to_device"):
+                    copy_host_to_device(
+                        host_tensors=host_inputs_i[:-1],
+                        device_tensors=self.trace_inputs_decode[sampling_on_device][i],
+                    )
 
         for i, trace_id in self.trace_ids_decode[sampling_on_device].items():
             ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)
@@ -958,7 +973,8 @@ class Generator:
         Input tt_out is a list of ttnn device tensors
         """
         if not async_read:
-            return [out.cpu() for out in tt_out]
+            with l1_kv_perf.timed("decode.output_readback"):
+                return [out.cpu() for out in tt_out]
 
         host_outputs = []
         read_events = []
@@ -976,14 +992,15 @@ class Generator:
         """
         max_batch_size_per_model = self.model_args[0].max_batch_size
 
-        logits = []
-        for i in range(self.data_parallel):
-            logits_i = self.model[i].process_output_decode(
-                tt_out[i], max_batch_size_per_model, S=1, is_tokens=is_tokens
-            )
-            logits.append(logits_i)
+        with l1_kv_perf.timed("decode.output_postprocess"):
+            logits = []
+            for i in range(self.data_parallel):
+                logits_i = self.model[i].process_output_decode(
+                    tt_out[i], max_batch_size_per_model, S=1, is_tokens=is_tokens
+                )
+                logits.append(logits_i)
 
-        return torch.cat(logits, 0)
+            return torch.cat(logits, 0)
 
     def _decode_forward_no_trace(
         self,

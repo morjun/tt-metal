@@ -110,3 +110,10 @@ def pytest_addoption(parser):
         type=float,
         help="Disable dual-source L1 reads for decode steps whose expected hit ratio is below this threshold",
     )
+    parser.addoption(
+        "--l1_memory_view_path",
+        action="store",
+        default=None,
+        type=str,
+        help="Optional JSON output path for summarized L1 memory-view snapshots from simple_text_demo",
+    )

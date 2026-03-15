@@ -201,6 +201,7 @@ class TransformerBlock(LightweightModule):
         l1_write_enabled=True,
         chunk_page_table=None,
         chunk_start_idx=None,
+        valid_seq_len=None,
         kv_cache=None,
     ) -> ttnn.Tensor:
         TG = self.args.is_galaxy
@@ -230,6 +231,7 @@ class TransformerBlock(LightweightModule):
             l1_write_enabled=l1_write_enabled,
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
+            valid_seq_len=valid_seq_len,
             kv_cache=kv_cache,
         )
 

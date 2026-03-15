@@ -604,9 +604,7 @@ void read_kv_mask_chunks(
     }
 }
 
-// Dual-source version: reads from L1 for chunks in the L1 window, DRAM otherwise.
-// l1_window_start_tile: the tile row in the full sequence where the L1 window begins.
-// l1_window_size_tiles: number of tile rows in the L1 window.
+// Dual-source version: reads from L1 for pinned sink rows and/or the recent L1 ring window, DRAM otherwise.
 // l1_k_reader/l1_v_reader: TensorAccessors pointing to the L1 KV cache tensors.
 template <
     uint32_t DHt,
@@ -642,11 +640,22 @@ void read_kv_mask_chunks_dual_source(
     // L1 dual-source params
     const L1KReaderType& l1_k_reader,
     const L1VReaderType& l1_v_reader,
-    uint32_t l1_window_start_tile,
-    uint32_t l1_window_size_tiles,
+    uint32_t l1_recent_window_start_tile,
+    uint32_t l1_recent_window_size_tiles,
+    uint32_t l1_sink_size_tiles,
+    uint32_t l1_min_expected_hit_ratio_mille,
     uint32_t l1_k_start_tile_id_for_head,
     uint32_t l1_v_start_tile_id_for_head) {
     uint32_t barrier_count = 0;
+    uint32_t seq_tiles = k_chunk_end * Sk_chunk_t;
+    uint32_t hot_tiles = seq_tiles < l1_sink_size_tiles ? seq_tiles : l1_sink_size_tiles;
+    if (l1_recent_window_size_tiles > 0 && seq_tiles > l1_sink_size_tiles) {
+        uint32_t recent_candidates = seq_tiles - l1_sink_size_tiles;
+        hot_tiles += recent_candidates < l1_recent_window_size_tiles ? recent_candidates : l1_recent_window_size_tiles;
+    }
+    uint32_t expected_hit_ratio_mille = seq_tiles == 0 ? 0 : (hot_tiles * 1000) / seq_tiles;
+    bool enable_l1_reads = (l1_sink_size_tiles > 0 || l1_recent_window_size_tiles > 0) &&
+                           expected_hit_ratio_mille >= l1_min_expected_hit_ratio_mille;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
         // Determine the sequence tile row for this chunk
         uint32_t chunk_seq_tile = k_chunk * Sk_chunk_t;
@@ -667,11 +676,15 @@ void read_kv_mask_chunks_dual_source(
         for (uint32_t col = 0; col < DHt; ++col) {
             for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
                 uint32_t global_seq_tile = chunk_seq_tile + row;
-                bool in_l1 = (global_seq_tile >= l1_window_start_tile) &&
-                             (global_seq_tile < l1_window_start_tile + l1_window_size_tiles);
+                bool in_sink = enable_l1_reads && (global_seq_tile < l1_sink_size_tiles);
+                bool in_recent = enable_l1_reads && (l1_recent_window_size_tiles > 0) &&
+                                 (global_seq_tile >= l1_recent_window_start_tile) &&
+                                 (global_seq_tile < l1_recent_window_start_tile + l1_recent_window_size_tiles);
 
-                if (in_l1) {
-                    uint32_t l1_tile_row = global_seq_tile % l1_window_size_tiles;
+                if (in_sink || in_recent) {
+                    uint32_t l1_tile_row = in_sink ? global_seq_tile
+                                                   : (l1_sink_size_tiles + ((global_seq_tile - l1_sink_size_tiles) %
+                                                                            l1_recent_window_size_tiles));
                     uint32_t l1_k_tile_id = l1_k_start_tile_id_for_head + l1_tile_row * DHt + col;
                     noc_async_read_tile(l1_k_tile_id, l1_k_reader, k_write_ptr);
 #if defined(DEBUG_PRINT)
@@ -707,18 +720,23 @@ void read_kv_mask_chunks_dual_source(
 
         for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
             uint32_t global_seq_tile = chunk_seq_tile + row;
-            bool in_l1 = (global_seq_tile >= l1_window_start_tile) &&
-                         (global_seq_tile < l1_window_start_tile + l1_window_size_tiles);
+            bool in_sink = enable_l1_reads && (global_seq_tile < l1_sink_size_tiles);
+            bool in_recent = enable_l1_reads && (l1_recent_window_size_tiles > 0) &&
+                             (global_seq_tile >= l1_recent_window_start_tile) &&
+                             (global_seq_tile < l1_recent_window_start_tile + l1_recent_window_size_tiles);
 
             uint32_t dram_v_tile_id = k_start_tile_id + row * DHt;
             uint32_t l1_v_tile_id = 0;
-            if (in_l1) {
-                uint32_t l1_tile_row = global_seq_tile % l1_window_size_tiles;
+            if (in_sink || in_recent) {
+                uint32_t l1_tile_row =
+                    in_sink
+                        ? global_seq_tile
+                        : (l1_sink_size_tiles + ((global_seq_tile - l1_sink_size_tiles) % l1_recent_window_size_tiles));
                 l1_v_tile_id = l1_v_start_tile_id_for_head + l1_tile_row * vDHt;
             }
 
             for (uint32_t col = 0; col < vDHt; ++col) {
-                if (in_l1) {
+                if (in_sink || in_recent) {
                     noc_async_read_tile(l1_v_tile_id + col, l1_v_reader, v_write_ptr);
 #if defined(DEBUG_PRINT)
                     v_l1_hits++;
