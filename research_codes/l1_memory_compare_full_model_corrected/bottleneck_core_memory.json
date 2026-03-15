@@ -1,0 +1,10 @@
+{
+  "total_bytes_per_bank": 1470080,
+  "static_cb_bytes_per_core": 1249664,
+  "static_cb_source": "probe_clash",
+  "cb_breakdown": null,
+  "effective_headroom_bytes": 220416,
+  "static_cb_pct": 85.01,
+  "headroom_pct": 14.99,
+  "effective_headroom_pct": 14.99
+}

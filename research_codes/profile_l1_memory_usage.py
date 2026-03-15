@@ -217,7 +217,7 @@ def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window, 
             f"| Max `l1_kv_window_size` from largest interleavable free | {dual_window['max_window_size_from_largest_interleavable_free']} | {dram_window['max_window_size_from_largest_interleavable_free']} |",
             f"| Max `l1_kv_window_size` from safe interleavable free | {dual_window['max_window_size_from_safe_interleavable_free']} | {dram_window['max_window_size_from_safe_interleavable_free']} |",
             "",
-            "These bounds come from allocator-visible `get_memory_view()` state only.",
+            "These bounds come from allocator-visible state (from `dump_device_memory_state()` CSVs) only.",
             "They can significantly overestimate the real decode-time limit because static circular buffers are typically not allocator-managed.",
         ]
     )
@@ -228,43 +228,181 @@ def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window, 
                 "",
                 "## Allocator Caveat",
                 "",
-                "- `get_memory_view()` reports allocator-managed L1 state.",
+                "- L1 state is read from `dump_device_memory_state()` CSV reports (allocator-managed).",
                 "- Static circular buffers are typically not allocator-managed and are not fully reflected in these free-space numbers.",
                 f"- Snapshot note: `{dual_snapshot.get('allocator_note', '')}`",
             ]
         )
 
     if real_window_probe:
+        first_clash = real_window_probe.get("first_static_cb_clash")
+        total_per_bank = dual_snapshot.get("total_bytes_per_bank", 1470080)
+
         lines.extend(
             [
                 "",
-                "## Real Window Probe",
+                "## Combined Usage (Allocator vs Real Runtime)",
                 "",
-                f"- Max passing `l1_kv_window_size`: `{real_window_probe['max_passing_window']}`",
-                f"- Min failing `l1_kv_window_size`: `{real_window_probe['min_failing_window']}`",
+                "Single compact view of allocator-visible state vs inferred runtime bottleneck-bank usage.",
+                "",
+                "| View | Source | Occupied (bytes) | Occupied (%) | Free/Headroom (bytes) | Free/Headroom (%) |",
+                "| --- | --- | ---: | ---: | ---: | ---: |",
             ]
         )
-        first_clash = real_window_probe.get("first_static_cb_clash")
+        dual_occ = dual_snapshot.get("total_bytes_allocated_per_bank", 0)
+        dram_occ = dram_snapshot.get("total_bytes_allocated_per_bank", 0)
+        dual_free = dual_snapshot.get("total_bytes_free_per_bank", 0)
+        dram_free = dram_snapshot.get("total_bytes_free_per_bank", 0)
+        lines.append(
+            f"| Allocator (Dual-source) | `dump_device_memory_state()` | {dual_occ} | {format_pct(100.0 * dual_occ / total_per_bank)} | {dual_free} | {format_pct(100.0 * dual_free / total_per_bank)} |"
+        )
+        lines.append(
+            f"| Allocator (DRAM-only) | `dump_device_memory_state()` | {dram_occ} | {format_pct(100.0 * dram_occ / total_per_bank)} | {dram_free} | {format_pct(100.0 * dram_free / total_per_bank)} |"
+        )
+        if first_clash:
+            cb_occ = first_clash["static_cb_occupied_bytes_per_bank"]
+            headroom = first_clash["effective_headroom_bytes_per_bank"]
+            lines.append(
+                f"| **Real runtime (bottleneck cores)** | Pass/fail probe + clash parse | **{cb_occ}** | **{format_pct(first_clash['static_cb_occupied_pct_per_bank'])}** | **{headroom}** | **{format_pct(first_clash['effective_headroom_pct_per_bank'])}** |"
+            )
+        lines.extend(
+            [
+                "",
+                "**Explanation:** Allocator rows show what `dump_device_memory_state()` reports (allocator-managed blocks only). "
+                "The real runtime row is inferred from the first failing `l1_kv_window_size` probe: when the L1 KV buffer "
+                "clashes with static circular buffers, we parse the error to get the static CB end address. That address "
+                "is the actual SRAM already occupied on the constraining decode cores (8×1 bottleneck range). The headroom "
+                "is the remainder—the only space available for the L1 KV mirror.",
+                "",
+                "## Real Window Probe",
+                "",
+                "| Metric | Value |",
+                "| --- | ---: |",
+                f"| Max passing `l1_kv_window_size` | `{real_window_probe['max_passing_window']}` |",
+                f"| Min failing `l1_kv_window_size` | `{real_window_probe['min_failing_window']}` |",
+            ]
+        )
         if first_clash:
             lines.extend(
                 [
-                    f"- First observed failure reason: `{first_clash['failure_reason']}`",
-                    f"- Static CB end address on constraining cores: `{first_clash['static_circular_buffer_end_address_per_bank']}`",
-                    f"- Inferred runtime SRAM already occupied by static CBs on constraining cores: `{first_clash['static_cb_occupied_bytes_per_bank']}` bytes ({first_clash['static_cb_occupied_pct_per_bank']:.2f}%)",
-                    f"- Requested L1 buffer start address on constraining cores: `{first_clash['l1_buffer_allocated_address_per_bank']}`",
-                    f"- Real top-of-bank headroom on constraining cores: `{first_clash['effective_headroom_bytes_per_bank']}` bytes ({first_clash['effective_headroom_pct_per_bank']:.2f}%)",
-                    f"- Requested buffer bytes on constraining cores: `{first_clash['requested_l1_buffer_bytes_per_bank']}` bytes ({first_clash['requested_l1_buffer_pct_per_bank']:.2f}%)",
-                    f"- Observed overlap on constraining cores: `{first_clash['overlap_bytes_per_bank']}` bytes ({first_clash['overlap_pct_per_bank']:.2f}%)",
+                    f"| First failure reason | `{first_clash['failure_reason']}` |",
+                    f"| Static CB end address (bottleneck cores) | `{first_clash['static_circular_buffer_end_address_per_bank']}` bytes |",
+                    f"| Inferred SRAM occupied by static CBs | `{first_clash['static_cb_occupied_bytes_per_bank']}` bytes ({first_clash['static_cb_occupied_pct_per_bank']:.2f}%) |",
+                    f"| L1 buffer start address (requested) | `{first_clash['l1_buffer_allocated_address_per_bank']}` |",
+                    f"| Real headroom on bottleneck cores | `{first_clash['effective_headroom_bytes_per_bank']}` bytes ({first_clash['effective_headroom_pct_per_bank']:.2f}%) |",
+                    f"| Requested L1 buffer size | `{first_clash['requested_l1_buffer_bytes_per_bank']}` bytes ({first_clash['requested_l1_buffer_pct_per_bank']:.2f}%) |",
+                    f"| Overlap (clash region) | `{first_clash['overlap_bytes_per_bank']}` bytes ({first_clash['overlap_pct_per_bank']:.2f}%) |",
+                    "",
+                    "**Why the allocator view misleads:** The dump only tracks allocator-managed blocks. "
+                    "Static circular buffers (CBs) used by decode kernels are typically not allocator-managed, so they "
+                    "do not appear in the allocator's free-space numbers. DRAM-only mode shows ~99.7% free from the "
+                    "allocator's perspective, but the real bottleneck cores have ~85% of their L1 already occupied by "
+                    "static CBs, leaving only ~15% headroom for the L1 KV mirror.",
+                    "",
+                    f"**Interpretation:** At window size {first_clash['window']}, the L1 KV mirror requires "
+                    f"{first_clash['requested_l1_buffer_bytes_per_bank']:,} bytes per bank on the constraining cores. "
+                    f"The allocator places it starting at address {first_clash['l1_buffer_allocated_address_per_bank']:,} "
+                    f"(top-down). Static CBs already occupy 0–{first_clash['static_cb_occupied_bytes_per_bank']:,}, so the "
+                    f"requested buffer overlaps the static region by {first_clash['overlap_bytes_per_bank']:,} bytes, "
+                    f"causing the clash. The real upper bound is {real_window_probe['max_passing_window']} tokens—the "
+                    "largest window that passes the actual workload. The exact per-bank footprint depends on "
+                    "interleaving and which cores hold the L1 KV cache; the probe confirms the limit.",
                 ]
             )
+        lines.append("")
+
+        # Compile-time CB size section: from bottleneck_core_memory.json if present, else from probe
+        bottleneck_json = path.parent / "bottleneck_core_memory.json"
+        cb_bytes = first_clash["static_cb_occupied_bytes_per_bank"] if first_clash else None
+        cb_source = "probe_clash"
+        cb_breakdown = None
+        if bottleneck_json.exists():
+            try:
+                bn = json.loads(bottleneck_json.read_text())
+                if bn.get("static_cb_bytes_per_core") is not None:
+                    cb_bytes = bn["static_cb_bytes_per_core"]
+                    cb_source = bn.get("static_cb_source", "probe_clash")
+                cb_breakdown = bn.get("cb_breakdown")
+            except (json.JSONDecodeError, KeyError):
+                pass
+        if cb_bytes is not None:
+            total_per_bank = total_per_bank or dual_snapshot.get("total_bytes_per_bank", 1470080)
+            cb_pct = round(100.0 * cb_bytes / total_per_bank, 2)
+            lines.extend(
+                [
+                    "## Compile-time CB size (debug log)",
+                    "",
+                    "Static CB size per core from debug log (when available) or from probe clash.",
+                    "",
+                    "| Metric | Value | Source |",
+                    "| --- | ---: | --- |",
+                    f"| Total static CB size per core (bytes) | {cb_bytes:,} | {cb_source} |",
+                    f"| % of L1 per bank | {cb_pct}% | — |",
+                    "",
+                ]
+            )
+            if cb_breakdown:
+                lines.append("Per-CB sizes (bytes per core):")
+                for k in sorted(cb_breakdown.keys(), key=lambda x: (len(x), x)):
+                    lines.append(f"- {k}: {cb_breakdown[k]:,}")
+                lines.append("")
+            lines.extend(
+                [
+                    "To refresh from debug log: run demo with `TT_LOGGER_LEVEL=Debug`, save log, then:",
+                    "`python research_codes/parse_sdpa_cb_memory.py --log <log> --comparison <comparison.json> --output-json "
+                    + str(path.parent / "bottleneck_core_memory.json")
+                    + "`",
+                    "",
+                ]
+            )
+
+        # Example commands
+        out_dir = path.parent
+        comp_path = out_dir / "comparison.json"
+        bottleneck_path = out_dir / "bottleneck_core_memory.json"
+        lines.extend(
+            [
+                "## Example commands",
+                "",
+                "**Regenerate this summary from existing `comparison.json`** (no re-run of inference):",
+                "",
+                f"```bash\npython research_codes/profile_l1_memory_usage.py --from-json {comp_path}\n```",
+                "",
+                "To reflect **compile-time CB size from debug logs**: run the demo with `TT_LOGGER_LEVEL=Debug`, save log, then:",
+                f"`python research_codes/parse_sdpa_cb_memory.py --log <log> --comparison {comp_path} --output-json {bottleneck_path}`, then regenerate the summary again.",
+                "",
+                "**Full run** (creates comparison.json and summary from scratch; runs dual-source, DRAM-only, and real-window probe):",
+                "",
+                "```bash",
+                "python research_codes/profile_l1_memory_usage.py \\",
+                "  --dual-source-cmd 'pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size 128' \\",
+                "  --dram-only-cmd 'pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size 0' \\",
+                "  --working-directory . \\",
+                f"  --output-dir {out_dir} \\",
+                "  --snapshot-label after_inference \\",
+                "  --real-window-cmd-template 'pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size {window}' \\",
+                "  --real-window-values 512,544 \\",
+                "  --num-local-kv-heads 8 \\",
+                "  --num-layers 32",
+                "```",
+                "",
+                "Run from repo root.",
+                "",
+            ]
+        )
 
     path.write_text("\n".join(lines) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run matched dual-source vs DRAM-only L1 memory-view comparisons.")
-    parser.add_argument("--dual-source-cmd", required=True, help="Shell command for the dual-source run.")
-    parser.add_argument("--dram-only-cmd", required=True, help="Shell command for the DRAM-only run.")
+    parser.add_argument(
+        "--from-json",
+        metavar="PATH",
+        help="Regenerate summary.md from existing comparison.json (skips running commands).",
+    )
+    parser.add_argument("--dual-source-cmd", help="Shell command for the dual-source run.")
+    parser.add_argument("--dram-only-cmd", help="Shell command for the DRAM-only run.")
     parser.add_argument("--working-directory", default=".", help="Working directory for both commands.")
     parser.add_argument("--output-dir", default="research_codes/l1_memory_compare", help="Directory for outputs.")
     parser.add_argument("--snapshot-label", default="after_model_load", help="Snapshot label to compare.")
@@ -279,7 +417,7 @@ def main():
         help="Comma-separated l1_kv_window_size values to probe with --real-window-cmd-template.",
     )
     parser.add_argument("--batch-size-per-device-group", type=int, default=1)
-    parser.add_argument("--num-local-kv-heads", type=int, required=True)
+    parser.add_argument("--num-local-kv-heads", type=int, help="Required when not using --from-json.")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=32)
     parser.add_argument("--kv-dtype", choices=sorted(DTYPE_BYTES), default="bfloat8_b")
@@ -293,37 +431,58 @@ def main():
     )
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.from_json:
+        json_path = Path(args.from_json)
+        if not json_path.is_file():
+            raise FileNotFoundError(f"comparison.json not found: {json_path}")
+        report = json.loads(json_path.read_text())
+        output_dir = json_path.parent
+        dual_snapshot = report["dual_source"]["snapshot"]
+        dram_snapshot = report["dram_only"]["snapshot"]
+        dual_window = report["dual_source"]["window_estimate"]
+        dram_window = report["dram_only"]["window_estimate"]
+        real_window_probe = report.get("real_window_probe")
+        inputs = report.get("inputs", {})
+        for k, v in inputs.items():
+            if hasattr(args, k) and getattr(args, k) is None:
+                setattr(args, k, v)
+    else:
+        if not args.dual_source_cmd or not args.dram_only_cmd:
+            parser.error("--dual-source-cmd and --dram-only-cmd are required when not using --from-json")
+        if args.num_local_kv_heads is None:
+            parser.error("--num-local-kv-heads is required when not using --from-json")
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    dual_snapshot_path = output_dir / "dual_source_memory_view.json"
-    dram_snapshot_path = output_dir / "dram_only_memory_view.json"
+        dual_snapshot_path = output_dir / "dual_source_memory_view.json"
+        dram_snapshot_path = output_dir / "dram_only_memory_view.json"
 
-    run_with_snapshot(args.dual_source_cmd, dual_snapshot_path, args.working_directory)
-    run_with_snapshot(args.dram_only_cmd, dram_snapshot_path, args.working_directory)
+        run_with_snapshot(args.dual_source_cmd, dual_snapshot_path, args.working_directory)
+        run_with_snapshot(args.dram_only_cmd, dram_snapshot_path, args.working_directory)
 
-    dual_snapshot = load_snapshot(dual_snapshot_path, args.snapshot_label)
-    dram_snapshot = load_snapshot(dram_snapshot_path, args.snapshot_label)
+        dual_snapshot = load_snapshot(dual_snapshot_path, args.snapshot_label)
+        dram_snapshot = load_snapshot(dram_snapshot_path, args.snapshot_label)
 
-    dual_window = summarize_window(dual_snapshot, args)
-    dram_window = summarize_window(dram_snapshot, args)
-    real_window_probe = probe_real_window_limit(
-        args.real_window_cmd_template,
-        parse_probe_values(args.real_window_values),
-        args.working_directory,
-        dual_snapshot["total_bytes_per_bank"],
-    )
+        dual_window = summarize_window(dual_snapshot, args)
+        dram_window = summarize_window(dram_snapshot, args)
+        real_window_probe = probe_real_window_limit(
+            args.real_window_cmd_template,
+            parse_probe_values(args.real_window_values),
+            args.working_directory,
+            dual_snapshot["total_bytes_per_bank"],
+        )
 
-    report = {
-        "inputs": vars(args),
-        "dual_source": {"snapshot": dual_snapshot, "window_estimate": dual_window},
-        "dram_only": {"snapshot": dram_snapshot, "window_estimate": dram_window},
-        "real_window_probe": real_window_probe,
-    }
+        report = {
+            "inputs": vars(args),
+            "dual_source": {"snapshot": dual_snapshot, "window_estimate": dual_window},
+            "dram_only": {"snapshot": dram_snapshot, "window_estimate": dram_window},
+            "real_window_probe": real_window_probe,
+        }
 
-    json_path = output_dir / "comparison.json"
+        json_path = output_dir / "comparison.json"
+        json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
     md_path = output_dir / "summary.md"
-    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     write_summary(md_path, dual_snapshot, dram_snapshot, dual_window, dram_window, real_window_probe)
     print(md_path)
 

@@ -418,6 +418,18 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t im_tile_size = im_tile.get_tile_size(im_df);
     uint32_t stats_tile_size = stats_tile.get_tile_size(stats_df);
 
+    log_debug(
+        tt::LogOp,
+        "SDPA decode CB tile sizes (bytes): q={} k={} v={} mask={} out={} scalar={} im={} stats={}",
+        q_tile_size,
+        k_tile_size,
+        v_tile_size,
+        mask_tile_size,
+        out_tile_size,
+        scalar_tile_size,
+        im_tile_size,
+        stats_tile_size);
+
     uint32_t intermed_output_tiles = (out0_t + 2 * PNHt) * (num_cores_per_head - 1);
 
     uint32_t index_stick_size = 0;
@@ -647,6 +659,68 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         c_out4_config.set_globally_allocated_address(*out0_buffer);
     }
     auto cb_out4_id = CreateCircularBuffer(program, core_grid, c_out4_config);
+
+    // Log exact compile-time CB sizes (per core, bytes) when TT_LOGGER_LEVEL=Debug
+    uint32_t cb_c0 = q_tiles * q_tile_size, cb_c1 = k_tiles * k_tile_size, cb_c2 = v_tiles * v_tile_size,
+             cb_c3 = qk_tiles * mask_tile_size, cb_c5 = scale_tiles * scalar_tile_size,
+             cb_c6 = statistics_tiles * stats_tile_size, cb_c7 = statistics_tiles * stats_tile_size,
+             cb_c10 = q_tiles * q_tile_size, cb_c11 = scale_tiles * col_identity_tile_size,
+             cb_c12 = scale_tiles * scalar_tile_size, cb_c16 = out0_t * stats_tile_size,
+             cb_c17 = statistics_tiles * stats_tile_size, cb_c18 = statistics_tiles * stats_tile_size,
+             cb_c20 = out0_t * out_tile_size, cb_c21 = statistics_tiles * stats_tile_size,
+             cb_c22 = statistics_tiles * stats_tile_size, cb_c23 = out_im_tiles * im_tile_size,
+             cb_c24 = qk_tiles * im_tile_size, cb_c25 = out_im_tiles * im_tile_size,
+             cb_c26 = out_im_tiles * im_tile_size, cb_c27 = statistics_tiles * stats_tile_size,
+             cb_c28 = statistics_tiles * stats_tile_size, cb_c29 = statistics_tiles * stats_tile_size,
+             cb_c30 = statistics_tiles * stats_tile_size, cb_c31 = statistics_tiles * stats_tile_size;
+    uint32_t cb_total = cb_c0 + cb_c1 + cb_c2 + cb_c3 + cb_c5 + cb_c6 + cb_c7 + cb_c10 + cb_c11 + cb_c12 + cb_c16 +
+                        cb_c17 + cb_c18 + cb_c20 + cb_c21 + cb_c22 + cb_c23 + cb_c24 + cb_c25 + cb_c26 + cb_c27 +
+                        cb_c28 + cb_c29 + cb_c30 + cb_c31;
+    if (use_attention_sink) {
+        cb_total += statistics_tiles * stats_tile_size;  // c_4
+    }
+    if (use_cur_pos_tensor) {
+        cb_total += index_stick_size;  // c_8
+    }
+    if (is_paged_attention) {
+        cb_total += shard_size;  // c_9
+    }
+    if (sliding_window_size.has_value() && sliding_window_size.value() > 0) {
+        cb_total += qk_tiles * mask_tile_size;  // c_13
+    }
+    if (intermed_output_tiles > 0) {
+        cb_total += intermed_output_tiles * stats_tile_size;  // c_19
+    }
+    log_debug(
+        tt::LogOp,
+        "SDPA decode CB sizes (bytes per core): c0={} c1={} c2={} c3={} c5={} c6={} c7={} c10={} c11={} c12={} "
+        "c16={} c17={} c18={} c20={} c21={} c22={} c23={} c24={} c25={} c26={} c27={} c28={} c29={} c30={} c31={}",
+        cb_c0,
+        cb_c1,
+        cb_c2,
+        cb_c3,
+        cb_c5,
+        cb_c6,
+        cb_c7,
+        cb_c10,
+        cb_c11,
+        cb_c12,
+        cb_c16,
+        cb_c17,
+        cb_c18,
+        cb_c20,
+        cb_c21,
+        cb_c22,
+        cb_c23,
+        cb_c24,
+        cb_c25,
+        cb_c26,
+        cb_c27,
+        cb_c28,
+        cb_c29,
+        cb_c30,
+        cb_c31);
+    log_debug(tt::LogOp, "SDPA decode total static CB size per core (bytes): {}", cb_total);
 
     // *** Create Kernels and Compile Time Args ***
     // Reduce ops need to multiply by a scalar. We always want to multiply by 1.0f

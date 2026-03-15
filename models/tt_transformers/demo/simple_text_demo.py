@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -195,49 +196,76 @@ def create_tt_page_table(global_batch_size, data_parallel, paged_attention_confi
     return page_table
 
 
-def _summarize_l1_memory_view(device):
-    view = ttnn.get_memory_view(device, ttnn.BufferType.L1)
-    chip_total_bytes = int(view.num_banks * view.total_bytes_per_bank)
-    chip_allocated_bytes = int(view.num_banks * view.total_bytes_allocated_per_bank)
-    chip_free_bytes = int(view.num_banks * view.total_bytes_free_per_bank)
-    largest_interleavable_free_bytes_estimate = int(view.num_banks * view.largest_contiguous_bytes_free_per_bank)
-    allocated_blocks = []
+def _get_reports_dir():
+    """Resolve generated/reports directory used by dump_device_memory_state."""
+    if os.environ.get("TT_METAL_REPORTS_DIR"):
+        return Path(os.environ["TT_METAL_REPORTS_DIR"])
+    cwd_reports = Path.cwd() / "generated" / "reports"
+    if cwd_reports.exists():
+        return cwd_reports
+    ttnn_parent = Path(ttnn.__file__).resolve().parent.parent
+    return ttnn_parent / "generated" / "reports"
 
-    for block in view.block_table:
-        try:
-            address = int(block.get("address", "0"))
-            size = int(block.get("size", "0"))
-            allocated = str(block.get("allocated", "")).lower() in {"yes", "true", "1"}
-        except (TypeError, ValueError):
-            continue
 
-        record = {"address": address, "size": size}
-        if allocated:
-            allocated_blocks.append(record)
+def _parse_l1_snapshot_from_dump(reports_dir, prefix):
+    """Parse L1 stats from dump_device_memory_state CSV outputs. Returns snapshot dict or None."""
+    summary_path = reports_dir / f"{prefix}memory_usage_summary.csv"
+    detailed_path = reports_dir / f"{prefix}detailed_memory_usage.csv"
+    if not summary_path.exists() or not detailed_path.exists():
+        return None
 
-    highest_allocated_end_address = max((block["address"] + block["size"] for block in allocated_blocks), default=0)
-    lowest_allocated_address = min((block["address"] for block in allocated_blocks), default=view.total_bytes_per_bank)
-    allocator_top_down_reserved_bytes = max(int(view.total_bytes_per_bank) - int(lowest_allocated_address), 0)
-    largest_allocated_block_bytes = max((block["size"] for block in allocated_blocks), default=0)
+    # memory_usage_summary.csv: header then one line per buffer (DRAM, L1, L1_SMALL): ",allocatable,allocated,free,largest\n"
+    lines = summary_path.read_text().strip().split("\n")
+    if len(lines) < 3:
+        return None
+    # Line 0 = header; line 1 = DRAM; line 2 = L1
+    parts = [p.strip() for p in lines[2].split(",")]
+    if len(parts) < 5:
+        return None
+    try:
+        total_bytes_per_bank = int(parts[1])
+        total_bytes_allocated_per_bank = int(parts[2])
+        total_bytes_free_per_bank = int(parts[3])
+        largest_contiguous_bytes_free_per_bank = int(parts[4])
+    except ValueError:
+        return None
+
+    # detailed_memory_usage.csv: find L1 section and chip total allocatable to get num_banks
+    detailed_text = detailed_path.read_text()
+    num_banks = 130
+    idx = detailed_text.find(",L1\n")
+    if idx >= 0:
+        chunk = detailed_text[idx : idx + 500]
+        for line in chunk.split("\n"):
+            if "Total allocatable (B):" in line:
+                try:
+                    part = line.split(":")[-1].strip().replace(",", "")
+                    chip_allocatable = int(part)
+                    if total_bytes_per_bank > 0:
+                        num_banks = chip_allocatable // total_bytes_per_bank
+                except (ValueError, IndexError):
+                    pass
+                break
+
+    chip_total_bytes = num_banks * total_bytes_per_bank
+    chip_allocated_bytes = num_banks * total_bytes_allocated_per_bank
+    chip_free_bytes = num_banks * total_bytes_free_per_bank
+    largest_interleavable_free_bytes_estimate = num_banks * largest_contiguous_bytes_free_per_bank
 
     per_bank_allocated_pct = (
-        100.0 * view.total_bytes_allocated_per_bank / view.total_bytes_per_bank if view.total_bytes_per_bank else 0.0
+        100.0 * total_bytes_allocated_per_bank / total_bytes_per_bank if total_bytes_per_bank else 0.0
     )
-    per_bank_free_pct = (
-        100.0 * view.total_bytes_free_per_bank / view.total_bytes_per_bank if view.total_bytes_per_bank else 0.0
-    )
+    per_bank_free_pct = 100.0 * total_bytes_free_per_bank / total_bytes_per_bank if total_bytes_per_bank else 0.0
     per_bank_largest_free_pct = (
-        100.0 * view.largest_contiguous_bytes_free_per_bank / view.total_bytes_per_bank
-        if view.total_bytes_per_bank
-        else 0.0
+        100.0 * largest_contiguous_bytes_free_per_bank / total_bytes_per_bank if total_bytes_per_bank else 0.0
     )
 
     return {
-        "num_banks": int(view.num_banks),
-        "total_bytes_per_bank": int(view.total_bytes_per_bank),
-        "total_bytes_allocated_per_bank": int(view.total_bytes_allocated_per_bank),
-        "total_bytes_free_per_bank": int(view.total_bytes_free_per_bank),
-        "largest_contiguous_bytes_free_per_bank": int(view.largest_contiguous_bytes_free_per_bank),
+        "num_banks": num_banks,
+        "total_bytes_per_bank": total_bytes_per_bank,
+        "total_bytes_allocated_per_bank": total_bytes_allocated_per_bank,
+        "total_bytes_free_per_bank": total_bytes_free_per_bank,
+        "largest_contiguous_bytes_free_per_bank": largest_contiguous_bytes_free_per_bank,
         "largest_interleavable_free_bytes_estimate": largest_interleavable_free_bytes_estimate,
         "chip_total_allocatable_bytes": chip_total_bytes,
         "chip_total_allocated_bytes": chip_allocated_bytes,
@@ -245,21 +273,39 @@ def _summarize_l1_memory_view(device):
         "per_bank_allocated_pct": per_bank_allocated_pct,
         "per_bank_free_pct": per_bank_free_pct,
         "per_bank_largest_contiguous_free_pct": per_bank_largest_free_pct,
-        "allocator_num_allocated_blocks": len(allocated_blocks),
-        "allocator_highest_allocated_end_address_per_bank": int(highest_allocated_end_address),
-        "allocator_lowest_allocated_address_per_bank": int(lowest_allocated_address),
-        "allocator_top_down_reserved_bytes_per_bank": int(allocator_top_down_reserved_bytes),
-        "allocator_largest_allocated_block_bytes_per_bank": int(largest_allocated_block_bytes),
+        "allocator_num_allocated_blocks": 0,
+        "allocator_highest_allocated_end_address_per_bank": 0,
+        "allocator_lowest_allocated_address_per_bank": total_bytes_per_bank,
+        "allocator_top_down_reserved_bytes_per_bank": 0,
+        "allocator_largest_allocated_block_bytes_per_bank": 0,
         "captures_allocator_state_only": True,
-        "allocator_note": "Static circular buffers are typically not allocator-managed and are not fully reflected in get_memory_view(). block_table contains allocator-managed allocated blocks only.",
+        "allocator_note": "Snapshot from dump_device_memory_state(). Static circular buffers are typically not allocator-managed and are not fully reflected. Block table not populated from dump.",
     }
+
+
+def _summarize_l1_memory_view(device, label="snapshot"):
+    """Capture L1 memory state via dump_device_memory_state and parse CSV reports."""
+    prefix = f"l1_snapshot_{label}_{int(time.time() * 1000)}_"
+    ttnn.dump_device_memory_state(device, prefix)
+    reports_dir = _get_reports_dir()
+    if not reports_dir.exists():
+        raise RuntimeError(
+            f"Reports dir not found: {reports_dir}. Set TT_METAL_REPORTS_DIR or run from repo root so generated/reports exists."
+        )
+    snapshot = _parse_l1_snapshot_from_dump(reports_dir, prefix)
+    if snapshot is None:
+        raise RuntimeError(
+            f"Failed to parse L1 snapshot from {reports_dir} (prefix={prefix}). "
+            "Check that dump_device_memory_state wrote memory_usage_summary.csv and detailed_memory_usage.csv."
+        )
+    return snapshot
 
 
 def _write_l1_memory_snapshot(device, output_path, label):
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    snapshot = _summarize_l1_memory_view(device)
+    snapshot = _summarize_l1_memory_view(device, label)
     snapshot["label"] = label
 
     existing = []

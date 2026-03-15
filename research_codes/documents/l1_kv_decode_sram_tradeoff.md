@@ -475,13 +475,15 @@ which is explicitly a **per-worker** quantity, not a full-chip quantity.
 
 TTNN already exposes two useful mechanisms.
 
-#### A. In-process snapshot API
+#### A. Snapshot API (used in demo: dump_device_memory_state)
 
-Use:
+We use:
 
-- `ttnn.get_memory_view(device, ttnn.BufferType.L1)`
+- `ttnn.dump_device_memory_state(device, prefix)`
 
-This returns a `MemoryView` with:
+This writes three CSV reports under `generated/reports/` (or `TT_METAL_REPORTS_DIR`): `memory_usage_summary.csv`, `l1_usage_summary.csv`, `detailed_memory_usage.csv`. The same allocator stats can be obtained in-process via `ttnn.get_memory_view(device, ttnn.BufferType.L1)` when storing to disk is not desired; the demo parses the dump CSVs to build the snapshot.
+
+`get_memory_view` returns a `MemoryView` with:
 
 - `num_banks`
 - `total_bytes_per_bank`
@@ -593,6 +595,18 @@ largest_free_pct_per_bank =
 
 This number is often more actionable than total free space, because an allocation can fail even when total free bytes look comfortable if the remaining space is too fragmented.
 
+### 9.3.1 What Is a "Bank" for L1 SRAM?
+
+In the allocator and in reports like `get_memory_view()` / `dump_device_memory_state()`, L1 is presented in **banks**. For L1 SRAM on **compute cores**, one **bank** corresponds to **one core’s L1**: the allocator maps each compute core to a single bank ID, and `total_bytes_per_bank` is the size of that core’s L1 region (e.g. 1,470,080 bytes ≈ 1.43 MiB on Blackhole P150). So when we say "per-bank" in the context of L1 on the decode worker grid, we mean **per core**.
+
+Important details:
+
+- **Compute-and-storage cores:** Each such core has exactly one L1 bank. So number of L1 banks = number of compute (worker) cores in the allocator’s grid.
+- **Storage-only cores (if any):** A single storage core can be split into multiple banks (multiple logical banks per physical core). So "bank" does not always mean "one physical core" for every core type; for the **decode path**, which runs on compute cores, **one bank = one core**.
+- **DRAM:** For DRAM, "bank" is a different hardware concept (memory channels/banks) and is not per-core in the same way.
+
+So in this document and in the profiling scripts, "per-bank" L1 usage on the constraining decode cores is **exactly** the per-core L1 usage for those cores. The bottleneck we care about (e.g. static CB end at 1,249,664 bytes) is the **per-core** SRAM consumed on the 8×1 decode cores.
+
 ### 9.4 Why Per-Core Matters More Than Whole-Chip Percentage
 
 Suppose the chip has a lot of total free SRAM left overall, but the specific worker cores used by decode have one or two banks close to full.
@@ -616,7 +630,7 @@ In the current Llama 3.1 8B P150 decode path, the real bottleneck is exactly thi
 
 ### 9.5 Minimal Example
 
-The following code is enough to snapshot current L1 allocation after model load or after a decode step:
+The demo snapshots L1 via `dump_device_memory_state(device, prefix)` and parses the generated CSVs. Equivalent in-process snapshot (when disk is not used) is:
 
 ```python
 import ttnn
@@ -649,11 +663,10 @@ print(f"Chip-total allocated %: {chip_alloc_pct:.2f}")
 To compare DRAM-only and dual-source accurately, the most useful measurement plan is:
 
 1. Run DRAM-only model load + one decode step.
-2. Capture `get_memory_view(..., BufferType.L1)` immediately after decode.
-3. Dump `dump_device_memory_state(..., prefix="dram_only_...")`.
-4. Repeat for dual-source.
-5. Run a small real-window pass/fail probe around the expected limit.
-6. Compare:
+2. Call `dump_device_memory_state(..., prefix="dram_only_...")` (or capture `get_memory_view(..., BufferType.L1)`) immediately after decode.
+3. Repeat for dual-source.
+4. Run a small real-window pass/fail probe around the expected limit.
+5. Compare:
    - allocated bytes per bank
    - largest contiguous free bytes per bank
    - chip-total allocated percentage
@@ -669,7 +682,7 @@ Today, there is **not** a single public TTNN API that returns complete runtime S
 So the best practical hierarchy is:
 
 1. **Allocator-visible runtime snapshot**
-   - from `ttnn.get_memory_view(...)`
+   - from `ttnn.dump_device_memory_state()` CSVs or `ttnn.get_memory_view(...)`
    - useful for persistent L1 tensors and fragmentation
    - incomplete for static CBs
 2. **Real workload pass/fail probe**
@@ -678,6 +691,8 @@ So the best practical hierarchy is:
    - this gives a real measured bottleneck on the participating cores
 3. **Kernel/program analysis**
    - use the decode program configuration and CB formulas to explain why the bottleneck exists
+
+**Getting exact compile-time CB size:** With `TT_LOGGER_LEVEL=Debug`, the SDPA decode factory logs "SDPA decode total static CB size per core (bytes): N" and a per-CB breakdown when the program is built. Run the demo (or any workload that compiles the decode program) with debug logging and redirect output to a file; then use `research_codes/parse_sdpa_cb_memory.py --log <file>` to parse it. If no log is available, the same script can use `--comparison <comparison.json>` to report bottleneck-core usage from the probe clash address (static CB end) instead.
 
 So the answer to "is only allocator view available?" is:
 
