@@ -1091,6 +1091,15 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             uint32_t attn_mask_addr = use_attention_mask ? optional_input_tensors.at(2).value().buffer()->address() : 0;
             uint32_t attention_sink_addr =
                 use_attention_sink ? optional_input_tensors.at(3).value().buffer()->address() : 0;
+            bool use_l1_kv_cache_rt = optional_input_tensors.size() > 5 && optional_input_tensors.at(4).has_value() &&
+                                      optional_input_tensors.at(5).has_value();
+            uint32_t l1_k_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(4).value().buffer()->address() : 0;
+            uint32_t l1_v_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(5).value().buffer()->address() : 0;
+            uint32_t l1_window_size_tiles = 0;
+            if (use_l1_kv_cache_rt) {
+                auto l1_k_shape = optional_input_tensors.at(4).value().padded_shape();
+                l1_window_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
+            }
             auto page_table_buffer = is_paged_attention ? optional_input_tensors.at(1).value().buffer() : nullptr;
             uint32_t page_table_stick_size = is_paged_attention ? page_table_buffer->aligned_page_size() : 0;
 
@@ -1134,9 +1143,16 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 reader_args[arg_idx++] = core_num_in_reduce;
                 reader_args[arg_idx++] = core_num_in_output;
                 reader_args[arg_idx++] = cur_pos;
-                // L1 KV args are not updated in the override callback (addresses don't change)
-                // but we skip past them to avoid out-of-bounds if further args are read
-                arg_idx += 4;  // l1_k_addr, l1_v_addr, l1_window_start_tile, l1_window_size_tiles
+                uint32_t cur_l1_window_start_tile = 0;
+                if (use_l1_kv_cache_rt && l1_window_size_tiles > 0) {
+                    uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
+                    cur_l1_window_start_tile =
+                        (seq_tiles > l1_window_size_tiles) ? (seq_tiles - l1_window_size_tiles) : 0;
+                }
+                reader_args[arg_idx++] = l1_k_addr;
+                reader_args[arg_idx++] = l1_v_addr;
+                reader_args[arg_idx++] = cur_l1_window_start_tile;
+                reader_args[arg_idx++] = l1_window_size_tiles;
 
                 // writer runtime args
                 arg_idx = 0;
