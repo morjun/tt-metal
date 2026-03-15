@@ -29,6 +29,8 @@ tt::tt_metal::operation::ProgramWithCallbacks sdpa_decode_multi_core(
     bool mla = false,
     uint32_t head_dim_v = 0,
     std::optional<uint32_t> sliding_window_size = std::nullopt,
+    uint32_t l1_sink_size = 0,
+    float l1_min_expected_hit_ratio = 0.0f,
     std::optional<const Tensor> l1_k_tensor = std::nullopt,
     std::optional<const Tensor> l1_v_tensor = std::nullopt);
 

@@ -208,6 +208,9 @@ def prepare_generator_args(
     num_layers,
     use_l1_weight_sharding=False,
     l1_kv_window_size=0,
+    l1_kv_sink_size=0,
+    l1_kv_use_sharded=False,
+    l1_kv_min_expected_hit_ratio=0.0,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -239,6 +242,9 @@ def prepare_generator_args(
             num_layers=num_layers,
             use_l1_weight_sharding=use_l1_weight_sharding,
             l1_kv_window_size=l1_kv_window_size,
+            l1_kv_sink_size=l1_kv_sink_size,
+            l1_kv_use_sharded=l1_kv_use_sharded,
+            l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -789,6 +795,9 @@ def test_demo_text(
     mode = request.config.getoption("--mode") or mode
     use_l1_weight_sharding = request.config.getoption("--use_l1_weight_sharding")
     l1_kv_window_size = request.config.getoption("--l1_kv_window_size")
+    l1_kv_sink_size = request.config.getoption("--l1_kv_sink_size")
+    l1_kv_use_sharded = request.config.getoption("--l1_kv_use_sharded")
+    l1_kv_min_expected_hit_ratio = request.config.getoption("--l1_kv_min_expected_hit_ratio")
 
     if stress_test and token_accuracy:
         pytest.skip("Stress test cannot be run with token accuracy mode")
@@ -884,6 +893,9 @@ def test_demo_text(
         num_layers=num_layers,
         use_l1_weight_sharding=use_l1_weight_sharding,
         l1_kv_window_size=l1_kv_window_size,
+        l1_kv_sink_size=l1_kv_sink_size,
+        l1_kv_use_sharded=l1_kv_use_sharded,
+        l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
     )
 
     # Skip ci-eval tests on P100 devices

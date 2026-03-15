@@ -45,6 +45,8 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     const std::optional<MemoryConfig>& memory_config,
     std::optional<SDPAProgramConfig> program_config,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+    uint32_t l1_sink_size,
+    float l1_min_expected_hit_ratio,
     const std::optional<const Tensor>& l1_k_tensor,
     const std::optional<const Tensor>& l1_v_tensor) {
     [[maybe_unused]] auto arch =
@@ -82,7 +84,9 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
                    .program_config = program_config,
                    .compute_kernel_config = kernel_config_val,
                    .k_chunk_size = k_chunk_size,
-                   .paged_attention = false},
+                   .paged_attention = false,
+                   .l1_sink_size = l1_sink_size,
+                   .l1_min_expected_hit_ratio = l1_min_expected_hit_ratio},
                {input_tensor_q, input_tensor_k, input_tensor_v},
                {cur_pos_tensor, std::nullopt, attn_mask, attention_sink, l1_k_tensor, l1_v_tensor},
                {})
@@ -102,7 +106,9 @@ ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
     std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+    uint32_t l1_sink_size,
+    float l1_min_expected_hit_ratio) {
     [[maybe_unused]] auto arch =
         input_tensor_q.storage_type() == StorageType::DEVICE
             ? input_tensor_q.device()->arch()
@@ -135,7 +141,9 @@ ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
                    .program_config = program_config,
                    .compute_kernel_config = kernel_config_val,
                    .k_chunk_size = k_chunk_size,
-                   .paged_attention = true},
+                   .paged_attention = true,
+                   .l1_sink_size = l1_sink_size,
+                   .l1_min_expected_hit_ratio = l1_min_expected_hit_ratio},
                {input_tensor_q, input_tensor_k, input_tensor_v},
                {cur_pos_tensor, page_table_tensor, attn_mask, attention_sink},
                {})
@@ -192,6 +200,8 @@ ttnn::Tensor ExecuteFlashMultiLatentAttentionDecode::invoke(
                    .compute_kernel_config = kernel_config_val,
                    .k_chunk_size = k_chunk_size,
                    .paged_attention = false,
+                   .l1_sink_size = 0,
+                   .l1_min_expected_hit_ratio = 0.0f,
                    .use_mla = true,
                    .head_dim_v = head_dim_v},
                {input_tensor_q, input_tensor_k},
@@ -247,6 +257,8 @@ ttnn::Tensor ExecutePagedFlashMultiLatentAttentionDecode::invoke(
                    .compute_kernel_config = kernel_config_val,
                    .k_chunk_size = k_chunk_size,
                    .paged_attention = true,
+                   .l1_sink_size = 0,
+                   .l1_min_expected_hit_ratio = 0.0f,
                    .use_mla = true,
                    .head_dim_v = head_dim_v},
                {input_tensor_q, input_tensor_k},

@@ -90,3 +90,23 @@ def pytest_addoption(parser):
         type=int,
         help="L1 KV cache window size (0 = disabled, e.g. 256 for ring-buffer cache)",
     )
+    parser.addoption(
+        "--l1_kv_sink_size",
+        action="store",
+        default=0,
+        type=int,
+        help="Pinned L1 KV sink size in tokens (0 = disabled)",
+    )
+    parser.addoption(
+        "--l1_kv_use_sharded",
+        action="store_true",
+        default=False,
+        help="Use a sharded L1 KV read cache alongside the interleaved writer cache",
+    )
+    parser.addoption(
+        "--l1_kv_min_expected_hit_ratio",
+        action="store",
+        default=0.0,
+        type=float,
+        help="Disable dual-source L1 reads for decode steps whose expected hit ratio is below this threshold",
+    )

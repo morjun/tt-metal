@@ -684,6 +684,9 @@ def create_tt_model(
     subdevice=None,
     use_l1_weight_sharding=False,
     l1_kv_window_size=0,
+    l1_kv_sink_size=0,
+    l1_kv_use_sharded=False,
+    l1_kv_min_expected_hit_ratio=0.0,
 ):
     from models.tt_transformers.tt.model import Transformer
     from models.tt_transformers.tt.model_config import ModelArgs
@@ -697,6 +700,9 @@ def create_tt_model(
         subdevice=subdevice,
         use_l1_weight_sharding=use_l1_weight_sharding,
         l1_kv_window_size=l1_kv_window_size,
+        l1_kv_sink_size=l1_kv_sink_size,
+        l1_kv_use_sharded=l1_kv_use_sharded,
+        l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
     )
     if num_layers is not None:
         tt_model_args.n_layers = num_layers

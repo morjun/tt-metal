@@ -24,6 +24,8 @@ struct ScaledDotProductAttentionDecode {
     const uint32_t k_chunk_size;
     const bool paged_attention;
     const std::optional<bool> share_cache;
+    const uint32_t l1_sink_size;
+    const float l1_min_expected_hit_ratio;
 
     const std::optional<bool> use_mla;
     const std::optional<uint32_t> head_dim_v;

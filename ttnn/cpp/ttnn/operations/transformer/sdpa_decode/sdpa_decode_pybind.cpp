@@ -68,6 +68,8 @@ void py_bind_sdpa_decode(py::module& module) {
                const std::optional<MemoryConfig>& memory_config,
                std::optional<SDPAProgramConfig> program_config,
                std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+               uint32_t l1_sink_size,
+               float l1_min_expected_hit_ratio,
                const std::optional<const Tensor>& l1_k_tensor,
                const std::optional<const Tensor>& l1_v_tensor) {
                 return self(
@@ -84,6 +86,8 @@ void py_bind_sdpa_decode(py::module& module) {
                     memory_config,
                     program_config,
                     compute_kernel_config,
+                    l1_sink_size,
+                    l1_min_expected_hit_ratio,
                     l1_k_tensor,
                     l1_v_tensor);
             },
@@ -101,6 +105,8 @@ void py_bind_sdpa_decode(py::module& module) {
             py::arg("memory_config").noconvert() = std::nullopt,
             py::arg("program_config").noconvert() = std::nullopt,
             py::arg("compute_kernel_config").noconvert() = std::nullopt,
+            py::arg("l1_sink_size").noconvert() = 0,
+            py::arg("l1_min_expected_hit_ratio").noconvert() = 0.0f,
             py::arg("l1_k_tensor").noconvert() = std::nullopt,
             py::arg("l1_v_tensor").noconvert() = std::nullopt});
 
@@ -123,7 +129,9 @@ void py_bind_sdpa_decode(py::module& module) {
                std::optional<uint32_t> sliding_window_size,
                const std::optional<MemoryConfig>& memory_config,
                std::optional<SDPAProgramConfig> program_config,
-               std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+               std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+               uint32_t l1_sink_size,
+               float l1_min_expected_hit_ratio) {
                 return self(
                     input_tensor_q,
                     input_tensor_k,
@@ -137,7 +145,9 @@ void py_bind_sdpa_decode(py::module& module) {
                     sliding_window_size,
                     memory_config,
                     program_config,
-                    compute_kernel_config);
+                    compute_kernel_config,
+                    l1_sink_size,
+                    l1_min_expected_hit_ratio);
             },
             py::arg("input_tensor_q").noconvert(),
             py::arg("input_tensor_k").noconvert(),
@@ -152,7 +162,9 @@ void py_bind_sdpa_decode(py::module& module) {
             py::arg("sliding_window_size").noconvert() = std::nullopt,
             py::arg("memory_config").noconvert() = std::nullopt,
             py::arg("program_config").noconvert() = std::nullopt,
-            py::arg("compute_kernel_config").noconvert() = std::nullopt});
+            py::arg("compute_kernel_config").noconvert() = std::nullopt,
+            py::arg("l1_sink_size").noconvert() = 0,
+            py::arg("l1_min_expected_hit_ratio").noconvert() = 0.0f});
 
     using MLAOperationType = decltype(ttnn::transformer::flash_multi_latent_attention_decode);
     ttnn::bind_registered_operation(

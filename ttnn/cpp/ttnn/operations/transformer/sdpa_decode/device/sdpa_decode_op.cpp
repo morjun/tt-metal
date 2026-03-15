@@ -375,6 +375,8 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
         this->use_mla.value_or(false),
         this->head_dim_v.value_or(0),
         sliding_window_size,
+        this->l1_sink_size,
+        this->l1_min_expected_hit_ratio,
         l1_k_tensor,
         l1_v_tensor);
 }
@@ -398,6 +400,8 @@ operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
         this->use_mla,
         this->head_dim_v,
         this->sliding_window_size,
+        this->l1_sink_size,
+        this->l1_min_expected_hit_ratio,
         has_attn_mask,
         has_cur_pos,
         has_l1_kv,

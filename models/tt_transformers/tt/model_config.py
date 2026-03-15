@@ -465,9 +465,15 @@ class ModelArgs:
         subdevice=None,
         use_l1_weight_sharding=False,
         l1_kv_window_size=0,  # 0 = disabled; set to e.g. 256 for L1 KV cache window
+        l1_kv_sink_size=0,
+        l1_kv_use_sharded=False,
+        l1_kv_min_expected_hit_ratio=0.0,
     ):
         self.use_l1_weight_sharding = use_l1_weight_sharding
         self.l1_kv_window_size = l1_kv_window_size
+        self.l1_kv_sink_size = l1_kv_sink_size
+        self.l1_kv_use_sharded = l1_kv_use_sharded
+        self.l1_kv_min_expected_hit_ratio = l1_kv_min_expected_hit_ratio
         if subdevice:
             self.num_devices = 1
         else:
