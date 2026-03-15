@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -28,6 +29,19 @@ def run_with_snapshot(command, snapshot_path, cwd):
     )
     if completed.returncode != 0:
         raise RuntimeError(f"Command failed ({completed.returncode}): {command}")
+
+
+def run_command_capture(command, cwd):
+    completed = subprocess.run(
+        command,
+        shell=True,
+        cwd=cwd,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return completed.returncode, completed.stdout
 
 
 def load_snapshot(path, label):
@@ -79,7 +93,76 @@ def format_pct(value):
     return f"{value:.2f}%"
 
 
-def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window):
+def parse_probe_values(raw_values):
+    if not raw_values:
+        return []
+    values = []
+    for part in raw_values.split(","):
+        token = part.strip()
+        if token:
+            values.append(int(token))
+    return values
+
+
+def probe_real_window_limit(command_template, probe_values, cwd, total_bytes_per_bank):
+    if not command_template or not probe_values:
+        return None
+
+    clash_pattern = re.compile(
+        r"Statically allocated circular buffers.*L1 buffer allocated at (\d+) and static circular buffer region ends at (\d+)"
+    )
+    results = []
+
+    for window in probe_values:
+        command = command_template.format(window=window)
+        returncode, output = run_command_capture(command, cwd)
+        probe = {
+            "window": window,
+            "returncode": returncode,
+            "passed": returncode == 0,
+            "failure_reason": None,
+        }
+        match = clash_pattern.search(output)
+        if match:
+            l1_buffer_address = int(match.group(1))
+            static_cb_end = int(match.group(2))
+            probe.update(
+                {
+                    "failure_reason": "static_cb_l1_clash",
+                    "l1_buffer_allocated_address_per_bank": l1_buffer_address,
+                    "static_circular_buffer_end_address_per_bank": static_cb_end,
+                    "static_cb_occupied_bytes_per_bank": static_cb_end,
+                    "static_cb_occupied_pct_per_bank": 100.0 * static_cb_end / total_bytes_per_bank,
+                    "effective_headroom_bytes_per_bank": max(total_bytes_per_bank - static_cb_end, 0),
+                    "effective_headroom_pct_per_bank": 100.0
+                    * max(total_bytes_per_bank - static_cb_end, 0)
+                    / total_bytes_per_bank,
+                    "requested_l1_buffer_bytes_per_bank": max(total_bytes_per_bank - l1_buffer_address, 0),
+                    "requested_l1_buffer_pct_per_bank": 100.0
+                    * max(total_bytes_per_bank - l1_buffer_address, 0)
+                    / total_bytes_per_bank,
+                    "overlap_bytes_per_bank": max(static_cb_end - l1_buffer_address, 0),
+                    "overlap_pct_per_bank": 100.0 * max(static_cb_end - l1_buffer_address, 0) / total_bytes_per_bank,
+                }
+            )
+        elif returncode != 0:
+            probe["failure_reason"] = "other_failure"
+        results.append(probe)
+
+    passed_windows = [item["window"] for item in results if item["passed"]]
+    failed_windows = [item["window"] for item in results if not item["passed"]]
+    first_clash = next((item for item in results if item.get("failure_reason") == "static_cb_l1_clash"), None)
+
+    return {
+        "probe_values": probe_values,
+        "max_passing_window": max(passed_windows) if passed_windows else None,
+        "min_failing_window": min(failed_windows) if failed_windows else None,
+        "first_static_cb_clash": first_clash,
+        "results": results,
+    }
+
+
+def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window, real_window_probe):
     lines = [
         "# L1 Memory Usage Comparison",
         "",
@@ -98,6 +181,19 @@ def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window):
         ("Per-bank free %", "per_bank_free_pct", True),
         ("Per-bank largest contiguous free %", "per_bank_largest_contiguous_free_pct", True),
     ]
+
+    if dual_snapshot.get("allocator_num_allocated_blocks", 0) or dram_snapshot.get("allocator_num_allocated_blocks", 0):
+        metric_rows.extend(
+            [
+                ("Allocator top-down reserved bytes per bank", "allocator_top_down_reserved_bytes_per_bank", False),
+                (
+                    "Allocator highest allocated end address per bank",
+                    "allocator_highest_allocated_end_address_per_bank",
+                    False,
+                ),
+                ("Allocator largest block bytes per bank", "allocator_largest_allocated_block_bytes_per_bank", False),
+            ]
+        )
 
     for label, key, is_pct in metric_rows:
         dual_value = dual_snapshot[key]
@@ -121,10 +217,46 @@ def write_summary(path, dual_snapshot, dram_snapshot, dual_window, dram_window):
             f"| Max `l1_kv_window_size` from largest interleavable free | {dual_window['max_window_size_from_largest_interleavable_free']} | {dram_window['max_window_size_from_largest_interleavable_free']} |",
             f"| Max `l1_kv_window_size` from safe interleavable free | {dual_window['max_window_size_from_safe_interleavable_free']} | {dram_window['max_window_size_from_safe_interleavable_free']} |",
             "",
-            "The `largest interleavable free` estimate is usually the most realistic upper bound.",
-            "The `safe interleavable free` number applies the configured safety margin and is the best starting point for experiments.",
+            "These bounds come from allocator-visible `get_memory_view()` state only.",
+            "They can significantly overestimate the real decode-time limit because static circular buffers are typically not allocator-managed.",
         ]
     )
+
+    if dual_snapshot.get("captures_allocator_state_only"):
+        lines.extend(
+            [
+                "",
+                "## Allocator Caveat",
+                "",
+                "- `get_memory_view()` reports allocator-managed L1 state.",
+                "- Static circular buffers are typically not allocator-managed and are not fully reflected in these free-space numbers.",
+                f"- Snapshot note: `{dual_snapshot.get('allocator_note', '')}`",
+            ]
+        )
+
+    if real_window_probe:
+        lines.extend(
+            [
+                "",
+                "## Real Window Probe",
+                "",
+                f"- Max passing `l1_kv_window_size`: `{real_window_probe['max_passing_window']}`",
+                f"- Min failing `l1_kv_window_size`: `{real_window_probe['min_failing_window']}`",
+            ]
+        )
+        first_clash = real_window_probe.get("first_static_cb_clash")
+        if first_clash:
+            lines.extend(
+                [
+                    f"- First observed failure reason: `{first_clash['failure_reason']}`",
+                    f"- Static CB end address on constraining cores: `{first_clash['static_circular_buffer_end_address_per_bank']}`",
+                    f"- Inferred runtime SRAM already occupied by static CBs on constraining cores: `{first_clash['static_cb_occupied_bytes_per_bank']}` bytes ({first_clash['static_cb_occupied_pct_per_bank']:.2f}%)",
+                    f"- Requested L1 buffer start address on constraining cores: `{first_clash['l1_buffer_allocated_address_per_bank']}`",
+                    f"- Real top-of-bank headroom on constraining cores: `{first_clash['effective_headroom_bytes_per_bank']}` bytes ({first_clash['effective_headroom_pct_per_bank']:.2f}%)",
+                    f"- Requested buffer bytes on constraining cores: `{first_clash['requested_l1_buffer_bytes_per_bank']}` bytes ({first_clash['requested_l1_buffer_pct_per_bank']:.2f}%)",
+                    f"- Observed overlap on constraining cores: `{first_clash['overlap_bytes_per_bank']}` bytes ({first_clash['overlap_pct_per_bank']:.2f}%)",
+                ]
+            )
 
     path.write_text("\n".join(lines) + "\n")
 
@@ -136,6 +268,16 @@ def main():
     parser.add_argument("--working-directory", default=".", help="Working directory for both commands.")
     parser.add_argument("--output-dir", default="research_codes/l1_memory_compare", help="Directory for outputs.")
     parser.add_argument("--snapshot-label", default="after_model_load", help="Snapshot label to compare.")
+    parser.add_argument(
+        "--real-window-cmd-template",
+        default=None,
+        help="Optional shell command template used to probe the real pass/fail window. Use {window} as the placeholder.",
+    )
+    parser.add_argument(
+        "--real-window-values",
+        default="",
+        help="Comma-separated l1_kv_window_size values to probe with --real-window-cmd-template.",
+    )
     parser.add_argument("--batch-size-per-device-group", type=int, default=1)
     parser.add_argument("--num-local-kv-heads", type=int, required=True)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -165,17 +307,24 @@ def main():
 
     dual_window = summarize_window(dual_snapshot, args)
     dram_window = summarize_window(dram_snapshot, args)
+    real_window_probe = probe_real_window_limit(
+        args.real_window_cmd_template,
+        parse_probe_values(args.real_window_values),
+        args.working_directory,
+        dual_snapshot["total_bytes_per_bank"],
+    )
 
     report = {
         "inputs": vars(args),
         "dual_source": {"snapshot": dual_snapshot, "window_estimate": dual_window},
         "dram_only": {"snapshot": dram_snapshot, "window_estimate": dram_window},
+        "real_window_probe": real_window_probe,
     }
 
     json_path = output_dir / "comparison.json"
     md_path = output_dir / "summary.md"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    write_summary(md_path, dual_snapshot, dram_snapshot, dual_window, dram_window)
+    write_summary(md_path, dual_snapshot, dram_snapshot, dual_window, dram_window, real_window_probe)
     print(md_path)
 
 

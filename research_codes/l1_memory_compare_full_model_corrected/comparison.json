@@ -1,0 +1,137 @@
+{
+  "dram_only": {
+    "snapshot": {
+      "allocator_highest_allocated_end_address_per_bank": 0,
+      "allocator_largest_allocated_block_bytes_per_bank": 0,
+      "allocator_lowest_allocated_address_per_bank": 1470080,
+      "allocator_note": "Static circular buffers are typically not allocator-managed and are not fully reflected in get_memory_view().",
+      "allocator_num_allocated_blocks": 0,
+      "allocator_num_free_blocks": 38,
+      "allocator_top_down_reserved_bytes_per_bank": 0,
+      "captures_allocator_state_only": true,
+      "chip_total_allocatable_bytes": 191110400,
+      "chip_total_allocated_bytes": 565760,
+      "chip_total_free_bytes": 190544640,
+      "label": "after_inference",
+      "largest_contiguous_bytes_free_per_bank": 1465728,
+      "largest_interleavable_free_bytes_estimate": 190544640,
+      "num_banks": 130,
+      "per_bank_allocated_pct": 0.29603831084022636,
+      "per_bank_free_pct": 99.70396168915977,
+      "per_bank_largest_contiguous_free_pct": 99.70396168915977,
+      "total_bytes_allocated_per_bank": 4352,
+      "total_bytes_free_per_bank": 1465728,
+      "total_bytes_per_bank": 1470080
+    },
+    "window_estimate": {
+      "bytes_per_kv_token_all_layers": 65536.0,
+      "bytes_per_kv_token_per_layer": 2048.0,
+      "max_total_l1_tokens_from_largest_interleavable_free": 2880,
+      "max_total_l1_tokens_from_safe_interleavable_free": 2592,
+      "max_total_l1_tokens_from_total_free_bytes": 2880,
+      "max_window_size_from_largest_interleavable_free": 2880,
+      "max_window_size_from_safe_interleavable_free": 2592,
+      "max_window_size_from_total_free_bytes": 2880
+    }
+  },
+  "dual_source": {
+    "snapshot": {
+      "allocator_highest_allocated_end_address_per_bank": 0,
+      "allocator_largest_allocated_block_bytes_per_bank": 0,
+      "allocator_lowest_allocated_address_per_bank": 1470080,
+      "allocator_note": "Static circular buffers are typically not allocator-managed and are not fully reflected in get_memory_view().",
+      "allocator_num_allocated_blocks": 0,
+      "allocator_num_free_blocks": 102,
+      "allocator_top_down_reserved_bytes_per_bank": 0,
+      "captures_allocator_state_only": true,
+      "chip_total_allocatable_bytes": 191110400,
+      "chip_total_allocated_bytes": 9617920,
+      "chip_total_free_bytes": 181492480,
+      "label": "after_inference",
+      "largest_contiguous_bytes_free_per_bank": 1396096,
+      "largest_interleavable_free_bytes_estimate": 181492480,
+      "num_banks": 130,
+      "per_bank_allocated_pct": 5.0326512842838484,
+      "per_bank_free_pct": 94.96734871571616,
+      "per_bank_largest_contiguous_free_pct": 94.96734871571616,
+      "total_bytes_allocated_per_bank": 73984,
+      "total_bytes_free_per_bank": 1396096,
+      "total_bytes_per_bank": 1470080
+    },
+    "window_estimate": {
+      "bytes_per_kv_token_all_layers": 65536.0,
+      "bytes_per_kv_token_per_layer": 2048.0,
+      "max_total_l1_tokens_from_largest_interleavable_free": 2752,
+      "max_total_l1_tokens_from_safe_interleavable_free": 2464,
+      "max_total_l1_tokens_from_total_free_bytes": 2752,
+      "max_window_size_from_largest_interleavable_free": 2752,
+      "max_window_size_from_safe_interleavable_free": 2464,
+      "max_window_size_from_total_free_bytes": 2752
+    }
+  },
+  "inputs": {
+    "batch_size_per_device_group": 1,
+    "dram_only_cmd": "pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size 0",
+    "dual_source_cmd": "pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size 128",
+    "head_dim": 128,
+    "kv_dtype": "bfloat8_b",
+    "l1_kv_sink_size": 0,
+    "num_layers": 32,
+    "num_local_kv_heads": 8,
+    "output_dir": "research_codes/l1_memory_compare_full_model_corrected",
+    "real_window_cmd_template": "pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 2 --stop_at_eos 0 --l1_kv_window_size {window}",
+    "real_window_values": "512,544",
+    "safety_margin": 0.9,
+    "snapshot_label": "after_inference",
+    "tile_size": 32,
+    "working_directory": "/home/masterjunmo/codes/tt-metal"
+  },
+  "real_window_probe": {
+    "first_static_cb_clash": {
+      "effective_headroom_bytes_per_bank": 220416,
+      "effective_headroom_pct_per_bank": 14.99346974314323,
+      "failure_reason": "static_cb_l1_clash",
+      "l1_buffer_allocated_address_per_bank": 1220352,
+      "overlap_bytes_per_bank": 29312,
+      "overlap_pct_per_bank": 1.9939050936003482,
+      "passed": false,
+      "requested_l1_buffer_bytes_per_bank": 249728,
+      "requested_l1_buffer_pct_per_bank": 16.98737483674358,
+      "returncode": 1,
+      "static_cb_occupied_bytes_per_bank": 1249664,
+      "static_cb_occupied_pct_per_bank": 85.00653025685676,
+      "static_circular_buffer_end_address_per_bank": 1249664,
+      "window": 544
+    },
+    "max_passing_window": 512,
+    "min_failing_window": 544,
+    "probe_values": [
+      512,
+      544
+    ],
+    "results": [
+      {
+        "failure_reason": null,
+        "passed": true,
+        "returncode": 0,
+        "window": 512
+      },
+      {
+        "effective_headroom_bytes_per_bank": 220416,
+        "effective_headroom_pct_per_bank": 14.99346974314323,
+        "failure_reason": "static_cb_l1_clash",
+        "l1_buffer_allocated_address_per_bank": 1220352,
+        "overlap_bytes_per_bank": 29312,
+        "overlap_pct_per_bank": 1.9939050936003482,
+        "passed": false,
+        "requested_l1_buffer_bytes_per_bank": 249728,
+        "requested_l1_buffer_pct_per_bank": 16.98737483674358,
+        "returncode": 1,
+        "static_cb_occupied_bytes_per_bank": 1249664,
+        "static_cb_occupied_pct_per_bank": 85.00653025685676,
+        "static_circular_buffer_end_address_per_bank": 1249664,
+        "window": 544
+      }
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+[
+  {
+    "window": 576,
+    "returncode": 1,
+    "duration_sec": 28.14,
+    "passed": false,
+    "interesting": [
+      "\u001b[90m2026-03-16 04:18:26.899\u001b[0m | critical | \u001b[35m         Always\u001b[0m | \u001b[37mStatically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664\u001b[0m \u001b[90m(assert.hpp:103)\u001b[0m",
+      "FAILED",
+      "E           Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664",
+      "FAILED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-1-device_params0-performance-batch-1] - RuntimeError: TT_THROW @ /home/masterjunmo/codes/tt-metal/tt_metal/impl/program/program.cpp:911: tt::exception",
+      "Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664"
+    ]
+  },
+  {
+    "window": 640,
+    "returncode": 1,
+    "duration_sec": 28.2,
+    "passed": false,
+    "interesting": [
+      "\u001b[90m2026-03-16 04:18:55.040\u001b[0m | critical | \u001b[35m         Always\u001b[0m | \u001b[37mStatically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664\u001b[0m \u001b[90m(assert.hpp:103)\u001b[0m",
+      "FAILED",
+      "E           Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664",
+      "FAILED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-1-device_params0-performance-batch-1] - RuntimeError: TT_THROW @ /home/masterjunmo/codes/tt-metal/tt_metal/impl/program/program.cpp:911: tt::exception",
+      "Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1220352 and static circular buffer region ends at 1249664"
+    ]
+  },
+  {
+    "window": 672,
+    "returncode": 1,
+    "duration_sec": 31.4,
+    "passed": false,
+    "interesting": [
+      "\u001b[90m2026-03-16 04:19:26.463\u001b[0m | critical | \u001b[35m         Always\u001b[0m | \u001b[37mStatically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664\u001b[0m \u001b[90m(assert.hpp:103)\u001b[0m",
+      "FAILED",
+      "E           Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664",
+      "FAILED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-1-device_params0-performance-batch-1] - RuntimeError: TT_THROW @ /home/masterjunmo/codes/tt-metal/tt_metal/impl/program/program.cpp:911: tt::exception",
+      "Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664"
+    ]
+  },
+  {
+    "window": 704,
+    "returncode": 1,
+    "duration_sec": 31.31,
+    "passed": false,
+    "interesting": [
+      "\u001b[90m2026-03-16 04:19:57.721\u001b[0m | critical | \u001b[35m         Always\u001b[0m | \u001b[37mStatically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664\u001b[0m \u001b[90m(assert.hpp:103)\u001b[0m",
+      "FAILED",
+      "E           Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664",
+      "FAILED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-1-device_params0-performance-batch-1] - RuntimeError: TT_THROW @ /home/masterjunmo/codes/tt-metal/tt_metal/impl/program/program.cpp:911: tt::exception",
+      "Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664"
+    ]
+  },
+  {
+    "window": 736,
+    "returncode": 1,
+    "duration_sec": 28.72,
+    "passed": false,
+    "interesting": [
+      "\u001b[90m2026-03-16 04:20:26.490\u001b[0m | critical | \u001b[35m         Always\u001b[0m | \u001b[37mStatically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664\u001b[0m \u001b[90m(assert.hpp:103)\u001b[0m",
+      "FAILED",
+      "E           Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664",
+      "FAILED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-1-device_params0-performance-batch-1] - RuntimeError: TT_THROW @ /home/masterjunmo/codes/tt-metal/tt_metal/impl/program/program.cpp:911: tt::exception",
+      "Statically allocated circular buffers in program 5 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=0)]. L1 buffer allocated at 1150720 and static circular buffer region ends at 1249664"
+    ]
+  }
+]

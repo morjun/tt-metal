@@ -1,0 +1,71 @@
+{
+  "dram_only": {
+    "snapshot": {
+      "chip_total_allocatable_bytes": 191110400,
+      "chip_total_allocated_bytes": 565760,
+      "chip_total_free_bytes": 190544640,
+      "label": "after_model_load",
+      "largest_contiguous_bytes_free_per_bank": 1465728,
+      "largest_interleavable_free_bytes_estimate": 190544640,
+      "num_banks": 130,
+      "per_bank_allocated_pct": 0.29603831084022636,
+      "per_bank_free_pct": 99.70396168915977,
+      "per_bank_largest_contiguous_free_pct": 99.70396168915977,
+      "total_bytes_allocated_per_bank": 4352,
+      "total_bytes_free_per_bank": 1465728,
+      "total_bytes_per_bank": 1470080
+    },
+    "window_estimate": {
+      "bytes_per_kv_token_all_layers": 65536.0,
+      "bytes_per_kv_token_per_layer": 2048.0,
+      "max_total_l1_tokens_from_largest_interleavable_free": 2880,
+      "max_total_l1_tokens_from_safe_interleavable_free": 2592,
+      "max_total_l1_tokens_from_total_free_bytes": 2880,
+      "max_window_size_from_largest_interleavable_free": 2880,
+      "max_window_size_from_safe_interleavable_free": 2592,
+      "max_window_size_from_total_free_bytes": 2880
+    }
+  },
+  "dual_source": {
+    "snapshot": {
+      "chip_total_allocatable_bytes": 191110400,
+      "chip_total_allocated_bytes": 9617920,
+      "chip_total_free_bytes": 181492480,
+      "label": "after_model_load",
+      "largest_contiguous_bytes_free_per_bank": 1396096,
+      "largest_interleavable_free_bytes_estimate": 181492480,
+      "num_banks": 130,
+      "per_bank_allocated_pct": 5.0326512842838484,
+      "per_bank_free_pct": 94.96734871571616,
+      "per_bank_largest_contiguous_free_pct": 94.96734871571616,
+      "total_bytes_allocated_per_bank": 73984,
+      "total_bytes_free_per_bank": 1396096,
+      "total_bytes_per_bank": 1470080
+    },
+    "window_estimate": {
+      "bytes_per_kv_token_all_layers": 65536.0,
+      "bytes_per_kv_token_per_layer": 2048.0,
+      "max_total_l1_tokens_from_largest_interleavable_free": 2752,
+      "max_total_l1_tokens_from_safe_interleavable_free": 2464,
+      "max_total_l1_tokens_from_total_free_bytes": 2752,
+      "max_window_size_from_largest_interleavable_free": 2752,
+      "max_window_size_from_safe_interleavable_free": 2464,
+      "max_window_size_from_total_free_bytes": 2752
+    }
+  },
+  "inputs": {
+    "batch_size_per_device_group": 1,
+    "dram_only_cmd": "pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 4 --stop_at_eos 0 --l1_kv_window_size 0",
+    "dual_source_cmd": "pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and batch-1\" --max_generated_tokens 4 --stop_at_eos 0 --l1_kv_window_size 128",
+    "head_dim": 128,
+    "kv_dtype": "bfloat8_b",
+    "l1_kv_sink_size": 0,
+    "num_layers": 32,
+    "num_local_kv_heads": 8,
+    "output_dir": "research_codes/l1_memory_compare_full_model",
+    "safety_margin": 0.9,
+    "snapshot_label": "after_model_load",
+    "tile_size": 32,
+    "working_directory": "/home/masterjunmo/codes/tt-metal"
+  }
+}

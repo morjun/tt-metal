@@ -3,9 +3,11 @@
 ## Executive Summary
 
 - Yes: the "L1 KV mirror" means our extra L1-resident KV ring buffer in `models/tt_transformers/tt/attention.py`, not the native SDPA circular buffers.
+- For the current Llama 3.1 8B P150 path, `KV_CACHE` resolves to `bfloat8_b`, so the working mirror arithmetic here uses `1 byte / logical KV element`, not `2 bytes / element` as it would for `bfloat16`.
 - In decode, the native SDPA circular-buffer footprint is essentially the same in both DRAM-only and dual-source modes.
 - The current dual-source design adds the L1 KV mirror on top of the native circular buffers. It does not replace them.
-- For the current Blackhole decode configuration, the native SDPA circular buffers are about `248 KiB` per active core, while the current `l1_kv_window_size=128` mirror is about `256 KiB` per layer.
+- For the current Blackhole decode configuration, the native SDPA circular buffers are about `248 KiB` per active core, while the current `l1_kv_window_size=128` mirror is about `256 KiB` per layer in the single-device no-sink case.
+- The current implementation allocates one L1 sink/ring mirror inside every decoder layer's `Attention` module, so the full-model persistent mirror cost is the per-layer cost multiplied by the number of resident layers.
 - The first profiling report in `research_codes/l1_kv_perf/summary.md` is a workload-average over all decode calls, not a steady-state per-token number. Its large `46-50 ms` L1-path averages are dominated by one expensive first decode iteration.
 - After removing that first-call spike, the steady-state overhead in the 1-layer microbenchmark is only about `0.27 ms / layer / token`. Multiplying that by roughly `32` layers gives about `8.7 ms / token`, which is consistent with the roughly `10 ms / token` slowdown observed in full `simple_text_demo`.
 
@@ -59,33 +61,100 @@ The current dual-source implementation allocates an extra persistent L1 cache:
 
 This is the "ring buffer as KV mirror" in `attention.py`.
 
-Its persistent size is:
+Its per-layer per-device persistent size is:
 
 ```text
-2 * batch * num_kv_heads * total_l1_tokens * head_dim * bytes_per_element
+2 * batch_size_per_device_group * n_local_kv_heads * total_l1_tokens * head_dim * bytes_per_element
 ```
 
 where:
 
 - `2` is K + V
 - `total_l1_tokens = l1_kv_sink_size + l1_kv_window_size`
+- `n_local_kv_heads` is the number of KV heads stored on this device for this layer
 
-For the current example:
+For the current single-device example:
 
-- `batch = 1`
-- `num_kv_heads = 8`
+- `batch_size_per_device_group = 1`
+- `n_local_kv_heads = 8`
 - `head_dim = 128`
 - `l1_kv_sink_size = 0`
 - `l1_kv_window_size = 128`
 - `kv dtype = bfloat8_b = 1 byte / element`
 
-the mirror size is:
+the per-layer per-device mirror size is:
 
 ```text
 2 * 1 * 8 * 128 * 128 * 1 = 262,144 B = 256 KiB = 0.25 MiB
 ```
 
 This matches `research_codes/l1_kv_sram_report.md`.
+
+### 1.3 Element Size Specification
+
+For the current Llama 3.1 8B path, the KV cache dtype is `bfloat8_b`.
+
+This is not an assumption added by this document. It follows the decoder precision settings in `model_config.py`, where the current Llama/Mistral/Phi3 defaults set:
+
+- `TensorGroup.KV_CACHE: PrecisionSetting.BFP8`
+
+So the working byte model in this note is:
+
+- `bfloat8_b`: `1 byte / logical element`
+- `bfloat16`: `2 bytes / logical element`
+
+That is why the mirror formulas here use `1`, not `2`.
+
+If the model were configured with `KV_CACHE = BF16`, all mirror-byte estimates in this document would double.
+
+There is also a tile-level view:
+
+- one tile contains `32 x 32 = 1024` logical elements
+- `bfloat8_b` tile payload is therefore about `1024` bytes
+- `bfloat16` tile payload is therefore about `2048` bytes
+
+The mirror formulas in this document are written in element space, while some circular-buffer formulas are written in tile space.
+
+### 1.4 Per-Layer Versus All-Layers
+
+The current implementation does **not** pin only one decoder layer.
+
+The model construction flow is:
+
+- `Transformer` builds `self.layers = [TransformerBlock(...)]` for all `n_layers`
+- every `TransformerBlock` creates its own `Attention(...)`
+- every `Attention` with `l1_kv_total_size > 0` allocates its own `self.l1_kv_cache`
+
+So the sink/ring mirror is instantiated separately in every decoder layer.
+
+That means the full-model per-device persistent mirror cost is:
+
+```text
+all_layers_per_device_bytes =
+    n_layers *
+    2 *
+    batch_size_per_device_group *
+    n_local_kv_heads *
+    total_l1_tokens *
+    head_dim *
+    bytes_per_element
+```
+
+For the current single-device 32-layer no-sink example:
+
+```text
+32 * 2 * 1 * 8 * 128 * 128 * 1
+= 8,388,608 B
+= 8.0 MiB
+```
+
+For the current single-device 32-layer sink-enabled example with `sink=32` and `window=128`:
+
+```text
+32 * 2 * 1 * 8 * 160 * 128 * 1
+= 10,485,760 B
+= 10.0 MiB
+```
 
 ## 2. DRAM-Only Versus Dual-Source SRAM Comparison
 
@@ -427,6 +496,14 @@ This is the quickest way to ask:
 - how much of that is currently allocated?
 - how much contiguous headroom remains?
 
+Important limitation:
+
+- this is an **allocator-visible** view of L1
+- it is **not** a full runtime accounting of all SRAM consumers
+- in particular, static circular buffers are typically not allocator-managed, so they are not fully reflected in these numbers
+
+That is why a DRAM-only decode snapshot can misleadingly show almost no allocated L1 even though the decode program is already consuming substantial SRAM through static CB placement.
+
 #### B. Full memory dump reports
 
 Use:
@@ -445,6 +522,44 @@ These are better when you want:
 - bank-by-bank usage
 - fragmentation analysis
 - a saved artifact for comparing DRAM-only vs dual-source runs
+
+Important limitation:
+
+- these reports are generated from the same allocator state
+- they still do **not** directly expose full static-CB occupancy
+- so they should be treated as allocator reports, not complete runtime SRAM utilization reports
+
+### 9.2.1 What The Earlier `99.70% Free` Actually Meant
+
+The earlier DRAM-only report showing about `99.70%` free L1 did **not** mean decode was barely using SRAM.
+
+It meant:
+
+- allocator-managed persistent L1 buffers were tiny in that configuration
+- and the profiling path was not counting most of the native static circular-buffer footprint
+
+The corrected real-window probe makes that visible.
+
+For the constraining decode cores in the failing `l1_kv_window_size=544` run:
+
+- total bytes per bank: `1,470,080`
+- static circular-buffer region end: `1,249,664`
+
+So the native decode path had already consumed:
+
+```text
+1,249,664 / 1,470,080 = 0.8501 ~= 85.0%
+```
+
+of the worker-bank address space before the extra L1 KV mirror was placed.
+
+Equivalently, the real remaining top-of-bank headroom on those cores was only:
+
+```text
+1,470,080 - 1,249,664 = 220,416 B
+```
+
+That is why the extra mirror fails much earlier than the allocator-only free-space estimate suggests.
 
 ### 9.3 What Percentages Make Sense?
 
@@ -493,6 +608,12 @@ So for our L1-KV work, the best hierarchy is:
 2. largest free block on participating banks
 3. chip-wide summed percentage
 
+In the current Llama 3.1 8B P150 decode path, the real bottleneck is exactly this kind of participating-core limit:
+
+- the public allocator view still shows `99.70%` free in DRAM-only mode
+- but the real decode-time limit is set by the worker-bank region where static CBs end at `1,249,664`
+- therefore the current practical max passing `l1_kv_window_size` is `512`, while `544` already fails with a CB/L1 overlap
+
 ### 9.5 Minimal Example
 
 The following code is enough to snapshot current L1 allocation after model load or after a decode step:
@@ -531,10 +652,86 @@ To compare DRAM-only and dual-source accurately, the most useful measurement pla
 2. Capture `get_memory_view(..., BufferType.L1)` immediately after decode.
 3. Dump `dump_device_memory_state(..., prefix="dram_only_...")`.
 4. Repeat for dual-source.
-5. Compare:
+5. Run a small real-window pass/fail probe around the expected limit.
+6. Compare:
    - allocated bytes per bank
    - largest contiguous free bytes per bank
    - chip-total allocated percentage
-   - detailed block tables on the participating decode banks
+   - real pass/fail window boundary
+   - static-CB clash address, if failure occurs
 
 That will tell us not only "how much SRAM is used", but also whether the current KV mirror is consuming the exact scarce per-core headroom that the native decode path wants for its own staging and future optimizations.
+
+### 9.7 What Is The Best "Real Runtime Utilization" Metric Available Today?
+
+Today, there is **not** a single public TTNN API that returns complete runtime SRAM utilization including static circular buffers for a running decode program.
+
+So the best practical hierarchy is:
+
+1. **Allocator-visible runtime snapshot**
+   - from `ttnn.get_memory_view(...)`
+   - useful for persistent L1 tensors and fragmentation
+   - incomplete for static CBs
+2. **Real workload pass/fail probe**
+   - run the actual workload while sweeping `l1_kv_window_size`
+   - if a failure occurs, capture the CB/L1 overlap address from the runtime error
+   - this gives a real measured bottleneck on the participating cores
+3. **Kernel/program analysis**
+   - use the decode program configuration and CB formulas to explain why the bottleneck exists
+
+So the answer to "is only allocator view available?" is:
+
+- allocator view is the only simple public snapshot API
+- but it is **not** the only usable real measurement
+- the most trustworthy real measurement today is workload execution plus the observed pass/fail boundary and overlap address
+
+## 10. Maximum `l1_kv_window_size` Must Be Computed Across All Layers
+
+Because the current implementation allocates one mirror per decoder layer, the maximum feasible window must be estimated from the **all-layers** per-token cost, not the single-layer cost.
+
+For one extra cached token on one device, the full-model byte cost is:
+
+```text
+per_token_all_layers_per_device_bytes =
+    n_layers *
+    2 *
+    batch_size_per_device_group *
+    n_local_kv_heads *
+    head_dim *
+    bytes_per_element
+```
+
+For the current single-device 32-layer Llama 3.1 8B case:
+
+```text
+32 * 2 * 1 * 8 * 128 * 1 = 65,536 B / token
+```
+
+That is the correct number to divide into free/interleavable L1 when estimating the maximum window.
+
+So the practical estimate is:
+
+```text
+max_total_l1_tokens_per_device
+    ~= floor(
+        largest_interleavable_free_bytes_estimate /
+        (n_layers * 2 * batch_size_per_device_group * n_local_kv_heads * head_dim * bytes_per_element)
+       )
+```
+
+and then:
+
+```text
+max_l1_kv_window_size
+    = max_total_l1_tokens_per_device - l1_kv_sink_size
+```
+
+rounded down to the implementation's tile granularity.
+
+For the current single-device snapshot discussed in this project:
+
+- whole-model per-token mirror cost is `65,536 B / token`
+- realistic upper bound is on the order of `2880` tokens
+- a safer starting point with margin is on the order of `2592` tokens
+
+This is the right order of magnitude for the current implementation. Earlier estimates in the tens of thousands of tokens were single-layer estimates and therefore too optimistic.

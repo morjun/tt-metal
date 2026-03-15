@@ -201,6 +201,24 @@ def _summarize_l1_memory_view(device):
     chip_allocated_bytes = int(view.num_banks * view.total_bytes_allocated_per_bank)
     chip_free_bytes = int(view.num_banks * view.total_bytes_free_per_bank)
     largest_interleavable_free_bytes_estimate = int(view.num_banks * view.largest_contiguous_bytes_free_per_bank)
+    allocated_blocks = []
+
+    for block in view.block_table:
+        try:
+            address = int(block.get("address", "0"))
+            size = int(block.get("size", "0"))
+            allocated = str(block.get("allocated", "")).lower() in {"yes", "true", "1"}
+        except (TypeError, ValueError):
+            continue
+
+        record = {"address": address, "size": size}
+        if allocated:
+            allocated_blocks.append(record)
+
+    highest_allocated_end_address = max((block["address"] + block["size"] for block in allocated_blocks), default=0)
+    lowest_allocated_address = min((block["address"] for block in allocated_blocks), default=view.total_bytes_per_bank)
+    allocator_top_down_reserved_bytes = max(int(view.total_bytes_per_bank) - int(lowest_allocated_address), 0)
+    largest_allocated_block_bytes = max((block["size"] for block in allocated_blocks), default=0)
 
     per_bank_allocated_pct = (
         100.0 * view.total_bytes_allocated_per_bank / view.total_bytes_per_bank if view.total_bytes_per_bank else 0.0
@@ -227,6 +245,13 @@ def _summarize_l1_memory_view(device):
         "per_bank_allocated_pct": per_bank_allocated_pct,
         "per_bank_free_pct": per_bank_free_pct,
         "per_bank_largest_contiguous_free_pct": per_bank_largest_free_pct,
+        "allocator_num_allocated_blocks": len(allocated_blocks),
+        "allocator_highest_allocated_end_address_per_bank": int(highest_allocated_end_address),
+        "allocator_lowest_allocated_address_per_bank": int(lowest_allocated_address),
+        "allocator_top_down_reserved_bytes_per_bank": int(allocator_top_down_reserved_bytes),
+        "allocator_largest_allocated_block_bytes_per_bank": int(largest_allocated_block_bytes),
+        "captures_allocator_state_only": True,
+        "allocator_note": "Static circular buffers are typically not allocator-managed and are not fully reflected in get_memory_view(). block_table contains allocator-managed allocated blocks only.",
     }
 
 

@@ -1,0 +1,32 @@
+[
+  {
+    "chip_total_allocatable_bytes": 191110400,
+    "chip_total_allocated_bytes": 565760,
+    "chip_total_free_bytes": 190544640,
+    "label": "after_model_load",
+    "largest_contiguous_bytes_free_per_bank": 1465728,
+    "largest_interleavable_free_bytes_estimate": 190544640,
+    "num_banks": 130,
+    "per_bank_allocated_pct": 0.29603831084022636,
+    "per_bank_free_pct": 99.70396168915977,
+    "per_bank_largest_contiguous_free_pct": 99.70396168915977,
+    "total_bytes_allocated_per_bank": 4352,
+    "total_bytes_free_per_bank": 1465728,
+    "total_bytes_per_bank": 1470080
+  },
+  {
+    "chip_total_allocatable_bytes": 191110400,
+    "chip_total_allocated_bytes": 565760,
+    "chip_total_free_bytes": 190544640,
+    "label": "after_inference",
+    "largest_contiguous_bytes_free_per_bank": 1465728,
+    "largest_interleavable_free_bytes_estimate": 190544640,
+    "num_banks": 130,
+    "per_bank_allocated_pct": 0.29603831084022636,
+    "per_bank_free_pct": 99.70396168915977,
+    "per_bank_largest_contiguous_free_pct": 99.70396168915977,
+    "total_bytes_allocated_per_bank": 4352,
+    "total_bytes_free_per_bank": 1465728,
+    "total_bytes_per_bank": 1470080
+  }
+]
