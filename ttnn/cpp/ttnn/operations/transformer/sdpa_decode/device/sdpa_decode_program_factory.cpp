@@ -673,9 +673,9 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
              cb_c26 = out_im_tiles * im_tile_size, cb_c27 = statistics_tiles * stats_tile_size,
              cb_c28 = statistics_tiles * stats_tile_size, cb_c29 = statistics_tiles * stats_tile_size,
              cb_c30 = statistics_tiles * stats_tile_size, cb_c31 = statistics_tiles * stats_tile_size;
-    uint32_t cb_total = cb_c0 + cb_c1 + cb_c2 + cb_c3 + cb_c5 + cb_c6 + cb_c7 + cb_c10 + cb_c11 + cb_c12 + cb_c16 +
-                        cb_c17 + cb_c18 + cb_c20 + cb_c21 + cb_c22 + cb_c23 + cb_c24 + cb_c25 + cb_c26 + cb_c27 +
-                        cb_c28 + cb_c29 + cb_c30 + cb_c31;
+    [[maybe_unused]] uint32_t cb_total = cb_c0 + cb_c1 + cb_c2 + cb_c3 + cb_c5 + cb_c6 + cb_c7 + cb_c10 + cb_c11 +
+                                         cb_c12 + cb_c16 + cb_c17 + cb_c18 + cb_c20 + cb_c21 + cb_c22 + cb_c23 +
+                                         cb_c24 + cb_c25 + cb_c26 + cb_c27 + cb_c28 + cb_c29 + cb_c30 + cb_c31;
     if (use_attention_sink) {
         cb_total += statistics_tiles * stats_tile_size;  // c_4
     }

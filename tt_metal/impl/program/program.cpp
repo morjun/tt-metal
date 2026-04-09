@@ -94,6 +94,47 @@ namespace {
 
 using namespace tt::tt_metal;
 
+bool should_log_l1_cb_map() {
+    static const bool enabled = std::getenv("TT_METAL_LOG_L1_CB_MAP") != nullptr;
+    return enabled;
+}
+
+std::string format_optional_addr(std::optional<DeviceAddr> addr) {
+    return addr.has_value() ? std::to_string(addr.value()) : "none";
+}
+
+template <typename CircularBufferAllocatorT>
+void log_l1_cb_map(
+    uint64_t program_id,
+    uint64_t program_runtime_id,
+    const CircularBufferAllocatorT& cb_allocator,
+    std::string_view phase,
+    uint64_t cb_region_end,
+    uint32_t max_l1_size,
+    std::optional<DeviceAddr> lowest_top_down_addr) {
+    if (!should_log_l1_cb_map()) {
+        return;
+    }
+
+    for (std::size_t y = cb_allocator.core_range.start_coord.y; y <= cb_allocator.core_range.end_coord.y; ++y) {
+        for (std::size_t x = cb_allocator.core_range.start_coord.x; x <= cb_allocator.core_range.end_coord.x; ++x) {
+            log_info(
+                tt::LogMetal,
+                "L1_CB_MAP program_id={} runtime_id={} phase={} core_range={} core=({}, {}) cb_region_end={} "
+                "max_l1_size={} lowest_top_down_addr={}",
+                program_id,
+                program_runtime_id,
+                phase,
+                cb_allocator.core_range.str(),
+                x,
+                y,
+                cb_region_end,
+                max_l1_size,
+                format_optional_addr(lowest_top_down_addr));
+        }
+    }
+}
+
 size_t get_ringbuffer_size(IDevice* device, HalProgrammableCoreType programmable_core_type) {
     if (programmable_core_type == HalProgrammableCoreType::TENSIX) {
         return device->allocator()->get_config().l1_unreserved_base -
@@ -878,6 +919,21 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
         circular_buffer->set_locally_allocated_address(computed_addr);
     }
     this->local_circular_buffer_allocation_needed_ = false;
+
+    const uint32_t max_l1_size = device->l1_size_per_core();
+    for (const CircularBufferAllocator& cb_allocator : this->cb_allocators_) {
+        if (cb_allocator.l1_regions.empty()) {
+            continue;
+        }
+        log_l1_cb_map(
+            this->id,
+            this->runtime_id,
+            cb_allocator,
+            "allocate",
+            cb_allocator.l1_regions.back().second,
+            max_l1_size,
+            std::nullopt);
+    }
 }
 
 void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device) {
@@ -893,6 +949,7 @@ void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device)
             continue;
         }
         uint64_t cb_region_end = cb_allocator.l1_regions.back().second;  // cb_allocator.get_cb_region_end();
+        log_l1_cb_map(this->id, this->runtime_id, cb_allocator, "validate", cb_region_end, max_l1_size, lowest_address);
         if (cb_region_end > max_l1_size) {
             TT_THROW(
                 "Statically allocated circular buffers on core range {} grow to {} B which is beyond max L1 size of {} "
