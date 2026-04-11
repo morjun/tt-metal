@@ -51,6 +51,7 @@ show_help() {
     echo "  --without-distributed            Disable distributed compute support (OpenMPI dependency). Enabled by default."
     echo "  --without-python-bindings        Disable Python bindings (ttnncpp will be available as standalone library, otherwise ttnn will include the cpp backend and the python bindings), Enabled by default"
     echo "  --enable-fake-kernels-target     Enable fake kernels target, to enable generation of compile_commands.json for the kernels to enable IDE support."
+    echo "  -j, --jobs N                     Number of parallel build jobs. Defaults to available_ram_gb/4 to avoid OOM kills."
 }
 
 clean() {
@@ -97,16 +98,18 @@ configure_only="OFF"
 enable_distributed="ON"
 with_python_bindings="ON"
 enable_fake_kernels_target="OFF"
+num_jobs=""
 
 declare -a cmake_args
 
-OPTIONS=h,e,c,t,a,m,s,u,b:
+OPTIONS=h,e,c,t,a,m,s,u,b:,j:
 LONGOPTIONS="
 help
 build-all
 export-compile-commands
 enable-ccache
 enable-time-trace
+jobs:
 build-type:
 disable-profiler
 install-prefix:
@@ -199,6 +202,8 @@ while true; do
             with_python_bindings="OFF";;
         --enable-fake-kernels-target)
             enable_fake_kernels_target="ON";;
+        -j|--jobs)
+            num_jobs="$2";shift;;
         --disable-unity-builds)
 	    unity_builds="OFF";;
         --disable-light-metal-trace)
@@ -420,6 +425,18 @@ fi
 
 # Build libraries and cpp tests
 if [ "$configure_only" = "OFF" ]; then
+    # Compute a memory-safe default for parallel jobs if not specified.
+    # clang++ with -O3 on large unity builds can use ~4GB each.
+    if [ -z "$num_jobs" ]; then
+        available_gb=$(free -g | awk '/^Mem:/{print $7}')
+        num_jobs=$(( available_gb / 4 ))
+        if [ "$num_jobs" -lt 1 ]; then
+            num_jobs=1
+        fi
+        echo "INFO: Parallel build jobs (auto): $num_jobs (based on ${available_gb}GB available RAM / 4GB per job)"
+    else
+        echo "INFO: Parallel build jobs: $num_jobs"
+    fi
     echo "INFO: Building Project"
-    cmake --build $build_dir --target $target
+    cmake --build $build_dir --target $target --parallel $num_jobs
 fi

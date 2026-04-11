@@ -162,3 +162,4 @@ tests/test_output_5.log
 tests/test_output.log
 research_codes/l1_cb_artifacts/*
 l1_cb_artifacts/
+l1_kv512_artifacts_v2/
