@@ -40,6 +40,7 @@ public:
 
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
+    ProgramId get_id() const;
 
     //////////////////////////////
     // Buffer related functions:
