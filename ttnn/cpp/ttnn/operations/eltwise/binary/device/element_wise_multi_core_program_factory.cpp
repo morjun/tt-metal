@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <string>
+#include <unordered_set>
 
 #include "binary_device_operation.hpp"
 #include "ttnn/operations/eltwise/binary/device/eltwise_multi_core_program_factory_common.hpp"
@@ -33,6 +34,13 @@ BinaryDeviceOperation::ElementWiseMultiCore::cached_program_t BinaryDeviceOperat
     auto fused_activations = operation_attributes.activations.value_or(EltwiseFusedActivations{});
 
     Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> binary_element_wise program id={}", pid);
+        }
+    }
 
     tt::DataFormat src0_cb_data_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
     uint32_t src0_single_tile_size = tt::tile_size(src0_cb_data_format);

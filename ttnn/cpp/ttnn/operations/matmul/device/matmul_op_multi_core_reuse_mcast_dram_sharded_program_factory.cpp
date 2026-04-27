@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/work_split.hpp>
 #include "ttnn/operation.hpp"
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
@@ -100,6 +102,13 @@ tt::tt_metal::operation::ProgramWithCallbacks create_program_dram_sharded(
     bool in1_transpose_tile = in1_tile.get_transpose_of_faces() && in1_tile.get_transpose_within_face();
 
     tt_metal::Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> matmul_dram_sharded program id={}", pid);
+        }
+    }
 
     uint32_t start_core_x = 0;
     uint32_t start_core_y = 0;
@@ -283,6 +292,23 @@ tt::tt_metal::operation::ProgramWithCallbacks create_program_dram_sharded(
     CoreRangeSet all_cores_in_rect_grid(bounding_box_set);
     std::vector<CoreCoord> all_cores_in_rect_grid_vec = corerange_to_cores(all_cores_in_rect_grid);
     log_debug(tt::LogOp, "bounding_box: {}", bounding_box);
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP") && bounding_box.end_coord.x > 7) {
+        log_info(
+            tt::LogOp,
+            ">>> matmul_dram_sharded wide-bbox: program_id={} M={} K={} N={} per_core_M={} per_core_N_storage={} "
+            "bbox=[({},{})..({},{})] storage_cores={}",
+            program.get_id(),
+            M,
+            K,
+            N,
+            per_core_M,
+            per_core_N_storage,
+            bounding_box.start_coord.x,
+            bounding_box.start_coord.y,
+            bounding_box.end_coord.x,
+            bounding_box.end_coord.y,
+            input_all_storage_cores.num_cores());
+    }
 
     // Mcast args
     auto in0_mcast_sender_semaphore_id = tt_metal::CreateSemaphore(program, all_cores_in_rect_grid, INVALID);

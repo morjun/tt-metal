@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "tt-metalium/buffer_types.hpp"
 #include "ttnn/operation.hpp"
@@ -1621,6 +1623,13 @@ tt::tt_metal::operation::ProgramWithCallbacks matmul_multi_core_reuse_mcast_2d_o
     std::optional<UnaryWithParam> fused_activation,
     bool untilize_out) {
     tt_metal::Program program{}; /* Create a program */
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> matmul_mcast_2d_optimized program id={}", pid);
+        }
+    }
     std::optional<ttnn::experimental::ccl::MatmulFusedOpSignaler> empty_fused_op_signaler;
 
     return matmul_multi_core_reuse_mcast_2d_optimized_(

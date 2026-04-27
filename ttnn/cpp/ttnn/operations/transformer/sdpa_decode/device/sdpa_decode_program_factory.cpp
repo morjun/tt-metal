@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <optional>
+#include <unordered_set>
 #include <string>
 
 #include <tt-metalium/buffer.hpp>
@@ -131,6 +132,13 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     log_debug(tt::LogOp, "k_chunk_size: {}", k_chunk_size);
 
     Program program = CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> sdpa_decode program id={}", pid);
+        }
+    }
 
     IDevice* device = input_tensor_q.device();
 

@@ -5,6 +5,7 @@
 #include "unary_sharded_program_factory.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/hal.hpp>
@@ -28,6 +29,13 @@ UnaryShardedProgramFactory::cached_program_t UnaryShardedProgramFactory::create(
     uint32_t packed_scalar1 = 0u;
     uint32_t packed_scalar2 = 0u;
     tt::tt_metal::Program program = CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> unary_sharded program id={}", pid);
+        }
+    }
 
     auto shard_spec = input.shard_spec().value();
     auto all_cores = shard_spec.grid;

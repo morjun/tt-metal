@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 ///
 #include <algorithm>
+#include <unordered_set>
 
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/buffer.hpp>
@@ -208,6 +209,13 @@ tt::tt_metal::operation::ProgramWithCallbacks all_gather_async_minimal_default(
     std::optional<uint32_t> num_buffers_per_channel,
     const bool reverse_order) {
     tt::tt_metal::Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> all_gather_async program id={}", pid);
+        }
+    }
     std::optional<experimental::ccl::AllGatherFusedOpSignaler> empty_fused_op_signaler;
     return all_gather_async_minimal_default_helper(
         program,

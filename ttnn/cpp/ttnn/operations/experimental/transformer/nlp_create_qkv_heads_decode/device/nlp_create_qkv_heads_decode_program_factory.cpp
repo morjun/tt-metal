@@ -2,9 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include "nlp_create_qkv_heads_decode_device_operation.hpp"
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 
@@ -63,6 +65,13 @@ tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_create_qkv_heads_de
     std::vector<Tensor>& output,
     CoreCoord compute_with_storage_grid_size) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> nlp_create_qkv_heads_decode_interleaved program id={}", pid);
+        }
+    }
 
     tt::DataFormat cb_data_format = tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 
@@ -212,6 +221,13 @@ tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_create_qkv_heads_de
     std::vector<Tensor>& output,
     CoreCoord compute_with_storage_grid_size) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> nlp_create_qkv_heads_decode_sharded program id={}", pid);
+        }
+    }
 
     tt_metal::IDevice* device = input_tensor.device();
     // Create CBs for reader/writer for batch_offset
@@ -490,6 +506,13 @@ tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_create_qkv_heads_de
     std::vector<Tensor>& output,
     CoreCoord compute_with_storage_grid_size) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> nlp_create_qkv_heads_decode_sharded_subcoregrid program id={}", pid);
+        }
+    }
 
     tt_metal::IDevice* device = input_tensor.device();
     // Create CBs for reader/writer for batch_offset

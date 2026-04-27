@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "unary_program_factory.hpp"
 
@@ -28,6 +29,13 @@ UnaryProgramFactory::cached_program_t UnaryProgramFactory::create(
     uint32_t packed_scalar1 = 0u;
     uint32_t packed_scalar2 = 0u;
     tt::tt_metal::Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> unary program id={}", pid);
+        }
+    }
 
     tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
     uint32_t single_tile_size = tt::tile_size(cb_data_format);

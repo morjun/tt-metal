@@ -78,6 +78,50 @@ LINE_RE = re.compile(
     r"cb_region_end=(\d+) max_l1_size=(\d+) lowest_top_down_addr=(\d+|none)"
 )
 
+# Matches lines emitted by program factories:
+#   log_info(tt::LogOp, ">>> <op_name> program id={}", program.get_id());
+OP_RE = re.compile(r">>> (\S+) program id=(\d+)")
+
+# Matches wide-bbox diagnostic lines emitted by matmul_dram_sharded factory when
+# the bounding box exceeds 8 columns (triggered by TT_METAL_LOG_L1_CB_MAP):
+#   >>> matmul_dram_sharded wide-bbox: program_id=91 M=1 K=128 N=128 per_core_M=1
+#       per_core_N_storage=4 bbox=[(0,0)..(12,8)] storage_cores=32
+WIDE_BBOX_RE = re.compile(
+    r">>> matmul_dram_sharded wide-bbox: program_id=(\d+) "
+    r"M=(\d+) K=(\d+) N=(\d+) per_core_M=(\d+) per_core_N_storage=(\d+) "
+    r"bbox=\[\((\d+),(\d+)\)\.\.\((\d+),(\d+)\)\] storage_cores=(\d+)"
+)
+
+
+def parse_op_map(text: str) -> dict[int, str]:
+    """Parse '>>> <op_name> program id=N' lines into pid→op_name dict."""
+    pid_to_op: dict[int, str] = {}
+    for line in text.splitlines():
+        m = OP_RE.search(line)
+        if m:
+            pid_to_op[int(m.group(2))] = m.group(1)
+    return pid_to_op
+
+
+def parse_wide_bbox_map(text: str) -> dict[int, dict]:
+    """Parse wide-bbox diagnostic lines into pid → matrix dimension info dict."""
+    result: dict[int, dict] = {}
+    for line in text.splitlines():
+        m = WIDE_BBOX_RE.search(line)
+        if m:
+            pid = int(m.group(1))
+            result[pid] = {
+                "M_tiles": int(m.group(2)),
+                "K_tiles": int(m.group(3)),
+                "N_tiles": int(m.group(4)),
+                "per_core_M": int(m.group(5)),
+                "per_core_N_storage": int(m.group(6)),
+                "bbox_start_xy": [int(m.group(7)), int(m.group(8))],
+                "bbox_end_xy": [int(m.group(9)), int(m.group(10))],
+                "storage_cores": int(m.group(11)),
+            }
+    return result
+
 
 def parse_lines(text: str) -> list[dict]:
     rows = []
@@ -201,12 +245,60 @@ def build_maps(rows: list[dict]) -> tuple[dict, dict, dict]:
     return dict(per_program), cumulative, headroom
 
 
+def pid_table_section(pid_to_op: dict[int, str], per_program: dict[int, dict]) -> str:
+    """Render a markdown table mapping every PID → op name and core count."""
+    lines = [
+        "",
+        "## PID → Program Name",
+        "",
+        "| PID | Op Name | # Cores |",
+        "|----:|---------|--------:|",
+    ]
+    for pid in sorted(per_program.keys()):
+        op = pid_to_op.get(pid, "unknown")
+        n_cores = len(per_program[pid])
+        lines.append(f"| {pid} | {op} | {n_cores} |")
+    lines.extend(
+        [
+            "",
+            "> Multiple PIDs with the same op name are distinct compilations (different shapes/configs).",
+            "> PIDs showing `unknown` come from factories not yet instrumented with logging.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def core_programs_section(per_program: dict[int, dict], pid_to_op: dict[int, str]) -> str:
+    """Render a markdown table listing every program that runs on each core."""
+    core_to_pids: dict[str, list[int]] = defaultdict(list)
+    for pid, core_map in per_program.items():
+        for core_k in core_map:
+            core_to_pids[core_k].append(pid)
+
+    lines = [
+        "",
+        "## Per-Core Program Inventory",
+        "",
+        "| Core | # Programs | Programs (pid: op_name) |",
+        "|------|----------:|-------------------------|",
+    ]
+    for core_k in sorted(core_to_pids.keys(), key=lambda k: tuple(int(v) for v in k.strip("()").split(","))):
+        pids = sorted(core_to_pids[core_k])
+        prog_strs = ", ".join(f"{p}:{pid_to_op.get(p, 'unknown')}" for p in pids)
+        lines.append(f"| {core_k} | {len(pids)} | {prog_strs} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def heatmap_md(
     cumulative: dict[str, int],
     headroom: dict[str, dict],
     max_l1: int,
+    pid_to_op: dict[int, str] | None = None,
     width: int = 0,
     height: int = 0,
+    per_program: dict[int, dict] | None = None,
 ) -> str:
     """
     Generate a markdown heatmap showing per-core L1 pressure.
@@ -264,16 +356,139 @@ def heatmap_md(
                 pid = hr.get("worst_case_pid")
 
                 if gap is not None and total_pct is not None:
-                    cell = f"{end_bytes} ({local_pct:.1f}%)<br>gap={gap//1024}KiB<br>pid={pid}"
+                    td_pct = hr.get("top_down_pct_of_l1", 0.0)
+                    op = (pid_to_op or {}).get(pid, "")
+                    op_str = f"({op})" if op else ""
+                    cell = f"L:{local_pct:.1f}% T:{td_pct:.1f}%<br>gap={gap//1024}KiB<br>pid={pid}{op_str}"
                 else:
-                    cell = f"{end_bytes} ({local_pct:.1f}%)"
+                    cell = f"L:{local_pct:.1f}%"
             row += f" {cell} |"
         lines.append(row)
 
     lines.append("")
-    lines.append("**Legend**: `cb_region_end (local_cb_pct%)` / `gap=free_headroom` / `total=true_occupied_pct`")
+    lines.append("**Legend**: `L=local_cb% T=top_down%` | `gap=free_headroom` | `pid=worst_case_pid`")
     lines.append("")
+    if per_program is not None:
+        lines.append(pid_table_section(pid_to_op or {}, per_program))
+        lines.append(core_programs_section(per_program, pid_to_op or {}))
     return "\n".join(lines)
+
+
+def plot_heatmaps(
+    cumulative: dict[str, int],
+    headroom: dict[str, dict],
+    per_program: dict[int, dict],
+    out_dir: Path,
+    max_l1: int,
+) -> None:
+    """
+    Generate and save two PNG heatmaps:
+      1. l1_sram_usage_heatmap.png   — worst-case local CB usage % per core
+      2. l1_program_count_heatmap.png — number of programs that use each core
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("  [warn] matplotlib not available; skipping heatmap images")
+        return
+
+    # Infer grid dimensions from observed cores
+    all_x = [int(k.strip("()").split(",")[0]) for k in cumulative]
+    all_y = [int(k.strip("()").split(",")[1]) for k in cumulative]
+    width = max(all_x) + 1  # number of x-values (columns)
+    height = max(all_y) + 1  # number of y-values (rows)
+
+    cell_w = max(0.65, 7.0 / width)
+    cell_h = max(0.65, 5.0 / height)
+    fig_w = width * cell_w + 2.5
+    fig_h = height * cell_h + 1.8
+
+    # ── Plot 1: true occupied SRAM % (local CBs + top-down tensor buffers) ──
+    # true_occupied = cb_region_end + (max_l1 - lowest_top_down_addr)
+    # Falls back to cb_region_end/max_l1 for cores where top-down addr is unavailable.
+    usage = np.full((height, width), np.nan)
+    for k, info in headroom.items():
+        x, y = (int(v) for v in k.strip("()").split(","))
+        total_pct = info.get("total_occupied_pct_of_l1")
+        if total_pct is not None:
+            usage[y, x] = total_pct
+        elif max_l1:
+            cb = info.get("cb_region_end_bytes", 0) or 0
+            usage[y, x] = 100.0 * cb / max_l1
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    cmap = plt.cm.RdYlGn_r  # green=low, yellow=mid, red=high
+    masked = np.ma.masked_invalid(usage)
+    im = ax.imshow(masked, cmap=cmap, vmin=0, vmax=100, aspect="auto")
+
+    for y in range(height):
+        for x in range(width):
+            v = usage[y, x]
+            if not np.isnan(v):
+                color = "white" if v > 55 else "black"
+                ax.text(
+                    x, y, f"{v:.0f}%", ha="center", va="center", fontsize=max(5, min(9, int(cell_w * 10))), color=color
+                )
+
+    ax.set_xticks(range(width))
+    ax.set_yticks(range(height))
+    ax.set_xticklabels([str(x) for x in range(width)], fontsize=8)
+    ax.set_yticklabels([str(y) for y in range(height)], fontsize=8)
+    ax.set_xlabel("Core x (column)", fontsize=9)
+    ax.set_ylabel("Core y (row)", fontsize=9)
+    ax.set_title(
+        "True occupied SRAM (% of L1) per core\n" "(cb_region_end + top-down tensor buffers) / max_l1", fontsize=10
+    )
+    cb1 = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb1.set_label("% of L1", fontsize=8)
+    plt.tight_layout()
+    out1 = out_dir / "l1_sram_usage_heatmap.png"
+    plt.savefig(out1, dpi=150)
+    plt.close()
+    print(f"  Saved {out1}")
+
+    # ── Plot 2: number of programs per core ─────────────────────────────────
+    n_progs = np.zeros((height, width), dtype=int)
+    core_to_pids: dict[str, set] = defaultdict(set)
+    for pid, core_map in per_program.items():
+        for core_k in core_map:
+            core_to_pids[core_k].add(pid)
+    for k, pids in core_to_pids.items():
+        x, y = (int(v) for v in k.strip("()").split(","))
+        if 0 <= x < width and 0 <= y < height:
+            n_progs[y, x] = len(pids)
+
+    vmax = int(n_progs.max()) if n_progs.max() > 0 else 1
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    cmap2 = plt.cm.YlOrRd
+    im2 = ax.imshow(n_progs, cmap=cmap2, vmin=0, vmax=vmax, aspect="auto")
+
+    for y in range(height):
+        for x in range(width):
+            v = int(n_progs[y, x])
+            if v > 0:
+                color = "white" if v > vmax * 0.6 else "black"
+                ax.text(x, y, str(v), ha="center", va="center", fontsize=max(5, min(9, int(cell_w * 10))), color=color)
+
+    ax.set_xticks(range(width))
+    ax.set_yticks(range(height))
+    ax.set_xticklabels([str(x) for x in range(width)], fontsize=8)
+    ax.set_yticklabels([str(y) for y in range(height)], fontsize=8)
+    ax.set_xlabel("Core x (column)", fontsize=9)
+    ax.set_ylabel("Core y (row)", fontsize=9)
+    ax.set_title("Number of programs using each core", fontsize=10)
+    cb2 = plt.colorbar(im2, ax=ax, fraction=0.03, pad=0.02)
+    cb2.set_label("# programs", fontsize=8)
+    plt.tight_layout()
+    out2 = out_dir / "l1_program_count_heatmap.png"
+    plt.savefig(out2, dpi=150)
+    plt.close()
+    print(f"  Saved {out2}")
 
 
 def main() -> None:
@@ -290,24 +505,59 @@ def main() -> None:
         )
 
     per_program, cumulative, headroom = build_maps(rows)
+    pid_to_op = parse_op_map(text)
+    wide_bbox_map = parse_wide_bbox_map(text)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    per_program_str = {str(k): v for k, v in per_program.items()}
-    (args.out_dir / "per_program_core_map.json").write_text(json.dumps(per_program_str, indent=2))
+    per_program_annotated = {
+        str(pid): {
+            "op_name": pid_to_op.get(pid, "unknown"),
+            "cores": cores,
+            **({"wide_bbox_info": wide_bbox_map[pid]} if pid in wide_bbox_map else {}),
+        }
+        for pid, cores in per_program.items()
+    }
+    (args.out_dir / "per_program_core_map.json").write_text(json.dumps(per_program_annotated, indent=2))
     (args.out_dir / "cumulative_core_map.json").write_text(json.dumps(dict(sorted(cumulative.items())), indent=2))
     (args.out_dir / "headroom_map.json").write_text(json.dumps(dict(sorted(headroom.items())), indent=2))
 
     max_l1 = max(r["max_l1_size"] for r in rows)
-    (args.out_dir / "l1_heatmap.md").write_text(heatmap_md(cumulative, headroom, max_l1))
+    (args.out_dir / "l1_heatmap.md").write_text(
+        heatmap_md(cumulative, headroom, max_l1, pid_to_op, per_program=per_program)
+    )
+
+    plot_heatmaps(cumulative, headroom, per_program, args.out_dir, max_l1)
 
     # Print summary table to stdout
     print(f"Parsed {len(rows)} L1_CB_MAP lines -> {args.out_dir}")
     print(f"  programs seen (validate): {sorted(per_program.keys())}")
     print(f"  cores in cumulative map : {len(cumulative)}")
     print()
+
+    if pid_to_op:
+        print(f"  pid→op mapping ({len(pid_to_op)} entries):")
+        for pid_key, op_name in sorted(pid_to_op.items()):
+            print(f"    pid={pid_key:>4}  {op_name}")
+        print()
+
+    if wide_bbox_map:
+        print(f"  wide-bbox programs ({len(wide_bbox_map)} entries):")
+        for pid_key, info in sorted(wide_bbox_map.items()):
+            op = pid_to_op.get(pid_key, "unknown")
+            bs, be = info["bbox_start_xy"], info["bbox_end_xy"]
+            print(
+                f"    pid={pid_key:>4}  {op}  "
+                f"M={info['M_tiles']} K={info['K_tiles']} N={info['N_tiles']}  "
+                f"storage_cores={info['storage_cores']}  "
+                f"bbox=[({bs[0]},{bs[1]})..({be[0]},{be[1]})]"
+            )
+        print()
+
     print("  Per-core summary (worst-case execution moment, sorted by tightest gap):")
-    print(f"  {'core':<10} {'pid':>5} {'local_cb':>10} {'local%':>7} {'top_down':>10} {'gap':>10} {'total%':>8}")
-    print(f"  {'-'*10} {'-'*5} {'-'*10} {'-'*7} {'-'*10} {'-'*10} {'-'*8}")
+    print(
+        f"  {'core':<10} {'pid':>5}  {'op_name':<40} {'local_cb':>10} {'local%':>7} {'top_down':>10} {'gap':>10} {'total%':>8}"
+    )
+    print(f"  {'-'*10} {'-'*5}  {'-'*40} {'-'*10} {'-'*7} {'-'*10} {'-'*10} {'-'*8}")
     sorted_cores = sorted(
         headroom.items(),
         key=lambda kv: kv[1].get("gap_bytes_free_headroom")
@@ -318,6 +568,7 @@ def main() -> None:
     for k, hr in sorted_cores:
         local_cb = hr.get("cb_region_end_bytes")
         pid = hr.get("worst_case_pid")
+        op = pid_to_op.get(pid, "unknown") if pid is not None else ""
         local_pct = f"{hr.get('local_cb_pct_of_l1', 0):.1f}%"
         top_down = hr.get("top_down_size_bytes")
         gap = hr.get("gap_bytes_free_headroom")
@@ -325,9 +576,8 @@ def main() -> None:
 
         td_str = f"{top_down:>10}" if top_down is not None else f"{'n/a':>10}"
         gap_str = f"{gap:>10}" if gap is not None else f"{'n/a':>10}"
-        print(
-            f"  {k:<10} {pid if pid is not None else 'n/a':>5} {local_cb:>10} {local_pct:>7} {td_str} {gap_str} {total_pct:>8}"
-        )
+        pid_str = f"{pid:>5}" if pid is not None else f"{'n/a':>5}"
+        print(f"  {k:<10} {pid_str}  {op:<40} {local_cb:>10} {local_pct:>7} {td_str} {gap_str} {total_pct:>8}")
 
 
 if __name__ == "__main__":

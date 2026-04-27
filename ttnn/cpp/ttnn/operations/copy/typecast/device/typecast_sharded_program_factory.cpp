@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include "typecast_sharded_program_factory.hpp"
 
 #include <tt-metalium/constants.hpp>
@@ -23,6 +24,13 @@ TypecastShardedProgramFactory::cached_program_t TypecastShardedProgramFactory::c
     const auto& output_dtype = args.output_dtype;
 
     tt::tt_metal::Program program = CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> typecast_sharded program id={}", pid);
+        }
+    }
 
     auto shard_spec = input.shard_spec().value();
     auto all_cores = shard_spec.grid;

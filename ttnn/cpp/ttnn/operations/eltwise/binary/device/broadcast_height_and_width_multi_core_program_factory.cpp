@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <optional>
+#include <unordered_set>
 
 #include "binary_device_operation.hpp"
 #include <tt-metalium/buffer.hpp>
@@ -63,6 +64,13 @@ BinaryDeviceOperation::BroadcastHeightAndWidthMultiCore::create(
     bool bnc1 = (bN * bC == 1);
 
     auto program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> broadcast_height_and_width program id={}", pid);
+        }
+    }
 
     tt_metal::IDevice* device = a.device();
 

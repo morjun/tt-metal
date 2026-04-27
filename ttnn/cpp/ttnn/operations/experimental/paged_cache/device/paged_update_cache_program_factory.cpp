@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/constants.hpp>
 #include "ttnn/operations/cb_utils.hpp"
@@ -37,6 +38,13 @@ operation::ProgramWithCallbacks paged_update_cache_multi_core(
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
     const bool share_cache) {
     Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> paged_update_cache program id={}", pid);
+        }
+    }
 
     tt_metal::IDevice* device = input_tensor.device();
 

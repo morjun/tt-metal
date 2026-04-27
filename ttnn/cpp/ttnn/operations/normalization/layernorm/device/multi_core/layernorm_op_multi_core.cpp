@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <string>
+#include <unordered_set>
 
 #include <tt-metalium/circular_buffer_config.hpp>
 #include "ttnn/operations/normalization/layernorm/device/layernorm_op.hpp"
@@ -316,6 +317,13 @@ operation::ProgramWithCallbacks layernorm_multi_core(
     //                      Application Setup
     ////////////////////////////////////////////////////////////////////////////
     Program program = CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> {} program id={}", rms_norm ? "rms_norm" : "layernorm", pid);
+        }
+    }
 
     const auto use_welford_and_not_rms_norm = use_welford && !rms_norm;
 
@@ -865,6 +873,13 @@ operation::ProgramWithCallbacks layernorm_multi_core_sharded(
     //                      Application Setup
     ////////////////////////////////////////////////////////////////////////////
     Program program = Program();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> {} program id={}", rms_norm ? "rms_norm_sharded" : "layernorm_sharded", pid);
+        }
+    }
     // define core ranges
     bool use_mcast = num_blocks > 1;
 

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include "typecast_program_factory.hpp"
 
 #include <tt-metalium/work_split.hpp>
@@ -23,6 +24,13 @@ TypecastProgramFactory::cached_program_t TypecastProgramFactory::create(
     const auto& output_dtype = args.output_dtype;
 
     tt::tt_metal::Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> typecast program id={}", pid);
+        }
+    }
 
     tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
     uint32_t single_tile_size = tt::tile_size(cb_data_format);

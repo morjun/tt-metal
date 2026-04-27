@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
+#include <unordered_set>
 
 #include "update_cache_op.hpp"
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-logger/tt-logger.hpp>
 
 using namespace tt::tt_metal;
 
@@ -23,6 +25,13 @@ operation::ProgramWithCallbacks update_cache_multi_core(
     const uint32_t batch_offset,
     ttnn::DeviceComputeKernelConfig compute_kernel_config) {
     Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> update_cache_multi_core program id={}", pid);
+        }
+    }
 
     tt::DataFormat cache_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(cache_tensor.dtype());
     uint32_t cache_single_tile_size = tt::tile_size(cache_cb_data_format);

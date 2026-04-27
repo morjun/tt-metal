@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "ttnn/operation.hpp"
@@ -33,6 +35,13 @@ tt_metal::operation::ProgramWithCallbacks create_program(
     tt_metal::Buffer* in1_buffer,
     tt_metal::Buffer* out_buffer) {
     tt_metal::Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> matmul_multi_core_reuse program id={}", pid);
+        }
+    }
 
     uint32_t in0_single_tile_size = tt::tile_size(in0_cb_data_format);
     uint32_t in1_single_tile_size = tt::tile_size(in1_cb_data_format);

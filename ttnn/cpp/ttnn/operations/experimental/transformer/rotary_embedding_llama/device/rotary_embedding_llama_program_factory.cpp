@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include <vector>
 #include "rotary_embedding_llama_program_factory.hpp"
 #include <tt-metalium/work_split.hpp>
@@ -23,6 +24,13 @@ operation::ProgramWithCallbacks rotary_embedding_llama_multi_core(
     ttnn::DeviceComputeKernelConfig compute_kernel_config) {
     using namespace tt::constants;
     Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> rotary_embedding_llama program id={}", pid);
+        }
+    }
 
     const tt::DataFormat input_cb_data_format = tt_metal::datatype_to_dataformat_converter(input.dtype());
     const uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
@@ -330,6 +338,13 @@ operation::ProgramWithCallbacks rotary_embedding_llama_multi_core_sharded(
     Tensor& output,
     ttnn::DeviceComputeKernelConfig compute_kernel_config) {
     Program program{};
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> rotary_embedding_llama_sharded program id={}", pid);
+        }
+    }
 
     const tt::DataFormat input_cb_data_format = tt_metal::datatype_to_dataformat_converter(input.dtype());
     const uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);

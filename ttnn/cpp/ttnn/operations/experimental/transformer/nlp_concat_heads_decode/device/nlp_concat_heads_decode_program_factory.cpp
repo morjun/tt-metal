@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_set>
 #include <tt-metalium/host_api.hpp>
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/constants.hpp>
 #include "nlp_concat_heads_decode_device_operation.hpp"
 #include <tt-metalium/work_split.hpp>
@@ -15,6 +17,13 @@ using namespace tt::constants;
 tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_concat_heads_decode(
     const Tensor& input_tensor, Tensor& output, CoreCoord compute_with_storage_grid_size) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> nlp_concat_heads_decode program id={}", pid);
+        }
+    }
 
     const auto& input_shape = input_tensor.padded_shape();
     const uint32_t head_dim = input_shape[-1];
@@ -148,6 +157,13 @@ tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_concat_heads_decode
 tt::tt_metal::operation::ProgramWithCallbacks multi_core_nlp_concat_heads_decode_subcoregrids(
     const Tensor& input_tensor, Tensor& output, CoreCoord compute_with_storage_grid_size) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    if (std::getenv("TT_METAL_LOG_L1_CB_MAP")) {
+        static std::unordered_set<uint64_t> logged_pids;
+        auto pid = program.get_id();
+        if (logged_pids.insert(pid).second) {
+            log_info(tt::LogOp, ">>> nlp_concat_heads_decode_subcoregrids program id={}", pid);
+        }
+    }
 
     const auto& input_shape = input_tensor.padded_shape();
     const uint32_t head_dim = input_shape[-1];
