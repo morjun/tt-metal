@@ -118,11 +118,22 @@ DRAM Reads:        15104 (19.16%)
 
     - Q헤드 개수: 32개
 
-    - KV헤드 하나당 8x1 row 할당됨 (Tensor Parallelism on a device)
+    - KV헤드 하나당 1x1 core 할당되고, 8개 코어로 구성된 1개 row가 공유(via NoC, Tensor Parallelism on a device)
 
     - Attention 계산 시, KV헤드 하나당 Q헤드 4개와 곱해짐
 
         - 이때 각 코어에서는 KV헤드와 Q헤드를 위해 Circular Buffer가 1.2MB 차지
+
+### SRAM Usage Heatmap
+
+![SRAM Usage Heatmap](../../../l1_cb_artifacts_noCacheFull/l1_sram_usage_heatmap.png)
+
+KV 캐시 L1 caching 미사용 시
+
+![SRAM Usage Heatmap - withCache](../../../l1_cb_artifacts/l1_sram_usage_heatmap.png)
+
+KV 캐시 L1 caching 사용 시
+
 
 ## Remaining Tasks
 
@@ -135,6 +146,8 @@ DRAM Reads:        15104 (19.16%)
 - L1에 데이터가 비효율적으로 저장되는 문제 (이미 L1에 할당되어 있는 KV 캐시 엔트리가 circular buffer에 복사가 됨) 해결
 
 - Circular Buffer를 계쏙 고정해놓지 말고 한 연산마다 가능한 최대의 양을 할당
+
+- 중간에 Core Utilization이 낮아질때 KV 캐시를 더 많이 할당했다가, 꽉찰것 같을때 다른 남아도는 코어로 옮겨두기 (Next step)
 
 - ~~KV Cache에서 hot token의 scale 조사~~
 
@@ -155,7 +168,12 @@ DRAM Reads:        15104 (19.16%)
 - ~~DRAM만 쓸 때 SRAM의 utilization 측정~~
 
     - 약 85% (8x8 만 사용중일 때)
-    - 현재 tt-metal이 제공하는 API인 `get_memory_view()`, `dump_device_memory_state()` 로는 allocator로 할당된 영역만 덤프되고 정적 할당된 CB 영역이 반영되지 않아 정확한 측정 불가 (free space도 잘못 계산되어 나옴)
+    ~~- 현재 tt-metal이 제공하는 API인 `get_memory_view()`, `dump_device_memory_state()` 로는 allocator로 할당된 영역만 덤프되고 정적 할당된 CB 영역이 반영되지 않아 정확한 측정 불가 (free space도 잘못 계산되어 나옴)~~
+
+- 프로그램 특정 방식
+    - 정적 (소스코드 분석)
+    - pid마다 크래시 혹은 CB 용량 기준으로 크래시내서 할당된 프로그램 이름 확인
+    - 프로그램 팩토리에 프로그램 생성 시 로깅 추가하여 pid와 매칭
 
 ## References
 
