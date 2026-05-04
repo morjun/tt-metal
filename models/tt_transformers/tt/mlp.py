@@ -46,28 +46,6 @@ class MLP(LightweightModule):
         w1_w3_mem_config = args.create_dram_sharded_mem_config(args.dim, args.hidden_dim // args.num_devices)
         w2_mem_config = args.create_dram_sharded_mem_config(args.hidden_dim // args.num_devices, args.dim)
 
-        # L1 Partitioning Logic
-        # Restrict to first layer only to avoid OOM (L1 budget is global).
-        # All L1-sharded weights for layer 0 (both attention and MLP) coexist on
-        # every core.  We query the hardware unreserved L1 size, subtract a
-        # reserve for matmul circular buffers / activation tensors, and split the
-        # remainder equally among the 4 weight matrices (WQKV, WO, W1_W3, W2).
-        if args.use_l1_weight_sharding and layer_num == 0:
-            l1_unreserved = ttnn.get_max_worker_l1_unreserved_size()  # ~1.4MB on BH P150
-            cb_reserve = 200 * 1024  # 200KB for matmul CBs + activation tensors
-            num_coexisting_weights = 4  # WQKV, WO, W1_W3, W2
-            per_weight_budget = max(0, (l1_unreserved - cb_reserve) // num_coexisting_weights)
-
-            w1_w3_l1_rows = args.get_l1_sharded_rows(
-                self.mesh_device, args.dim * 2, target_l1_per_core=per_weight_budget
-            )
-            w2_l1_rows = args.get_l1_sharded_rows(
-                self.mesh_device, (args.hidden_dim // args.num_devices) * 2, target_l1_per_core=per_weight_budget
-            )
-        else:
-            w1_w3_l1_rows = 0
-            w2_l1_rows = 0
-
         # TODO Clean up this code. With sharding, we load the normal weights and then shard them
         as_sharded_tensor = lambda name, type, dims: ttnn.as_tensor(
             pad_hidden_dim(
@@ -101,70 +79,6 @@ class MLP(LightweightModule):
         )  # bfp4 normally ok here but sub .99 pcc for llama 3.1 weights
         self.w2 = as_sharded_tensor("w2_sharded", ff2_dtype, dims=w2_dims)
         self.w3 = as_sharded_tensor("w3_sharded", ff1_3_dtype, dims=w1_dims)
-
-        # Split Weight Logic - Only execute when L1 sharding is enabled
-        if w1_w3_l1_rows > 0:
-
-            def get_split_tensors(name, dim_arg, l1_rows):
-                """Split weight [Out, In] into L1 HEIGHT-sharded and DRAM INTERLEAVED portions.
-
-                torch_weight() returns [In, Out] (transposed PyTorch convention).
-                We transpose to [Out, In] so that dim-0 slicing splits the OUTPUT dimension,
-                matching the attention.py convention.
-                """
-                full_w = torch_weight(name).transpose(-1, -2)  # [In, Out] → [Out, In]
-                total_rows = full_w.shape[0]
-
-                grid = self.mesh_device.compute_with_storage_grid_size()
-                num_cores = grid.x * grid.y
-                alignment = num_cores * 32
-
-                l1_rows_actual = min(total_rows, l1_rows)
-                l1_rows_actual = (l1_rows_actual // alignment) * alignment
-
-                w_l1_torch = full_w[:l1_rows_actual, :]
-                w_dram_torch = full_w[l1_rows_actual:, :]
-
-                grid = self.mesh_device.compute_with_storage_grid_size()
-                core_grid = ttnn.CoreGrid(y=grid.y, x=grid.x)
-
-                if l1_rows_actual > 0:
-                    w_l1 = ttnn.as_tensor(
-                        w_l1_torch.unsqueeze(0).unsqueeze(0),
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.mesh_device,
-                        memory_config=ttnn.create_sharded_memory_config(
-                            shape=(l1_rows_actual, dim_arg),
-                            core_grid=core_grid,
-                            strategy=ttnn.ShardStrategy.HEIGHT,
-                            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                            use_height_and_width_as_shard_shape=False,
-                        ),
-                    )
-                else:
-                    w_l1 = None
-
-                w_dram = ttnn.as_tensor(
-                    w_dram_torch.transpose(-1, -2).unsqueeze(0).unsqueeze(0),
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    device=self.mesh_device,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-                return w_l1, w_dram
-
-            self.w1_l1, self.w1_dram = get_split_tensors("w1", args.dim, w1_w3_l1_rows)
-            self.w2_l1, self.w2_dram = get_split_tensors("w2", args.hidden_dim // args.num_devices, w2_l1_rows)
-            self.w3_l1, self.w3_dram = get_split_tensors("w3", args.dim, w1_w3_l1_rows)
-        else:
-            # L1 sharding disabled - use original weights
-            self.w1_l1 = None
-            self.w1_dram = self.w1
-            self.w2_l1 = None
-            self.w2_dram = self.w2
-            self.w3_l1 = None
-            self.w3_dram = self.w3
 
         # Default activation is SILU
         self.activation_type = (
@@ -209,57 +123,27 @@ class MLP(LightweightModule):
         # These use HiFi2; this drops 1 bit of the activations but would be FLOP-bound on 12 cores with HiFi4
         memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if mode == "decode" else ttnn.DRAM_MEMORY_CONFIG
 
-        # Split Linear Helper
-        # We inline or use check.
-
         # W1
-        if self.w1_l1 is not None and mode == "decode":
-            x_T = ttnn.transpose(x, -2, -1)
-            w1_l1_T = ttnn.matmul(self.w1_l1, x_T)
-            w1_l1_out = ttnn.transpose(w1_l1_T, -2, -1)
-            w1_dram_out = ttnn.linear(
-                x,
-                self.w1_dram,
-                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-                memory_config=memory_config,
-            )
-            w1_out = ttnn.concat([w1_l1_out, w1_dram_out], dim=-1)
-        else:
-            # In prefill or when L1 sharding is disabled, use the original full weight.
-            # self.w1_dram is aliased to self.w1 when disabled, but is only a partial
-            # weight when L1 sharding is enabled — so always use self.w1 here.
-            w1_out = ttnn.linear(
-                x,
-                self.w1,
-                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
-                compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-                program_config=pc_1,
-                memory_config=memory_config,
-            )
+        w1_out = ttnn.linear(
+            x,
+            self.w1,
+            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
+            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+            program_config=pc_1,
+            memory_config=memory_config,
+        )
 
         # W3
-        if self.w3_l1 is not None and mode == "decode":
-            x_T = ttnn.transpose(x, -2, -1)
-            w3_l1_T = ttnn.matmul(self.w3_l1, x_T)
-            w3_l1_out = ttnn.transpose(w3_l1_T, -2, -1)
-            w3_dram_out = ttnn.linear(
-                x,
-                self.w3_dram,
-                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-                memory_config=memory_config,
-            )
-            w3_out = ttnn.concat([w3_l1_out, w3_dram_out], dim=-1)
-        else:
-            w3_out = ttnn.linear(
-                x,
-                self.w3,  # Always use full weight for prefill / non-sharding decode
-                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
-                compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-                program_config=pc_3,
-                memory_config=memory_config,
-            )
+        w3_out = ttnn.linear(
+            x,
+            self.w3,
+            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
+            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+            program_config=pc_3,
+            memory_config=memory_config,
+        )
         ttnn.deallocate(x)
 
         if TG:
@@ -361,27 +245,15 @@ class MLP(LightweightModule):
         li_ff2_compute_kernel_cfg = self.model_config["DECODERS_OPTIMIZATIONS"].get_math_fidelity(
             decoder_id=layer_num, op=OpGroup.LI_FF2, configuration=self.args
         )
-        if self.w2_l1 is not None and mode == "decode":
-            w2_in_T = ttnn.transpose(w2_in, -2, -1)
-            w2_l1_T = ttnn.matmul(self.w2_l1, w2_in_T)
-            w2_l1_out = ttnn.transpose(w2_l1_T, -2, -1)
-            w2_dram_out = ttnn.linear(
-                w2_in,
-                self.w2_dram,
-                dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
-                memory_config=memory_config,
-            )
-            w2_out = ttnn.concat([w2_l1_out, w2_dram_out], dim=-1)
-        else:
-            w2_out = ttnn.linear(
-                w2_in,
-                self.w2,  # Always use full weight for prefill / non-sharding decode
-                compute_kernel_config=li_ff2_compute_kernel_cfg,
-                dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
-                program_config=pc_2,
-                memory_config=memory_config,
-                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
-            )
+        w2_out = ttnn.linear(
+            w2_in,
+            self.w2,
+            compute_kernel_config=li_ff2_compute_kernel_cfg,
+            dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
+            program_config=pc_2,
+            memory_config=memory_config,
+            core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
+        )
         ttnn.deallocate(w2_in)
         # if mode == "decode" and not TG:
         #     w2_out = ttnn.sharded_to_interleaved(w2_out, ttnn.DRAM_MEMORY_CONFIG)

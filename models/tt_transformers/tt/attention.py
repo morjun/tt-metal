@@ -32,26 +32,6 @@ class Attention(LightweightModule):
 
         self.mesh_device = mesh_device
         self.tt_ccl = tt_ccl
-        # L1 Partitioning: query hardware L1 budget, subtract CB reserve,
-        # split equally among 4 coexisting weights (WQKV, WO, W1_W3, W2).
-        # Restrict to first layer only to avoid OOM (L1 budget is global)
-        if configuration.use_l1_weight_sharding and layer_num == 0:
-            l1_unreserved = ttnn.get_max_worker_l1_unreserved_size()  # ~1.4MB on BH P150
-            cb_reserve = 200 * 1024  # 200KB for matmul CBs + activation tensors
-            num_coexisting_weights = 4  # WQKV, WO, W1_W3, W2
-            per_weight_budget = max(0, (l1_unreserved - cb_reserve) // num_coexisting_weights)
-
-            wqkv_l1_rows = configuration.get_l1_sharded_rows(
-                self.mesh_device, configuration.dim * 2, target_l1_per_core=per_weight_budget
-            )
-            wo_l1_rows = configuration.get_l1_sharded_rows(
-                self.mesh_device,
-                (configuration.hidden_dim // configuration.num_devices) * 2,
-                target_l1_per_core=per_weight_budget,
-            )
-        else:
-            wqkv_l1_rows = 0
-            wo_l1_rows = 0
         self.num_devices = configuration.num_devices
         self.TG = self.num_devices == 32
         self.hidden_size = configuration.dim
@@ -349,73 +329,6 @@ class Attention(LightweightModule):
             ),
         )
 
-        # L1 Partitioning Logic
-        # Split weights along output dimension into L1-resident (fast) and DRAM-resident (remaining) portions.
-        # self.wqkv and self.wo (created above) are always kept for prefill use.
-        if wqkv_l1_rows > 0 or wo_l1_rows > 0:
-
-            def get_split_tensors(full_w, dim_arg, l1_rows):
-                """Split weight [Out, In] into L1 HEIGHT-sharded and DRAM INTERLEAVED portions."""
-                total_rows = full_w.shape[0]
-                grid = self.mesh_device.compute_with_storage_grid_size()
-                num_cores = grid.x * grid.y
-                alignment = num_cores * 32
-
-                l1_rows_actual = min(total_rows, l1_rows)
-                l1_rows_actual = (l1_rows_actual // alignment) * alignment
-
-                w_l1_torch = full_w[:l1_rows_actual, :]
-                w_dram_torch = full_w[l1_rows_actual:, :]
-                core_grid = ttnn.CoreGrid(y=grid.y, x=grid.x)
-
-                if l1_rows_actual > 0:
-                    w_l1 = ttnn.as_tensor(
-                        w_l1_torch.unsqueeze(0).unsqueeze(0),
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.mesh_device,
-                        memory_config=ttnn.create_sharded_memory_config(
-                            shape=(l1_rows_actual, dim_arg),
-                            core_grid=core_grid,
-                            strategy=ttnn.ShardStrategy.HEIGHT,
-                            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                            use_height_and_width_as_shard_shape=False,
-                        ),
-                    )
-                else:
-                    w_l1 = None
-
-                w_dram = ttnn.as_tensor(
-                    w_dram_torch.transpose(-1, -2).unsqueeze(0).unsqueeze(0),
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    device=self.mesh_device,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-                return w_l1, w_dram
-
-            # Split WQKV: qkv_cat is [1, 1, Dim, LocalQKV], transpose to [LocalQKV, Dim] for height splitting
-            qkv_cat_local = qkv_cat.squeeze(0).squeeze(0).transpose(-1, -2)
-            self.wqkv_l1, self.wqkv_dram = get_split_tensors(qkv_cat_local, configuration.dim, wqkv_l1_rows)
-
-            if self.wqkv_l1 is None:
-                self.wqkv_dram = self.wqkv  # Alias to preserve original sharding config
-
-            # Split WO: pt_wo is [1, 1, Hidden/Dev, Dim], transpose to [Dim, Hidden/Dev] for height splitting
-            wo_local = pt_wo.squeeze(0).squeeze(0).transpose(-1, -2)
-            self.wo_l1, self.wo_dram = get_split_tensors(
-                wo_local, configuration.hidden_dim // configuration.num_devices, wo_l1_rows
-            )
-
-            if self.wo_l1 is None:
-                self.wo_dram = self.wo
-        else:
-            # L1 sharding disabled — alias _dram to original weights
-            self.wqkv_l1 = None
-            self.wqkv_dram = self.wqkv
-            self.wo_l1 = None
-            self.wo_dram = self.wo
-
         if not use_paged_kv_cache:
             # vLLM provides its own kv cache
             self.init_kv_cache(configuration, weight_cache_path)
@@ -644,32 +557,14 @@ class Attention(LightweightModule):
         # Use HiFi2 for DRAM-sharded matmuls as they are otherwise flop-bound on 12 cores with HiFi4
         ###
 
-        # Split Linear Logic for WQKV
-        if self.wqkv_l1 is not None:
-            # L1 Path: Transposed Matmul
-            x_T = ttnn.transpose(x, -2, -1)
-            xqkv_l1_T = ttnn.matmul(self.wqkv_l1, x_T)
-            xqkv_l1 = ttnn.transpose(xqkv_l1_T, -2, -1)
-
-            # DRAM Path: Standard Linear
-            xqkv_dram = ttnn.linear(
-                x,
-                self.wqkv_dram,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
-            )
-
-            # Concat
-            xqkv_fused_sharded = ttnn.concat([xqkv_l1, xqkv_dram], dim=-1)
-        else:
-            xqkv_fused_sharded = ttnn.linear(
-                x,
-                self.wqkv_dram,
-                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                program_config=self.model_config["XQKV_DECODE_PROGCFG"],
-                compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-                dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
-            )
+        xqkv_fused_sharded = ttnn.linear(
+            x,
+            self.wqkv,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.model_config["XQKV_DECODE_PROGCFG"],
+            compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+            dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+        )
 
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
@@ -929,35 +824,15 @@ class Attention(LightweightModule):
 
             # TODO: Fix this once self.TG supports dram-sharded matmuls
 
-            # Split WO Logic
-            if self.wo_l1 is not None:
-                # L1 Path
-                attn_output_T = ttnn.transpose(attn_output, -2, -1)
-                dense_out_l1_T = ttnn.matmul(self.wo_l1, attn_output_T)
-                dense_out_l1 = ttnn.transpose(dense_out_l1_T, -2, -1)
-
-                # DRAM Path
-                dense_out_dram = ttnn.linear(
-                    attn_output,
-                    self.wo_dram,
-                    # core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
-                    # program_config=self.model_config["ATTN_OUTPUT_PROGCFG"] if not self.TG else None,
-                    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                    dtype=ttnn.bfloat8_b if self.TG else None,
-                    compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
-                )
-
-                dense_out_sharded = ttnn.concat([dense_out_l1, dense_out_dram], dim=-1)
-            else:
-                dense_out_sharded = ttnn.matmul(
-                    attn_output,
-                    self.wo_dram,
-                    core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
-                    program_config=self.model_config["ATTN_OUTPUT_PROGCFG"] if not self.TG else None,
-                    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                    dtype=ttnn.bfloat8_b if self.TG else None,
-                    compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
-                )
+            dense_out_sharded = ttnn.matmul(
+                attn_output,
+                self.wo,
+                core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
+                program_config=self.model_config["ATTN_OUTPUT_PROGCFG"] if not self.TG else None,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                dtype=ttnn.bfloat8_b if self.TG else None,
+                compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
+            )
 
             ttnn.deallocate(attn_output_cat)
 

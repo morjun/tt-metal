@@ -336,7 +336,6 @@ def prepare_generator_args(
     page_params,
     paged_attention,
     num_layers,
-    use_l1_weight_sharding=False,
     l1_kv_window_size=0,
     l1_kv_sink_size=0,
     l1_kv_use_sharded=False,
@@ -370,7 +369,6 @@ def prepare_generator_args(
             dtype=ttnn.bfloat8_b,
             state_dict=state_dict,
             num_layers=num_layers,
-            use_l1_weight_sharding=use_l1_weight_sharding,
             l1_kv_window_size=l1_kv_window_size,
             l1_kv_sink_size=l1_kv_sink_size,
             l1_kv_use_sharded=l1_kv_use_sharded,
@@ -925,7 +923,6 @@ def test_demo_text(
     enable_trace = False  # FORECE DISABLE FOR DPRINT DEBUGGING
     num_layers = request.config.getoption("--num_layers") or num_layers
     mode = request.config.getoption("--mode") or mode
-    use_l1_weight_sharding = request.config.getoption("--use_l1_weight_sharding")
     l1_kv_window_size = request.config.getoption("--l1_kv_window_size")
     l1_kv_sink_size = request.config.getoption("--l1_kv_sink_size")
     l1_kv_use_sharded = request.config.getoption("--l1_kv_use_sharded")
@@ -1024,7 +1021,6 @@ def test_demo_text(
         page_params=page_params,
         paged_attention=paged_attention,
         num_layers=num_layers,
-        use_l1_weight_sharding=use_l1_weight_sharding,
         l1_kv_window_size=l1_kv_window_size,
         l1_kv_sink_size=l1_kv_sink_size,
         l1_kv_use_sharded=l1_kv_use_sharded,

@@ -463,13 +463,11 @@ class ModelArgs:
         optimizations=None,
         cache_hf=False,  # Set to False to reduce memory usage by not caching HF model
         subdevice=None,
-        use_l1_weight_sharding=False,
         l1_kv_window_size=0,  # 0 = disabled; set to e.g. 256 for L1 KV cache window
         l1_kv_sink_size=0,
         l1_kv_use_sharded=False,
         l1_kv_min_expected_hit_ratio=0.0,
     ):
-        self.use_l1_weight_sharding = use_l1_weight_sharding
         self.l1_kv_window_size = l1_kv_window_size
         self.l1_kv_sink_size = l1_kv_sink_size
         self.l1_kv_use_sharded = l1_kv_use_sharded
@@ -2079,39 +2077,6 @@ class ModelArgs:
             self.dram_weight_grid, (k, padded_size // dram_cores), ttnn.ShardOrientation.ROW_MAJOR
         )
         return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)
-
-    def get_l1_sharded_rows(self, device, row_size_bytes, target_l1_per_core):
-        """
-        Calculate how many rows of weights can fit into L1 memory.
-
-        IMPORTANT: target_l1_per_core is the budget for THIS weight only.
-        All L1-sharded weights for a layer coexist on every core, so the
-        caller must partition the total available L1 among all weights.
-
-        Args:
-            device: ttnn.Device
-            row_size_bytes: Size in bytes of a single row of the weight matrix
-            target_l1_per_core: L1 bytes budgeted for this weight on each core.
-                Must account for other weights sharing the same L1.
-
-        Returns:
-            int: Number of rows that fit in L1, aligned to tile size (32).
-        """
-        # Get compute grid size
-        grid = device.compute_with_storage_grid_size()
-        num_cores = grid.x * grid.y
-
-        total_l1_capacity = target_l1_per_core * num_cores
-
-        # Calculate max rows
-        max_rows = total_l1_capacity // row_size_bytes
-
-        # Align to num_cores * 32 to ensure valid sharding
-        alignment = num_cores * 32
-        max_rows = (max_rows // alignment) * alignment
-
-        # Clamp to ensure at least one tile
-        return max(32, max_rows)
 
     def matmul_config(
         self,
