@@ -105,9 +105,29 @@ def pytest_addoption(parser):
         help="Disable dual-source L1 reads for decode steps whose expected hit ratio is below this threshold",
     )
     parser.addoption(
+        "--l1_kv_safety_margin",
+        action="store",
+        default=64 * 1024,
+        type=int,
+        help="Bytes reserved between CB top and KV bottom when sizing the adaptive L1 KV cache (default: 65536)",
+    )
+    parser.addoption(
+        "--l1_kv_min_viable_tokens",
+        action="store",
+        default=64,
+        type=int,
+        help="Skip cores that cannot fit at least this many KV tokens after applying the safety margin (default: 64)",
+    )
+    parser.addoption(
         "--l1_memory_view_path",
         action="store",
         default=None,
         type=str,
         help="Optional JSON output path for summarized L1 memory-view snapshots from simple_text_demo",
+    )
+    parser.addoption(
+        "--use_adaptive_l1_kv_cache",
+        action="store_true",
+        default=False,
+        help="Enable the adaptive N-tier L1 KV cache (measures per-core headroom after decode compile and allocates tiers)",
     )

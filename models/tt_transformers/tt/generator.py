@@ -81,6 +81,19 @@ class Generator:
         self.trace_inputs_decode = defaultdict(lambda: None)
         self.trace_output_decode = defaultdict(lambda: None)
 
+        # Adaptive L1 KV cache deferred allocation flags.
+        # l1_kv_needs_alloc is True when any model has an l1_kv_window_size > 0
+        # OR has use_adaptive_l1_kv_cache=True (N-tier adaptive path).
+        # Allocation is triggered once after the decode compile step.
+        self.l1_kv_needs_alloc = any(
+            getattr(m_args, "l1_kv_window_size", 0) > 0 or getattr(m_args, "use_adaptive_l1_kv_cache", False)
+            for m_args in self.model_args
+        )
+        self.l1_kv_safety_margin = getattr(model_args[0], "l1_kv_safety_margin", 64 * 1024)
+        self.l1_kv_min_viable_tokens = getattr(model_args[0], "l1_kv_min_viable_tokens", 64)
+        # Used by the no-trace path to detect when the compile iteration has already run.
+        self._decode_compile_done = False
+
     def _capture_trace_prefill(
         self,
         prefill_ids,
@@ -471,6 +484,12 @@ class Generator:
         Performs text decode step.
         Returns tt_logits on device
         """
+        # No-trace path: trigger post-compile L1 KV allocation on the second call
+        # (the first call is the compile iteration; CB addresses are frozen after it returns).
+        if self.l1_kv_needs_alloc and self._decode_compile_done:
+            self._post_compile_allocate_l1_kv()
+        self._decode_compile_done = True
+
         tt_logits = []
 
         tt_tokens = []
@@ -513,6 +532,45 @@ class Generator:
 
         return tt_logits
 
+    def _post_compile_allocate_l1_kv(self):
+        """
+        Query per-core L1 headroom from the runtime and allocate the adaptive
+        HEIGHT_SHARDED L1 KV ring buffer on every attention layer.
+
+        Called exactly once, immediately after the decode compile step (when all
+        CB addresses are frozen). This is triggered by _capture_decode_trace_text
+        (trace path) or _decode_forward_no_trace_text (no-trace path).
+        """
+        if not self.l1_kv_needs_alloc:
+            return
+
+        # Query the first physical device for the headroom map.
+        mesh_dev = self.model_args[0].mesh_device
+        headroom_map = mesh_dev.get_l1_headroom_per_core()  # {(x, y): bytes}
+
+        # DEBUG: print full headroom map sorted by core coordinate
+        sorted_headroom = sorted(headroom_map.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+        headroom_lines = ", ".join(f"({x},{y}):{b}" for (x, y), b in sorted_headroom)
+        logger.info(
+            f"[L1 KV] Headroom acquired for {len(headroom_map)} cores. "
+            f"Safety margin: {self.l1_kv_safety_margin // 1024} KiB. "
+            f"min_viable_tokens: {self.l1_kv_min_viable_tokens}. "
+            f"Allocating adaptive L1 KV cache..."
+        )
+        logger.info(f"[L1 KV] Full headroom map (core: bytes): {headroom_lines}")
+
+        for model_i in self.model:
+            for layer in model_i.layers:
+                if hasattr(layer, "attention"):
+                    layer.attention.allocate_l1_kv_cache(
+                        headroom_map,
+                        safety_margin_bytes=self.l1_kv_safety_margin,
+                        min_viable_tokens=self.l1_kv_min_viable_tokens,
+                    )
+
+        self.l1_kv_needs_alloc = False
+        logger.info("[L1 KV] Adaptive L1 KV cache allocation complete.")
+
     def _capture_decode_trace_text(
         self,
         tokens,
@@ -534,6 +592,10 @@ class Generator:
             sampling_on_device=sampling_on_device,
         )
         logger.info("Done Compiling Model")
+
+        # Post-compile: allocate adaptive L1 KV cache now that all CB addresses are frozen.
+        if self.l1_kv_needs_alloc:
+            self._post_compile_allocate_l1_kv()
 
         # Get inputs ready for trace run
         device_inputs = []

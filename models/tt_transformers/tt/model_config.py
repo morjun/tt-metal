@@ -467,11 +467,17 @@ class ModelArgs:
         l1_kv_sink_size=0,
         l1_kv_use_sharded=False,
         l1_kv_min_expected_hit_ratio=0.0,
+        l1_kv_safety_margin=64 * 1024,  # bytes reserved between CB top and KV bottom
+        l1_kv_min_viable_tokens=64,  # skip cores that can't fit at least this many tokens
+        use_adaptive_l1_kv_cache=False,  # enable N-tier adaptive L1 KV cache
     ):
         self.l1_kv_window_size = l1_kv_window_size
         self.l1_kv_sink_size = l1_kv_sink_size
         self.l1_kv_use_sharded = l1_kv_use_sharded
         self.l1_kv_min_expected_hit_ratio = l1_kv_min_expected_hit_ratio
+        self.l1_kv_safety_margin = l1_kv_safety_margin
+        self.l1_kv_min_viable_tokens = l1_kv_min_viable_tokens
+        self.use_adaptive_l1_kv_cache = use_adaptive_l1_kv_cache
         if subdevice:
             self.num_devices = 1
         else:

@@ -340,6 +340,9 @@ def prepare_generator_args(
     l1_kv_sink_size=0,
     l1_kv_use_sharded=False,
     l1_kv_min_expected_hit_ratio=0.0,
+    l1_kv_safety_margin=64 * 1024,
+    l1_kv_min_viable_tokens=64,
+    use_adaptive_l1_kv_cache=False,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -373,6 +376,9 @@ def prepare_generator_args(
             l1_kv_sink_size=l1_kv_sink_size,
             l1_kv_use_sharded=l1_kv_use_sharded,
             l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
+            l1_kv_safety_margin=l1_kv_safety_margin,
+            l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
+            use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -927,6 +933,9 @@ def test_demo_text(
     l1_kv_sink_size = request.config.getoption("--l1_kv_sink_size")
     l1_kv_use_sharded = request.config.getoption("--l1_kv_use_sharded")
     l1_kv_min_expected_hit_ratio = request.config.getoption("--l1_kv_min_expected_hit_ratio")
+    l1_kv_safety_margin = request.config.getoption("--l1_kv_safety_margin")
+    l1_kv_min_viable_tokens = request.config.getoption("--l1_kv_min_viable_tokens")
+    use_adaptive_l1_kv_cache = request.config.getoption("--use_adaptive_l1_kv_cache")
     l1_memory_view_path = request.config.getoption("--l1_memory_view_path")
 
     if stress_test and token_accuracy:
@@ -1025,6 +1034,9 @@ def test_demo_text(
         l1_kv_sink_size=l1_kv_sink_size,
         l1_kv_use_sharded=l1_kv_use_sharded,
         l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
+        l1_kv_safety_margin=l1_kv_safety_margin,
+        l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
+        use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
     )
 
     # Skip ci-eval tests on P100 devices

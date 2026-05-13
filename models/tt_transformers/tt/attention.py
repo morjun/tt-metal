@@ -5,6 +5,7 @@
 import math
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
@@ -92,6 +93,7 @@ class Attention(LightweightModule):
         self.l1_kv_sink_size = getattr(configuration, "l1_kv_sink_size", 0)
         self.l1_kv_use_sharded = getattr(configuration, "l1_kv_use_sharded", False)
         self.l1_kv_min_expected_hit_ratio = getattr(configuration, "l1_kv_min_expected_hit_ratio", 0.0)
+        self.use_adaptive_l1_kv_cache = getattr(configuration, "use_adaptive_l1_kv_cache", False)
         if self.l1_kv_sink_size > 0:
             assert self.l1_kv_window_size > 0, "Pinned L1 sink tokens require a non-zero recent ring window"
         self.l1_kv_total_size = self.l1_kv_sink_size + self.l1_kv_window_size
@@ -99,6 +101,14 @@ class Attention(LightweightModule):
         self.l1_kv_window_size_tiles = (
             math.ceil(self.l1_kv_window_size / self.tile_size) if self.l1_kv_window_size > 0 else 0
         )
+        # Adaptive tier state (populated by allocate_l1_kv_cache when use_adaptive_l1_kv_cache=True)
+        # l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
+        #   t[0] k_tensor    — HEIGHT_SHARDED K cache tensor in L1
+        #   t[1] v_tensor    — HEIGHT_SHARDED V cache tensor in L1
+        #   t[2] token_start — first global token index this tier covers
+        #   t[3] tok_count   — number of tokens this tier holds
+        self.l1_kv_tiers: list = []
+        self.l1_kv_adaptive_total_capacity: int = 0  # sum of all tier tok_counts; set after allocation
 
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
         self.compute_kernel_config_hifi2_fp16 = configuration.compute_kernel_config_hifi2_fp16
@@ -396,43 +406,248 @@ class Attention(LightweightModule):
         ]
 
         if self.l1_kv_total_size > 0 and not self.paged_attention_config:
-            l1_cache_k = torch.zeros(
-                (
-                    self.batch_size_per_device_group,
-                    self.n_local_kv_heads,
-                    self.l1_kv_total_size,
-                    self.head_dim,
-                )
+            # Legacy fixed-window path: allocate exactly l1_kv_total_size tokens in L1 right now.
+            # Layout is chosen once here — no later to_memory_config() copy needed.
+            shape = (
+                self.batch_size_per_device_group,
+                self.n_local_kv_heads,
+                self.l1_kv_total_size,
+                self.head_dim,
             )
-            l1_cache_v = torch.zeros(
-                (
-                    self.batch_size_per_device_group,
-                    self.n_local_kv_heads,
-                    self.l1_kv_total_size,
-                    self.head_dim,
-                )
-            )
+            if self.l1_kv_use_sharded:
+                l1_memcfg = self._create_l1_kv_sharded_memcfg(shape)  # HEIGHT_SHARDED
+                if l1_memcfg is None:
+                    logger.warning(
+                        "[L1 KV] Could not build HEIGHT_SHARDED config; "
+                        "falling back to L1_MEMORY_CONFIG (interleaved)."
+                    )
+                    l1_memcfg = ttnn.L1_MEMORY_CONFIG
+            else:
+                l1_memcfg = ttnn.L1_MEMORY_CONFIG  # plain interleaved
+
+            l1_cache_k = torch.zeros(shape)
+            l1_cache_v = torch.zeros_like(l1_cache_k)
             self.l1_kv_cache = [
                 ttnn.as_tensor(
                     k_or_v,
                     dtype=self.kv_cache_dtype,
                     layout=self.model_config["ATTN_W_LAYOUT_TILE"],
                     device=self.mesh_device,
-                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    memory_config=l1_memcfg,  # chosen once; no re-sharding at read time
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
                 )
                 for k_or_v in [l1_cache_k, l1_cache_v]
             ]
-            self.l1_kv_sharded_memcfg = (
-                self._create_l1_kv_sharded_memcfg(
-                    (self.batch_size_per_device_group, self.n_local_kv_heads, self.l1_kv_total_size, self.head_dim)
-                )
-                if self.l1_kv_use_sharded
-                else None
+            self.l1_kv_sharded_memcfg = l1_memcfg if self.l1_kv_use_sharded else None
+            layout_str = "HEIGHT_SHARDED" if self.l1_kv_use_sharded else "L1_MEMORY_CONFIG"
+            logger.info(
+                f"[L1 KV] Fixed-window cache allocated (layer head_dim={self.head_dim}): "
+                f"{self.l1_kv_total_size} tokens, {layout_str}."
             )
+        elif self.use_adaptive_l1_kv_cache and not self.paged_attention_config:
+            # Adaptive N-tier path: defer until after decode compile so we can
+            # measure per-core headroom. allocate_l1_kv_cache() will be called by the generator.
+            self.l1_kv_cache = None
+            self.l1_kv_sharded_memcfg = None
         else:
             self.l1_kv_cache = None
             self.l1_kv_sharded_memcfg = None
+
+    def allocate_l1_kv_cache(
+        self,
+        headroom_map: dict,
+        safety_margin_bytes: int = 64 * 1024,
+        min_viable_tokens: int = 64,
+    ):
+        """
+        Post-compile deferred allocation of the adaptive N-tier L1 KV cache.
+        Called once by the generator after the decode compile step.
+
+        Only handles use_adaptive_l1_kv_cache=True.
+        The legacy fixed-window path (l1_kv_window_size > 0) is allocated
+        eagerly in init_kv_cache() and never reaches this function.
+        """
+        if self.paged_attention_config:
+            return
+        if not self.use_adaptive_l1_kv_cache:
+            return  # fixed-window path already allocated in init_kv_cache
+        if self.l1_kv_cache is not None:
+            return  # already allocated
+        self._allocate_adaptive_l1_kv_tiers(headroom_map, safety_margin_bytes)
+
+    def _allocate_adaptive_l1_kv_tiers(
+        self,
+        headroom_map: dict,
+        safety_margin_bytes: int,
+    ):
+        """
+        Non-uniform bucketed HEIGHT_SHARDED allocation.
+        Each core class (by headroom) becomes an independent tier tensor.
+        Tier i covers token range [token_start_i, token_start_i + token_count_i).
+        All 130 cores participate; high-headroom cores store more tile-rows.
+        """
+        if self.l1_kv_tiers:
+            return  # already allocated
+
+        tiers = self._build_adaptive_l1_memcfg_tiers(headroom_map, safety_margin_bytes)
+        if not tiers:
+            logger.warning("[L1 KV adaptive] No viable tiers; L1 KV cache disabled for this layer.")
+            return
+
+        token_cursor = 0
+        for memcfg, tile_rows_per_core, cores, tok_count in tiers:
+            shape = (
+                self.batch_size_per_device_group,
+                self.n_local_kv_heads,
+                tok_count,
+                self.head_dim,
+            )
+            zeros = torch.zeros(shape)
+            k_tensor = ttnn.as_tensor(
+                zeros,
+                dtype=self.kv_cache_dtype,
+                layout=self.model_config["ATTN_W_LAYOUT_TILE"],
+                device=self.mesh_device,
+                memory_config=memcfg,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            v_tensor = ttnn.as_tensor(
+                zeros,
+                dtype=self.kv_cache_dtype,
+                layout=self.model_config["ATTN_W_LAYOUT_TILE"],
+                device=self.mesh_device,
+                memory_config=memcfg,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            self.l1_kv_tiers.append((k_tensor, v_tensor, token_cursor, tok_count))
+            logger.info(
+                f"[L1 KV adaptive] Tier: {len(cores)} cores × {tile_rows_per_core} tile-rows "
+                f"= {tok_count} tokens [tokens {token_cursor}..{token_cursor + tok_count - 1}], "
+                f"{tile_rows_per_core * self.tile_size * self.head_dim * 2 // 1024} KiB/core."
+            )
+            token_cursor += tok_count
+
+        # l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
+        #   t[0] k_tensor    — HEIGHT_SHARDED K cache tensor in L1
+        #   t[1] v_tensor    — HEIGHT_SHARDED V cache tensor in L1
+        #   t[2] token_start — first global token index this tier covers
+        #   t[3] tok_count   — number of tokens this tier holds
+        total = sum(t[3] for t in self.l1_kv_tiers)  # t[3] = tok_count
+        self.l1_kv_adaptive_total_capacity = total
+        logger.info(f"[L1 KV adaptive] Total L1 KV tokens across {len(self.l1_kv_tiers)} tiers: {total}")
+
+    def _build_adaptive_l1_memcfg_tiers(
+        self,
+        headroom_map: dict,
+        safety_margin_bytes: int,
+    ) -> list:
+        """
+        Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
+        Returns list of (memcfg, tile_rows_per_core, sorted_cores, token_count) tuples,
+        ordered from lowest to highest tile-rows.
+
+        Cost formula (all 32 layers, K+V, bfloat8_b):
+            bytes_per_tile_row = tile_size * head_dim * elem_bytes * num_layers * 2
+            tile_rows_per_core = floor((H - safety_margin) / bytes_per_tile_row)
+        """
+        from collections import defaultdict
+
+        if self.kv_cache_dtype == ttnn.bfloat16:
+            elem_bytes = 2
+        elif self.kv_cache_dtype == ttnn.bfloat8_b:
+            elem_bytes = 1
+        else:
+            elem_bytes = 2
+
+        # Cost per tile-row on one core: tile_size rows × head_dim cols × K+V × all layers
+        # (num_layers factor: all layers share this core's headroom budget)
+        # Note: we don't know num_layers here, but the headroom_map already reflects the
+        # worst-case CB snapshot. We pass num_layers as a config attribute if available.
+        num_layers = getattr(self, "num_layers", 32)  # default 32 for Llama 3.1 8B
+        bytes_per_tile_row = self.tile_size * self.head_dim * elem_bytes * num_layers * 2
+
+        # Build per-core tile-row capacity (floor, ignore safety margin)
+        tier_cores: dict = defaultdict(list)  # tile_rows -> [(x,y), ...]
+        for (x, y), usable in headroom_map.items():
+            net = usable - safety_margin_bytes
+            if net <= 0:
+                continue
+            tile_rows = net // bytes_per_tile_row
+            if tile_rows < 1:
+                continue  # less than 1 tile-row: skip
+            tier_cores[tile_rows].append((x, y))
+
+        if not tier_cores:
+            return []
+
+        result = []
+        for tile_rows, cores in sorted(tier_cores.items()):
+            cores = sorted(cores)
+            n_cores = len(cores)
+            # Total flat-height rows this tier contributes:
+            #   tile_rows × n_cores tile-rows, each 32 element-rows
+            # Token count = total_flat_rows / (batch × n_local_kv_heads)
+            total_flat_rows = tile_rows * n_cores * self.tile_size
+            tok_count = total_flat_rows // (self.batch_size_per_device_group * self.n_local_kv_heads)
+            if tok_count == 0:
+                continue
+
+            # shard_shape: each core holds tile_rows tile-rows × head_dim columns
+            shard_shape = [
+                tile_rows * self.tile_size,  # shard height in elements
+                self.head_dim,  # shard width (full head)
+            ]
+            core_range_set = self._cores_to_core_range_set(cores)
+            shard_spec = ttnn.ShardSpec(
+                core_range_set,
+                shard_shape,
+                ttnn.ShardOrientation.ROW_MAJOR,
+            )
+            memcfg = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                shard_spec,
+            )
+            result.append((memcfg, tile_rows, cores, tok_count))
+
+        return result
+
+    @staticmethod
+    def _cores_to_core_range_set(cores: list) -> ttnn.CoreRangeSet:
+        """
+        Pack a sorted list of (x, y) logical core coordinates into a CoreRangeSet
+        by merging horizontally contiguous runs within the same row.
+        """
+        from collections import defaultdict
+
+        rows = defaultdict(list)
+        for x, y in cores:
+            rows[y].append(x)
+
+        ranges = []
+        for y, xs in sorted(rows.items()):
+            xs = sorted(xs)
+            run_start = xs[0]
+            prev = xs[0]
+            for x in xs[1:]:
+                if x == prev + 1:
+                    prev = x
+                else:
+                    ranges.append(
+                        ttnn.CoreRange(
+                            ttnn.CoreCoord(run_start, y),
+                            ttnn.CoreCoord(prev, y),
+                        )
+                    )
+                    run_start = x
+                    prev = x
+            ranges.append(
+                ttnn.CoreRange(
+                    ttnn.CoreCoord(run_start, y),
+                    ttnn.CoreCoord(prev, y),
+                )
+            )
+        return ttnn.CoreRangeSet(ranges)
 
     def _create_l1_kv_sharded_memcfg(self, shape):
         if self.l1_kv_total_size <= 0:
@@ -450,21 +665,94 @@ class Attention(LightweightModule):
         )
 
     def _get_sdpa_l1_cache_tensors(self):
+        # l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
+        #   t[0]: K tensor  t[1]: V tensor  t[2]: token_start  t[3]: tok_count
+        if self.l1_kv_tiers:
+            ks = [t[0] for t in self.l1_kv_tiers]  # t[0]: K tensor
+            vs = [t[1] for t in self.l1_kv_tiers]  # t[1]: V tensor
+            meta = [(t[2], t[3]) for t in self.l1_kv_tiers]  # t[2]: token_start, t[3]: tok_count
+            return ks, vs, meta, ()
+        # Fixed-window path
         if self.l1_kv_cache is None:
-            return None, None, ()
-        if not self.l1_kv_use_sharded or self.l1_kv_sharded_memcfg is None:
-            return self.l1_kv_cache[0], self.l1_kv_cache[1], ()
-        with l1_kv_perf.timed("decode.l1_sharded_view"):
-            sharded_k = ttnn.to_memory_config(self.l1_kv_cache[0], self.l1_kv_sharded_memcfg)
-            sharded_v = ttnn.to_memory_config(self.l1_kv_cache[1], self.l1_kv_sharded_memcfg)
-        return sharded_k, sharded_v, (sharded_k, sharded_v)
+            return None, None, None, ()
+        # Tensor is already in the chosen layout (L1_MEMORY_CONFIG or HEIGHT_SHARDED),
+        # decided at allocation time — no to_memory_config() copy needed here.
+        return self.l1_kv_cache[0], self.l1_kv_cache[1], None, ()
 
     def _build_l1_update_pos(self, current_pos):
-        if self.l1_kv_total_size <= 0:
-            return None
+        """Returns current_pos if any L1 KV write is needed this step, else None."""
         if self.l1_kv_window_size > 0:
-            return current_pos
+            return current_pos  # fixed-window: ring write active
+        if self.l1_kv_tiers:
+            return current_pos  # adaptive: ring write active
         return None
+
+    def _build_adaptive_l1_write_pos(self, current_pos):
+        """
+        Compute the flat L1 write position for the adaptive N-tier ring-buffer.
+        Returns a ttnn int32 tensor with the flat index in [0, T) where
+        T = l1_kv_adaptive_total_capacity.
+
+        Ring layout:
+          [0, sink_size)            — attention sink (stable, wrapped last)
+          [sink_size, T)            — recency ring of capacity (T - sink_size)
+
+        NOTE: disabled when T == 0 (no tiers allocated yet).
+        NOTE: not trace-compatible (returns None when called inside a trace);
+              the caller must guard with l1_write_enabled.
+        """
+        T = self.l1_kv_adaptive_total_capacity
+        if T == 0:
+            return None
+        ring_cap = T - self.l1_kv_sink_size
+        if ring_cap <= 0:
+            return None
+        orig_shape = current_pos.shape
+        l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
+        l1_pos = ttnn.typecast(l1_pos, ttnn.float32)
+        # ring: sink_size + (pos - sink_size) % ring_cap
+        if self.l1_kv_sink_size > 0:
+            shifted = ttnn.subtract(l1_pos, float(self.l1_kv_sink_size))
+            ringed = ttnn.remainder(shifted, float(ring_cap))
+            l1_pos = ttnn.add(ringed, float(self.l1_kv_sink_size))
+        else:
+            l1_pos = ttnn.remainder(l1_pos, float(T))
+        l1_pos = ttnn.typecast(l1_pos, ttnn.int32)
+        l1_pos = ttnn.to_layout(l1_pos, ttnn.ROW_MAJOR_LAYOUT)
+        # Strip tile padding back to original shape
+        padded_shape = l1_pos.shape
+        slice_starts = [0] * len(padded_shape)
+        slice_ends = list(padded_shape)
+        for i in range(len(orig_shape)):
+            slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
+        l1_pos = ttnn.slice(l1_pos, slice_starts, slice_ends)
+        return l1_pos
+
+    def _write_adaptive_l1_tiers(self, k_heads_l1, v_heads_l1, flat_l1_pos_tensor):
+        """
+        Dispatch the ring-buffer write to the tier whose token range contains
+        the flat write position.
+
+        flat_l1_pos_tensor is a scalar int32 ttnn tensor with value in [0, T).
+        We read it to host to pick the correct tier; this is a host sync and
+        must not be called inside a trace.
+
+        l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
+          t[0]: K tensor  t[1]: V tensor  t[2]: token_start  t[3]: tok_count
+        """
+        if not self.l1_kv_tiers:
+            return
+        pos_val = int(ttnn.to_torch(flat_l1_pos_tensor).view(-1)[0])
+        for k_tensor, v_tensor, token_start, tok_count in self.l1_kv_tiers:
+            # token_start = t[2], tok_count = t[3]
+            if token_start <= pos_val < token_start + tok_count:
+                offset = pos_val - token_start
+                offset_tensor = self._make_l1_index_tensor(torch.full_like(ttnn.to_torch(flat_l1_pos_tensor), offset))
+                ttnn.experimental.paged_update_cache(k_tensor, k_heads_l1, update_idxs_tensor=offset_tensor)
+                ttnn.experimental.paged_update_cache(v_tensor, v_heads_l1, update_idxs_tensor=offset_tensor)
+                ttnn.deallocate(offset_tensor)
+                return
+        logger.warning(f"[L1 KV adaptive] Ring write pos {pos_val} not covered by any tier — skipping.")
 
     def _make_l1_index_tensor(self, positions: torch.Tensor):
         return ttnn.from_torch(
@@ -653,6 +941,10 @@ class Attention(LightweightModule):
             with l1_kv_perf.timed("decode.l1_clone_path"):
                 k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
                 v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
+        elif self.l1_kv_tiers and not page_table and l1_write_enabled:
+            with l1_kv_perf.timed("decode.l1_clone_path"):
+                k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
+                v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
         else:
             k_heads_l1 = None
             v_heads_l1 = None
@@ -667,7 +959,15 @@ class Attention(LightweightModule):
                 values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
             )
 
-        if self.l1_kv_cache is not None and not page_table and l1_write_enabled:
+        if self.l1_kv_tiers and not page_table and l1_write_enabled:
+            # Adaptive N-tier ring-buffer write.
+            # NOTE: _write_adaptive_l1_tiers does a host sync (to_torch) — not trace-compatible.
+            with l1_kv_perf.timed("decode.adaptive_l1_kv_write"):
+                flat_pos = self._build_adaptive_l1_write_pos(current_pos)
+                if flat_pos is not None:
+                    self._write_adaptive_l1_tiers(k_heads_l1, v_heads_l1, flat_pos)
+                    ttnn.deallocate(flat_pos)
+        elif self.l1_kv_cache is not None and not page_table and l1_write_enabled:
             l1_pos = l1_update_pos
             if l1_pos is None and self.l1_kv_window_size > 0:
                 with l1_kv_perf.timed("decode.l1_index_path"):
@@ -703,8 +1003,16 @@ class Attention(LightweightModule):
             "l1_min_expected_hit_ratio": self.l1_kv_min_expected_hit_ratio,
         }
         sharded_l1_tensors = ()
-        if self.l1_kv_cache is not None:
-            sdpa_l1_k, sdpa_l1_v, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
+        if self.l1_kv_tiers:
+            # Adaptive N-tier path: pass all tier tensors + metadata to the extended SDPA op.
+            ks, vs, tier_meta, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
+            if ks:
+                sdpa_kwargs["l1_k_tensors"] = ks
+                sdpa_kwargs["l1_v_tensors"] = vs
+                sdpa_kwargs["l1_tier_token_starts"] = [m[0] for m in tier_meta]
+                sdpa_kwargs["l1_tier_token_counts"] = [m[1] for m in tier_meta]
+        elif self.l1_kv_cache is not None:
+            sdpa_l1_k, sdpa_l1_v, _, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
             sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k
             sdpa_kwargs["l1_v_tensor"] = sdpa_l1_v
 
