@@ -179,4 +179,45 @@ std::optional<DeviceAddr> SubDeviceManagerTracker::lowest_occupied_compute_l1_ad
     return lowest_addr == std::numeric_limits<DeviceAddr>::max() ? std::nullopt : std::make_optional(lowest_addr);
 }
 
+std::optional<DeviceAddr> SubDeviceManagerTracker::lowest_occupied_compute_l1_address_for_cores(
+    const CoreRangeSet& target_cores, tt::stl::Span<const SubDeviceId> sub_device_ids) const {
+    // Per-core analogue of lowest_occupied_compute_l1_address: returns the lowest L1
+    // buffer start address whose cores intersect ``target_cores``. Composed across the
+    // same allocators the global query consults (default sub-device + filtered active
+    // sub-devices). Used by program.cpp::validate_circular_buffer_region to make the
+    // CB / L1-buffer clash check per-cb-allocator-core instead of global.
+    DeviceAddr lowest_addr = std::numeric_limits<DeviceAddr>::max();
+
+    const auto& global_allocator = default_sub_device_manager_->allocator(SubDeviceId{0});
+    auto found = global_allocator->lowest_occupied_l1_address_for_cores(target_cores);
+    if (found.has_value()) {
+        lowest_addr = std::min(lowest_addr, *found);
+    }
+
+    // Default to all active sub-device ids when caller passes none, mirroring the
+    // global query's behaviour for code paths that don't specify sub-devices.
+    if (sub_device_ids.empty() && default_sub_device_manager_ != active_sub_device_manager_) {
+        sub_device_ids = tt::stl::Span<const SubDeviceId>(active_sub_device_manager_->get_sub_device_ids());
+    }
+    for (const auto& sub_device_id : sub_device_ids) {
+        const auto& allocator = this->get_active_sub_device_manager()->sub_device_allocator(sub_device_id);
+        if (!allocator) {
+            continue;
+        }
+        // Skip sub-devices that share no core with target_cores — they cannot host an
+        // L1 buffer that would intersect the cb_allocator's range, and the per-core
+        // query inside their allocator would scan an empty intersection anyway.
+        const auto& sub_cores =
+            this->get_active_sub_device_manager()->sub_device(sub_device_id).cores(HalProgrammableCoreType::TENSIX);
+        if (!sub_cores.intersects(target_cores)) {
+            continue;
+        }
+        found = allocator->lowest_occupied_l1_address_for_cores(target_cores);
+        if (found.has_value()) {
+            lowest_addr = std::min(lowest_addr, *found);
+        }
+    }
+    return lowest_addr == std::numeric_limits<DeviceAddr>::max() ? std::nullopt : std::make_optional(lowest_addr);
+}
+
 }  // namespace tt::tt_metal

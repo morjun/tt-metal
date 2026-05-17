@@ -1035,6 +1035,11 @@ std::optional<DeviceAddr> MeshDevice::lowest_occupied_compute_l1_address(
     return sub_device_manager_tracker_->lowest_occupied_compute_l1_address(sub_device_ids);
 }
 
+std::optional<DeviceAddr> MeshDevice::lowest_occupied_compute_l1_address_for_cores(
+    const CoreRangeSet& target_cores, tt::stl::Span<const SubDeviceId> sub_device_ids) const {
+    return sub_device_manager_tracker_->lowest_occupied_compute_l1_address_for_cores(target_cores, sub_device_ids);
+}
+
 void MeshDevice::update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const {
     // MeshDevice does not track CB state itself; the underlying physical Device does.
     // This path is only called when programs dispatch through the MeshDevice's

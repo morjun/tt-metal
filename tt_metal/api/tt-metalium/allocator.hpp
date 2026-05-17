@@ -102,6 +102,13 @@ public:
 
     std::optional<DeviceAddr> get_lowest_occupied_l1_address(uint32_t bank_id) const;
 
+    // Returns the lowest start address of any live L1 buffer whose cores intersect
+    // ``target_cores``. Interleaved L1 buffers (which span every compute bank) always
+    // count. Returns std::nullopt when no L1 buffer touches those cores. Used by
+    // ``program.cpp::validate_circular_buffer_region`` to make the CB / L1-buffer
+    // clash check per-cb-allocator-core instead of global across all banks.
+    std::optional<DeviceAddr> lowest_occupied_l1_address_for_cores(const CoreRangeSet& target_cores) const;
+
     void shrink_allocator_size(const BufferType& buffer_type, DeviceAddr shrink_size, bool bottom_up = true);
     void reset_allocator_size(const BufferType& buffer_type);
 

@@ -85,4 +85,42 @@ TEST_F(MeshDeviceSingleCardBufferFixture, TestL1BuffersDoNotGrowBeyondBankSize) 
         auto buffer = distributed::MeshBuffer::create(buffer_config, local_config, this->devices_[0].get()));
 }
 
+// Verifies the per-core L1 occupancy query introduced for the per-cb-allocator validate
+// check (see research_codes/documents/l1_kv_cache_cache/per_core_validate_patch_design.md).
+//
+// Interleaved L1 buffers participate in every core's query because they span every
+// compute bank (recorded with an empty-set "all cores" sentinel). After deallocation
+// the query reverts to std::nullopt.
+TEST_F(MeshDeviceSingleCardBufferFixture, TestLowestOccupiedL1AddressForCores_Interleaved) {
+    auto& mesh = this->devices_[0];
+    const auto& allocator = mesh->allocator();
+
+    const CoreCoord any_core{0, 0};
+    const CoreRangeSet any_core_set{CoreRange{any_core, any_core}};
+
+    // Empty allocator → no L1 buffer anywhere → nullopt for any core.
+    EXPECT_FALSE(allocator->lowest_occupied_l1_address_for_cores(any_core_set).has_value());
+
+    constexpr uint32_t kBufferSize = 64 * 1024;
+    distributed::DeviceLocalBufferConfig local_config{.page_size = kBufferSize, .buffer_type = BufferType::L1};
+    distributed::ReplicatedBufferConfig buffer_config{.size = kBufferSize};
+    auto buf = distributed::MeshBuffer::create(buffer_config, local_config, mesh.get());
+
+    // Interleaved L1 buffer: should be reported for any core.
+    auto reported = allocator->lowest_occupied_l1_address_for_cores(any_core_set);
+    ASSERT_TRUE(reported.has_value());
+    EXPECT_EQ(reported.value(), buf->address());
+
+    // Query with a different core — interleaved sentinel still matches.
+    const CoreCoord other_core{1, 0};
+    const CoreRangeSet other_core_set{CoreRange{other_core, other_core}};
+    auto reported_other = allocator->lowest_occupied_l1_address_for_cores(other_core_set);
+    ASSERT_TRUE(reported_other.has_value());
+    EXPECT_EQ(reported_other.value(), buf->address());
+
+    // Deallocating the buffer must remove its entry from the per-core tracker.
+    buf.reset();
+    EXPECT_FALSE(allocator->lowest_occupied_l1_address_for_cores(any_core_set).has_value());
+}
+
 }  // namespace tt::tt_metal

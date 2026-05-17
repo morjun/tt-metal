@@ -116,12 +116,28 @@ DeviceAddr Allocator::allocate_buffer(Buffer* buffer) {
     if (config_->disable_interleaved) {
         TT_FATAL(num_cores.has_value(), "Interleaved allocation is disabled, see validate_num_banks");
     }
+    // Cores the buffer actually occupies, captured only for L1 buffers so that
+    // per-cb-allocator validate (see lowest_occupied_l1_address_for_cores) can
+    // ignore L1 buffers that live on cores disjoint from a given CB region.
+    // Empty = "interleaved across all compute banks" sentinel.
+    CoreRangeSet buffer_cores{};
+    if (buffer_type == BufferType::L1 || buffer_type == BufferType::L1_SMALL) {
+        if (buffer->has_shard_spec()) {
+            buffer_cores = buffer->shard_spec().grid();
+        } else if (const auto& dist = buffer->buffer_distribution_spec(); dist.has_value()) {
+            buffer_cores = dist->core_groups().cores_with_data;
+        }
+        // else: interleaved — leave buffer_cores empty (treated as all-cores).
+    }
+    using AllocID = BankManager::AllocatorDependencies::AllocatorID;
+    constexpr AllocID kDefaultAllocId{0};
     switch (buffer_type) {
         case BufferType::DRAM:
             address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
             break;
         case BufferType::L1:
-            address = l1_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
+            address = l1_manager_->allocate_buffer(
+                size, page_size, bottom_up, config_->compute_grid, num_cores, kDefaultAllocId, buffer_cores);
             break;
         case BufferType::L1_SMALL: {
             TT_FATAL(num_cores.has_value(), "L1_SMALL only supports sharded allocations, see validate_num_banks");
@@ -317,6 +333,18 @@ std::optional<DeviceAddr> Allocator::get_lowest_occupied_l1_address(uint32_t ban
     std::lock_guard<std::mutex> lock(mutex_);
     // l1_manager always sits below l1_small_manager in the address space, so there is no need to check l1_small_manager
     return l1_manager_->lowest_occupied_address(bank_id);
+}
+
+std::optional<DeviceAddr> Allocator::lowest_occupied_l1_address_for_cores(const CoreRangeSet& target_cores) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // L1 small region sits above the main L1 region address-wise, so the absolute
+    // lowest among the two is whatever the main L1 manager reports first; only
+    // fall back to L1 small if the main L1 has no candidates touching the target.
+    auto main_addr = l1_manager_->lowest_occupied_address_for_cores(target_cores);
+    if (main_addr.has_value()) {
+        return main_addr;
+    }
+    return l1_small_manager_->lowest_occupied_address_for_cores(target_cores);
 }
 
 void Allocator::shrink_allocator_size(const BufferType& buffer_type, DeviceAddr shrink_size, bool bottom_up) {

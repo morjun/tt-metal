@@ -939,9 +939,17 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
 void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device) {
     // ZoneScoped;
 
+    // The check below uses a PER-cb_allocator lowest_occupied_l1_address (= lowest
+    // start of any live L1 buffer whose cores intersect this allocator's core range)
+    // rather than a global lowest. Rationale: the validate fires only on a real
+    // clash — an L1 buffer that sits below a CB region ON THE SAME CORES. A buffer
+    // on cores disjoint from the cb_allocator's range cannot collide with these CBs
+    // and must not falsely trigger the assertion. The global lowest semantics made
+    // the adaptive multi-tier KV cache (where the deepest stack is on one tier's
+    // cores and the highest CB top is on a different tier's cores) unsatisfiable.
+    // See research_codes/documents/l1_kv_cache_cache/per_core_validate_patch_design.md
     // TODO: Circular buffer allocation and validation could be better optimized by determining usage per sub-device
-    std::optional<DeviceAddr> lowest_address =
-        device->lowest_occupied_compute_l1_address(this->determine_sub_device_ids(device));
+    const auto sub_device_ids = this->determine_sub_device_ids(device);
     uint32_t max_l1_size = device->l1_size_per_core();
 
     for (const CircularBufferAllocator& cb_allocator : this->cb_allocators_) {
@@ -949,6 +957,9 @@ void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device)
             continue;
         }
         uint64_t cb_region_end = cb_allocator.l1_regions.back().second;  // cb_allocator.get_cb_region_end();
+        const CoreRangeSet cb_cores{cb_allocator.core_range};
+        std::optional<DeviceAddr> lowest_address =
+            device->lowest_occupied_compute_l1_address_for_cores(cb_cores, sub_device_ids);
         log_l1_cb_map(this->id, this->runtime_id, cb_allocator, "validate", cb_region_end, max_l1_size, lowest_address);
         // Update the device-side per-core CB floor tracker for headroom introspection.
         device->update_max_cb_end(cb_allocator.core_range, cb_region_end);

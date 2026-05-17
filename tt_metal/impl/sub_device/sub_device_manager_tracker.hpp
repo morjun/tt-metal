@@ -57,6 +57,14 @@ public:
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids = {}) const;
 
+    // Returns the lowest start address of any live L1 buffer whose cores intersect
+    // ``target_cores``, considering both the default sub-device's global allocator and
+    // each active sub-device's allocator (filtered by ``sub_device_ids`` exactly the
+    // way the existing global query does). Returns std::nullopt when no L1 buffer
+    // touches those cores in any of the consulted allocators.
+    std::optional<DeviceAddr> lowest_occupied_compute_l1_address_for_cores(
+        const CoreRangeSet& target_cores, tt::stl::Span<const SubDeviceId> sub_device_ids = {}) const;
+
 private:
     void reset_sub_device_state(const std::unique_ptr<SubDeviceManager>& sub_device_manager);
 

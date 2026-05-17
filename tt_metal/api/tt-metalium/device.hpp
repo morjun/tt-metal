@@ -142,6 +142,13 @@ public:
     virtual std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids) const = 0;
 
+    // Per-core analogue of lowest_occupied_compute_l1_address: returns the lowest L1
+    // buffer start address whose cores intersect ``target_cores``. Used by
+    // ``program.cpp::validate_circular_buffer_region`` to make the CB / L1-buffer
+    // clash check per-cb-allocator-core instead of global across all banks.
+    virtual std::optional<DeviceAddr> lowest_occupied_compute_l1_address_for_cores(
+        const CoreRangeSet& target_cores, tt::stl::Span<const SubDeviceId> sub_device_ids = {}) const = 0;
+
     // Per-core L1 headroom introspection for adaptive KV cache placement.
     // update_max_cb_end is called during program CB allocation to track the
     // worst-case CB floor per core across all compiled programs.

@@ -109,6 +109,7 @@ void BankManager::init_allocators(DeviceAddr size_bytes, uint32_t alignment_byte
     allocators_.resize(n);
     allocated_buffers_.resize(n);
     allocated_ranges_cache_.resize(n);
+    l1_buffer_cores_.resize(n);
 
     for (uint32_t allocator_id = 0; allocator_id < n; ++allocator_id) {
         allocators_[allocator_id] = std::make_unique<allocator::FreeListOpt>(
@@ -389,7 +390,8 @@ uint64_t BankManager::allocate_buffer(
     bool bottom_up,
     const CoreRangeSet& compute_grid,
     std::optional<uint32_t> num_shards,
-    BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    BankManager::AllocatorDependencies::AllocatorID allocator_id,
+    const CoreRangeSet& buffer_cores) {
     auto* alloc = this->get_allocator_from_id(allocator_id);
     TT_FATAL(alloc, "Allocator not initialized!");
 
@@ -430,6 +432,9 @@ uint64_t BankManager::allocate_buffer(
             size_per_bank,
             bank_size());
         allocated_buffers_[allocator_id.get()].insert(address.value());
+        if (buffer_type_ == BufferType::L1) {
+            l1_buffer_cores_[allocator_id.get()].emplace(address.value(), buffer_cores);
+        }
         // No neighbors, nothing to invalidate
         return address.value();
     }
@@ -478,6 +483,9 @@ uint64_t BankManager::allocate_buffer(
     auto address = alloc->allocate_at_address(chosen.value(), size_per_bank);
     TT_FATAL(address.has_value(), "Allocator failed to place at chosen address {}", chosen.value());
     allocated_buffers_[allocator_id.get()].insert(address.value());
+    if (buffer_type_ == BufferType::L1) {
+        l1_buffer_cores_[allocator_id.get()].emplace(address.value(), buffer_cores);
+    }
     // Allocation in this allocator invalidates caches in allocators that depend on this allocator
     this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
     return address.value();
@@ -488,6 +496,9 @@ void BankManager::deallocate_buffer(DeviceAddr address, BankManager::AllocatorDe
     TT_FATAL(alloc, "Allocator not initialized!");
     alloc->deallocate(address);
     allocated_buffers_[allocator_id.get()].erase(address);
+    if (buffer_type_ == BufferType::L1) {
+        l1_buffer_cores_[allocator_id.get()].erase(address);
+    }
     // Deallocation in this allocator invalidates caches in allocators that depend on this allocator
     this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
 }
@@ -500,6 +511,9 @@ void BankManager::deallocate_all() {
             alloc->deallocate(addr);
         }
         allocated_buffers_[allocator_id.get()].clear();
+        if (buffer_type_ == BufferType::L1) {
+            l1_buffer_cores_[allocator_id.get()].clear();
+        }
         allocated_ranges_cache_[allocator_id.get()].reset();
     }
 }
@@ -509,6 +523,9 @@ void BankManager::clear() {
         if (allocators_[allocator_id.get()]) {
             allocators_[allocator_id.get()]->clear();
             allocated_buffers_[allocator_id.get()].clear();
+            if (buffer_type_ == BufferType::L1) {
+                l1_buffer_cores_[allocator_id.get()].clear();
+            }
         }
         allocated_ranges_cache_[allocator_id.get()].reset();
     }
@@ -523,6 +540,7 @@ BankManager& BankManager::operator=(BankManager&& that) noexcept {
     alignment_bytes_ = that.alignment_bytes_;
     allocator_dependencies_ = std::move(that.allocator_dependencies_);
     allocated_ranges_cache_ = std::move(that.allocated_ranges_cache_);
+    l1_buffer_cores_ = std::move(that.l1_buffer_cores_);
     return *this;
 }
 
@@ -538,6 +556,35 @@ std::optional<DeviceAddr> BankManager::lowest_occupied_address(
     }
     DeviceAddr adjusted_abs_addr = lowest_address.value() + this->bank_offset(bank_id);
     return adjusted_abs_addr;
+}
+
+std::optional<DeviceAddr> BankManager::lowest_occupied_address_for_cores(
+    const CoreRangeSet& target_cores, BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    // Tracking only populated for L1; other buffer types fall back to nullopt so
+    // callers get the same "no occupancy info" answer for DRAM/L1_SMALL/TRACE.
+    if (buffer_type_ != BufferType::L1) {
+        return std::nullopt;
+    }
+    const auto id = allocator_id.get();
+    if (id >= l1_buffer_cores_.size()) {
+        return std::nullopt;
+    }
+    const auto& live = l1_buffer_cores_[id];
+    if (live.empty()) {
+        return std::nullopt;
+    }
+    DeviceAddr lowest = std::numeric_limits<DeviceAddr>::max();
+    bool any = false;
+    for (const auto& [addr, cores] : live) {
+        // Empty core set is the sentinel for "interleaved across every compute bank"
+        // — those buffers participate in every per-core query.
+        const bool is_interleaved = cores.ranges().empty();
+        if (is_interleaved || cores.intersects(target_cores)) {
+            lowest = std::min(lowest, addr);
+            any = true;
+        }
+    }
+    return any ? std::make_optional(lowest) : std::nullopt;
 }
 
 Statistics BankManager::get_statistics(BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
@@ -669,6 +716,14 @@ void BankManager::apply_state(
 
         // Track the allocation
         allocated_buffers_[target_allocator_id.get()].insert(start_addr);
+        if (buffer_type_ == BufferType::L1) {
+            // Serialized state carries addresses but not the original sharded core
+            // sets. Register with the empty-set "interleaved / all-cores" sentinel so
+            // a per-core query treats restored buffers as touching every core. This
+            // is conservative — validate may over-fire after a state restore but will
+            // never silently miss a real clash.
+            l1_buffer_cores_[target_allocator_id.get()].emplace(start_addr, CoreRangeSet{});
+        }
     }
 
     // Invalidate caches for dependent allocators
@@ -688,6 +743,9 @@ void BankManager::override_state(
         alloc->deallocate(addr);
     }
     allocated_buffers_[target_allocator_id.get()].clear();
+    if (buffer_type_ == BufferType::L1) {
+        l1_buffer_cores_[target_allocator_id.get()].clear();
+    }
     allocated_ranges_cache_[target_allocator_id.get()].reset();
 
     // Apply state

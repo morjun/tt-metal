@@ -98,7 +98,13 @@ public:
         bool bottom_up,
         const CoreRangeSet& compute_grid,
         std::optional<uint32_t> num_shards,
-        AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0});
+        AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0},
+        // Cores the buffer actually occupies. Used only for per-core L1 occupancy
+        // queries (lowest_occupied_address_for_cores). For sharded buffers, pass
+        // shard_spec.grid() / distribution_spec cores. For interleaved buffers,
+        // leave default-constructed: the empty set is treated as a sentinel
+        // meaning "every compute bank" by the per-core query.
+        const CoreRangeSet& buffer_cores = CoreRangeSet{});
 
     void deallocate_buffer(
         DeviceAddr address, AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0});
@@ -108,6 +114,15 @@ public:
 
     std::optional<DeviceAddr> lowest_occupied_address(
         uint32_t bank_id,
+        AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0}) const;
+
+    // Returns the lowest L1 buffer start address among currently-live L1 buffers whose
+    // core set intersects ``target_cores``. Interleaved L1 buffers (recorded with an
+    // empty core set) always count. Sharded L1 buffers only count when their shard cores
+    // overlap ``target_cores``. Returns std::nullopt when no L1 buffer touches those
+    // cores, or when this BankManager is not managing BufferType::L1.
+    std::optional<DeviceAddr> lowest_occupied_address_for_cores(
+        const CoreRangeSet& target_cores,
         AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0}) const;
 
     Statistics get_statistics(
@@ -165,6 +180,16 @@ private:
     // Track allocations per allocator
     ttsl::SmallVector<std::unordered_set<DeviceAddr>> allocated_buffers_{};
     ttsl::SmallVector<std::unique_ptr<allocator::Algorithm>> allocators_{};
+
+    // Per-allocator map: live L1 buffer start address -> cores it occupies.
+    // - Sharded L1 buffer: cores = shard_spec.grid() (or buffer distribution cores).
+    // - Interleaved L1 buffer: cores = empty CoreRangeSet (sentinel meaning "all
+    //   compute banks").
+    // Only populated when ``buffer_type_ == BufferType::L1``; DRAM / TRACE / L1_SMALL
+    // BankManagers skip the bookkeeping.
+    // Used exclusively by ``lowest_occupied_address_for_cores`` to support the
+    // per-cb-allocator validate check in program.cpp. Not in the dispatch hot path.
+    ttsl::SmallVector<std::unordered_map<DeviceAddr, CoreRangeSet>> l1_buffer_cores_{};
 
     // Per-allocator cache of: merged allocated ranges of all other dependent allocators
     ttsl::SmallVector<std::optional<std::vector<std::pair<DeviceAddr, DeviceAddr>>>> allocated_ranges_cache_{};
