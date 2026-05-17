@@ -26,6 +26,8 @@ struct ScaledDotProductAttentionDecode {
     const std::optional<bool> share_cache;
     const uint32_t l1_sink_size;
     const float l1_min_expected_hit_ratio;
+    const std::vector<uint32_t> l1_tier_token_starts;  // absolute token start per tier
+    const std::vector<uint32_t> l1_tier_token_counts;  // token count per tier
 
     const std::optional<bool> use_mla;
     const std::optional<uint32_t> head_dim_v;

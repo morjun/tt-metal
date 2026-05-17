@@ -93,6 +93,9 @@ class Generator:
         self.l1_kv_min_viable_tokens = getattr(model_args[0], "l1_kv_min_viable_tokens", 64)
         # Used by the no-trace path to detect when the compile iteration has already run.
         self._decode_compile_done = False
+        # True after the warmup step (step 2) has run for the improved live-scan path.
+        # Not needed for the JSON path (allocation happens immediately after compile).
+        self._l1_kv_warmup_done = False
 
     def _capture_trace_prefill(
         self,
@@ -484,11 +487,92 @@ class Generator:
         Performs text decode step.
         Returns tt_logits on device
         """
-        # No-trace path: trigger post-compile L1 KV allocation on the second call
-        # (the first call is the compile iteration; CB addresses are frozen after it returns).
+        # No-trace path: L1 KV allocation dispatch.
+        #
+        # Both JSON and live-scan paths follow the SAME sequence:
+        #   Step 1 (compile decode): run normally. This raises the L1 bottom-up
+        #           watermark past every program's static CB region end.
+        #           We mark _decode_compile_done after it returns.
+        #   Step 2 (allocate+decode): first call _post_compile_allocate_l1_kv()
+        #           (reads from JSON or live scan), THEN run the normal decode body.
+        #
+        # Why must allocation happen AFTER step 1?
+        #   The HEIGHT_SHARDED KV tensor is placed by the L1 bottom-up allocator at
+        #   the first free address. Before step 1 runs, that address may be inside a
+        #   static CB region of a later program (e.g. embedding at 0..110976). Step 1
+        #   runs ALL programs, which registers their CB regions and raises the watermark
+        #   above max(cb_region_end) across all programs. Only then is it safe to place
+        #   the KV buffer, as the allocator will land it above all CB regions.
+        #
+        # For the live-scan path, step 2 runs the inlined decode body first to ensure
+        # output tensors are alive during the headroom query (more accurate estimate).
+        _has_json = bool(getattr(self.model_args[0], "l1_kv_headroom_json", None))
         if self.l1_kv_needs_alloc and self._decode_compile_done:
-            self._post_compile_allocate_l1_kv()
+            if _has_json:
+                # JSON path: allocate now (bottom-up watermark is already raised
+                # by the compile step). Read headroom from the offline JSON.
+                self._post_compile_allocate_l1_kv()
+            elif self._l1_kv_warmup_done:
+                # Live-scan path: warmup step already ran and scan+alloc done.
+                # This branch is a safety net; normally won't be reached.
+                self._post_compile_allocate_l1_kv()
+            else:
+                # Live-scan path, warmup step: run the full decode body FIRST,
+                # then scan headroom while output tensors are still alive.
+                self._l1_kv_warmup_done = True
+                self._decode_compile_done = True  # prevent re-triggering on next call
+                tt_logits_warmup = []
+                tt_tokens_w = []
+                tt_current_pos_w = []
+                tt_rot_mat_idxs_w = []
+                tt_page_table_w = []
+                tt_l1_update_pos_w = []
+                tt_l1_write_enabled_w = []
+                for i in range(self.data_parallel):
+                    user_page_table_w = page_table[i] if page_table is not None else None
+                    model_i_w = self.model[i]
+                    (
+                        tt_tokens_wi,
+                        tt_current_pos_wi,
+                        tt_rot_mat_idxs_wi,
+                        tt_page_table_wi,
+                        tt_l1_update_pos_wi,
+                        tt_l1_write_enabled_wi,
+                    ) = model_i_w.prepare_inputs_decode(tokens[i], current_pos[i], user_page_table_w)
+                    tt_tokens_w.append(tt_tokens_wi)
+                    tt_current_pos_w.append(tt_current_pos_wi)
+                    tt_rot_mat_idxs_w.append(tt_rot_mat_idxs_wi)
+                    tt_page_table_w.append(tt_page_table_wi)
+                    tt_l1_update_pos_w.append(tt_l1_update_pos_wi)
+                    tt_l1_write_enabled_w.append(tt_l1_write_enabled_wi)
+                for i in range(self.data_parallel):
+                    user_kv_cache_w = kv_cache[i] if kv_cache is not None else None
+                    tt_logits_wi = self.model[i].ttnn_decode_forward(
+                        tt_tokens_w[i],
+                        tt_current_pos_w[i],
+                        rot_mat_idxs=tt_rot_mat_idxs_w[i],
+                        page_table=tt_page_table_w[i],
+                        l1_update_pos=tt_l1_update_pos_w[i],
+                        l1_write_enabled=tt_l1_write_enabled_w[i],
+                        kv_cache=user_kv_cache_w,
+                        sampling_on_device=sampling_on_device,
+                    )
+                    tt_logits_warmup.append(tt_logits_wi)
+                # Output tensors still alive here — scan captures transient top-down buffers.
+                self._post_compile_allocate_l1_kv()
+                return tt_logits_warmup
         self._decode_compile_done = True
+
+        # T3 / T4 diagnostic checkpoints. Fire only on the first step after
+        # _post_compile_allocate_l1_kv stashed a T2 snapshot, then clear so we
+        # don't re-log every token. Diff against T2 shows what step 2's pre-decode
+        # ops (prepare_inputs_decode, then ttnn_decode_forward internals) allocate.
+        _t3_t4_active = getattr(self, "_t2_headroom_map", None) is not None
+        if _t3_t4_active:
+            mesh_dev = self.model_args[0].mesh_device
+            logger.info("[L1 KV checkpoint] === T3: start of step-2 decode body, pre prepare_inputs_decode ===")
+            t3_map = mesh_dev.get_l1_headroom_per_core()
+            self._log_post_alloc_diff(self._t2_headroom_map, t3_map, tag="T2→T3")
 
         tt_logits = []
 
@@ -516,6 +600,12 @@ class Generator:
             tt_l1_update_pos.append(tt_l1_update_pos_i)
             tt_l1_write_enabled.append(tt_l1_write_enabled_i)
 
+        if _t3_t4_active:
+            logger.info("[L1 KV checkpoint] === T4: after prepare_inputs_decode, pre ttnn_decode_forward ===")
+            t4_map = self.model_args[0].mesh_device.get_l1_headroom_per_core()
+            self._log_post_alloc_diff(self._t2_headroom_map, t4_map, tag="T2→T4")
+            self._t2_headroom_map = None  # consume — diagnostics fire once
+
         for i in range(self.data_parallel):
             user_kv_cache = kv_cache[i] if kv_cache is not None else None
             tt_logits_i = self.model[i].ttnn_decode_forward(
@@ -534,19 +624,33 @@ class Generator:
 
     def _post_compile_allocate_l1_kv(self):
         """
-        Query per-core L1 headroom from the runtime and allocate the adaptive
-        HEIGHT_SHARDED L1 KV ring buffer on every attention layer.
+        Allocate adaptive L1 KV cache tiers after CB addresses are frozen.
 
-        Called exactly once, immediately after the decode compile step (when all
-        CB addresses are frozen). This is triggered by _capture_decode_trace_text
-        (trace path) or _decode_forward_no_trace_text (no-trace path).
+        Headroom source (in priority order):
+          1. JSON path  -- ``model_args.l1_kv_headroom_json`` is set:
+                          load ``gap_bytes_free_headroom`` from an offline profiling
+                          JSON produced by TT_METAL_LOG_L1_CB_MAP.  This is the most
+                          accurate source: it captures both CB and mid-step transient
+                          top-down allocations.
+          2. Live-scan  -- called AFTER a warmup decode step so that output tensors are
+                          still alive, capturing more of the transient top-down region
+                          than a between-step scan would.
         """
         if not self.l1_kv_needs_alloc:
             return
 
-        # Query the first physical device for the headroom map.
         mesh_dev = self.model_args[0].mesh_device
-        headroom_map = mesh_dev.get_l1_headroom_per_core()  # {(x, y): bytes}
+        logger.info("[L1 KV checkpoint] === T1: before any KV tier allocation ===")
+        live_headroom_map = mesh_dev.get_l1_headroom_per_core()  # always probe, used for diff
+
+        json_path = getattr(self.model_args[0], "l1_kv_headroom_json", None)
+        if json_path:
+            headroom_map = self._load_headroom_json(json_path)
+            logger.info(f"[L1 KV] Using offline headroom JSON: {json_path} ({len(headroom_map)} cores)")
+            self._log_headroom_diff(headroom_map, live_headroom_map)
+        else:
+            headroom_map = live_headroom_map
+            logger.info("[L1 KV] Using live headroom scan (improved: mid-step measurement)")
 
         # DEBUG: print full headroom map sorted by core coordinate
         sorted_headroom = sorted(headroom_map.items(), key=lambda kv: (kv[0][1], kv[0][0]))
@@ -558,6 +662,7 @@ class Generator:
             f"Allocating adaptive L1 KV cache..."
         )
         logger.info(f"[L1 KV] Full headroom map (core: bytes): {headroom_lines}")
+        self._log_padding_overhead()
 
         for model_i in self.model:
             for layer in model_i.layers:
@@ -570,6 +675,146 @@ class Generator:
 
         self.l1_kv_needs_alloc = False
         logger.info("[L1 KV] Adaptive L1 KV cache allocation complete.")
+
+        # T2 checkpoint: capture per-bank top_down/cb_end immediately after KV alloc.
+        # Diff against T1 tells us exactly which banks the KV tiers landed on and how
+        # much top-down space each consumed.
+        logger.info("[L1 KV checkpoint] === T2: immediately after all KV tier allocations ===")
+        post_alloc_map = mesh_dev.get_l1_headroom_per_core()
+        self._log_post_alloc_diff(live_headroom_map, post_alloc_map, tag="T1→T2")
+        self._t2_headroom_map = post_alloc_map  # stash for T3 comparison
+
+    @staticmethod
+    def _log_post_alloc_diff(t1: dict, t2: dict, tag: str = "Δ") -> None:
+        """Headroom change `tag` (e.g. 'T1→T2'). Negative delta = headroom shrank
+        (= top-down stack grew). Positive delta on an off-tier core is unexpected."""
+        common = sorted(set(t1.keys()) & set(t2.keys()))
+        deltas = [(c, t2[c] - t1[c]) for c in common]
+        deltas_sorted = sorted(deltas, key=lambda kv: kv[1])
+        most_neg = deltas_sorted[:16]
+        unchanged = [c for c, d in deltas if d == 0]
+        logger.info(
+            f"[{tag}] {len(deltas)} cores; {len(unchanged)} unchanged; "
+            f"min={deltas_sorted[0][1]:+d} B, max={deltas_sorted[-1][1]:+d} B"
+        )
+        logger.info(
+            f"[{tag}] 16 most-negative (= biggest top-down growth): "
+            + ", ".join(f"({x},{y}):{d:+d}" for (x, y), d in most_neg)
+        )
+
+    @staticmethod
+    def _load_headroom_json(path: str) -> dict:
+        """
+        Load gap_bytes_free_headroom per core from an offline profiling JSON.
+
+        Expected JSON format (produced by TT_METAL_LOG_L1_CB_MAP profiling tool)::
+
+            {
+              "(x,y)": {
+                "gap_bytes_free_headroom": 343424,
+                ...
+              },
+              ...
+            }
+
+        Returns
+        -------
+        dict[(int, int), int]
+            Mapping from ``(x, y)`` core coordinate to available headroom bytes.
+        """
+        import json
+        import re
+
+        with open(path) as f:
+            raw = json.load(f)
+
+        headroom_map = {}
+        for key, val in raw.items():
+            m = re.match(r"\((\d+),(\d+)\)", key)
+            if m:
+                headroom_map[(int(m.group(1)), int(m.group(2)))] = int(val["gap_bytes_free_headroom"])
+
+        if not headroom_map:
+            raise ValueError(f"[L1 KV] No valid core entries found in headroom JSON: {path}")
+        return headroom_map
+
+    @staticmethod
+    def _log_headroom_diff(json_map: dict, live_map: dict) -> None:
+        """
+        Compare offline JSON headroom against a live scan taken at allocation time.
+
+        delta = live - json
+          delta < 0 → live reports LESS free space than the JSON promised (cores
+                      where some persistent buffer exists now that wasn't there
+                      at JSON-capture time, or where the current code path keeps
+                      a different intermediate alive). These are the cores most
+                      likely to OOM when we try to consume the JSON budget.
+          delta > 0 → live reports MORE free space (transient peak from JSON
+                      profile no longer in flight; expected and harmless).
+        """
+        common = sorted(set(json_map.keys()) & set(live_map.keys()))
+        if not common:
+            logger.warning("[L1 KV diff] No overlapping cores between JSON and live maps")
+            return
+
+        deltas = [(core, live_map[core] - json_map[core]) for core in common]
+        deltas_sorted = sorted(deltas, key=lambda kv: kv[1])  # ascending: worst (most negative) first
+
+        n_neg = sum(1 for _, d in deltas if d < 0)
+        n_zero = sum(1 for _, d in deltas if d == 0)
+        n_pos = sum(1 for _, d in deltas if d > 0)
+        min_d = deltas_sorted[0][1]
+        max_d = deltas_sorted[-1][1]
+        avg_d = sum(d for _, d in deltas) // len(deltas)
+        json_only = set(json_map.keys()) - set(live_map.keys())
+        live_only = set(live_map.keys()) - set(json_map.keys())
+
+        logger.info(
+            f"[L1 KV diff] live - json: {n_neg} cores LESS, {n_zero} equal, {n_pos} MORE "
+            f"(min={min_d:+d} B, max={max_d:+d} B, avg={avg_d:+d} B); "
+            f"json_only={len(json_only)}, live_only={len(live_only)}"
+        )
+        worst = deltas_sorted[:16]
+        worst_str = ", ".join(f"({x},{y}):{d:+d}" for (x, y), d in worst)
+        logger.info(f"[L1 KV diff] 16 most-negative deltas (live<json): {worst_str}")
+        best = deltas_sorted[-8:]
+        best_str = ", ".join(f"({x},{y}):{d:+d}" for (x, y), d in best)
+        logger.info(f"[L1 KV diff] 8 most-positive deltas (live>json): {best_str}")
+        if json_only:
+            logger.info(f"[L1 KV diff] cores present only in JSON: {sorted(json_only)}")
+        if live_only:
+            logger.info(f"[L1 KV diff] cores present only in live scan: {sorted(live_only)}")
+
+    def _log_padding_overhead(self) -> None:
+        """
+        Log raw vs padded per-tile cost for the KV dtype so we can quantify how
+        much the ``_build_adaptive_l1_memcfg_tiers`` budget formula under-counts.
+
+        Llama 3.1 8B uses bfloat8_b for KV, which stores 1 mantissa byte per
+        element plus a shared-exponent byte per 16 elements → 1088 B per 32×32
+        tile (instead of the naive 1024 B). The formula in attention.py uses
+        elem_bytes=1 with no per-tile exponent term, so it under-counts by
+        1088 / 1024 ≈ 6.25%. The OOM messages in the failing run confirm this:
+            Tier 1 (1 tile-row × 4 tile-wide):  raw 4096   actual 4352   (+6.25%)
+            Tier 2 (2 tile-rows × 4 tile-wide): raw 8192   actual 8704   (+6.25%)
+            Tier 3 (4 tile-rows × 4 tile-wide): raw 16384  actual 17408  (+6.25%)
+        """
+        per_tile_raw_b16 = 32 * 32 * 2
+        per_tile_padded_bfp8 = 1088  # 1024 mantissa + 64 exponent bytes
+        per_tile_raw_bfp8 = 1024
+        overhead_pct_bfp8 = 100 * (per_tile_padded_bfp8 - per_tile_raw_bfp8) / per_tile_raw_bfp8
+        logger.info(
+            f"[L1 KV padding] per-tile sizes: bfloat16={per_tile_raw_b16} B (no exponent overhead); "
+            f"bfloat8_b={per_tile_padded_bfp8} B actual vs {per_tile_raw_bfp8} B in budget formula "
+            f"(+{overhead_pct_bfp8:.2f}% under-counted)."
+        )
+        logger.info(
+            f"[L1 KV padding] attention.py:_build_adaptive_l1_memcfg_tiers uses "
+            f"`tile_size * head_dim * elem_bytes` which equals raw tile bytes for bfloat16 "
+            f"but ignores the exponent bytes for bfloat8_b. If KV dtype is bfloat8_b, the "
+            f"per-tile-row budget is under-counted by ~6.25% per layer, accumulating across "
+            f"all layers (e.g. 32 layers × ~6% ≈ 16 KiB unaccounted on the highest tier)."
+        )
 
     def _capture_decode_trace_text(
         self,

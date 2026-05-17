@@ -162,3 +162,5 @@ tests/test_output_5.log
 tests/test_output.log
 l1_cb_artifacts*/
 l1_kv512_artifacts_v2/
+l1_1_layer/
+research_codes/documents/l1_kv_cache_cache/results

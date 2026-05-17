@@ -71,7 +71,11 @@ void py_bind_sdpa_decode(py::module& module) {
                uint32_t l1_sink_size,
                float l1_min_expected_hit_ratio,
                const std::optional<const Tensor>& l1_k_tensor,
-               const std::optional<const Tensor>& l1_v_tensor) {
+               const std::optional<const Tensor>& l1_v_tensor,
+               const std::vector<std::optional<const Tensor>>& l1_k_tensors,
+               const std::vector<std::optional<const Tensor>>& l1_v_tensors,
+               const std::vector<uint32_t>& l1_tier_token_starts,
+               const std::vector<uint32_t>& l1_tier_token_counts) {
                 return self(
                     input_tensor_q,
                     input_tensor_k,
@@ -89,7 +93,11 @@ void py_bind_sdpa_decode(py::module& module) {
                     l1_sink_size,
                     l1_min_expected_hit_ratio,
                     l1_k_tensor,
-                    l1_v_tensor);
+                    l1_v_tensor,
+                    l1_k_tensors,
+                    l1_v_tensors,
+                    l1_tier_token_starts,
+                    l1_tier_token_counts);
             },
             py::arg("input_tensor_q").noconvert(),
             py::arg("input_tensor_k").noconvert(),
@@ -108,7 +116,11 @@ void py_bind_sdpa_decode(py::module& module) {
             py::arg("l1_sink_size").noconvert() = 0,
             py::arg("l1_min_expected_hit_ratio").noconvert() = 0.0f,
             py::arg("l1_k_tensor").noconvert() = std::nullopt,
-            py::arg("l1_v_tensor").noconvert() = std::nullopt});
+            py::arg("l1_v_tensor").noconvert() = std::nullopt,
+            py::arg("l1_k_tensors").noconvert() = std::vector<std::optional<const Tensor>>(),
+            py::arg("l1_v_tensors").noconvert() = std::vector<std::optional<const Tensor>>(),
+            py::arg("l1_tier_token_starts").noconvert() = std::vector<uint32_t>(),
+            py::arg("l1_tier_token_counts").noconvert() = std::vector<uint32_t>()});
 
     using PagedOperationType = decltype(ttnn::transformer::paged_scaled_dot_product_attention_decode);
     ttnn::bind_registered_operation(

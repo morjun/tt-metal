@@ -604,8 +604,246 @@ void read_kv_mask_chunks(
     }
 }
 
-// Dual-source version: reads from L1 for pinned sink rows and/or the recent L1 ring window, DRAM otherwise.
-// l1_k_reader/l1_v_reader: TensorAccessors pointing to the L1 KV cache tensors.
+// N-tier flat-range version: dispatches each tile to the tier whose token range contains it, or DRAM.
+// tier_start_tiles[i] and tier_size_tiles[i] define the flat token range for tier i.
+// head_base is (batch_offset + head_offset) in UNITS OF ONE HEAD's stride within the tier tensor.
+// Tile ids within each tier tensor: head_base * tier_size_tiles[i] * DHt + local_row * DHt + col
+template <
+    uint32_t DHt,
+    uint32_t vDHt,
+    uint32_t barrier_threshold,
+    uint32_t mask_tile_bytes,
+    uint32_t PNHt,
+    bool use_attention_mask,
+    uint32_t cb_k_in,
+    uint32_t cb_v_in,
+    uint32_t cb_mask_in,
+    bool reuse_k,
+    uint32_t num_tiers,
+    typename KReaderType,
+    typename VReaderType,
+    typename MaskReaderType,
+    typename L1K0,
+    typename L1V0,
+    typename L1K1,
+    typename L1V1,
+    typename L1K2,
+    typename L1V2,
+    typename L1K3,
+    typename L1V3,
+    typename L1K4,
+    typename L1V4>
+void read_kv_mask_chunks_n_tier(
+    uint32_t k_chunk_start,
+    uint32_t k_chunk_end,
+    uint32_t k_start_tile_id,
+    uint32_t mask_start_tile_id,
+    uint32_t Sk_chunk_t,
+    uint32_t k_chunk_tiles,
+    uint32_t v_chunk_tiles,
+    uint32_t mask_chunk_tiles,
+    const KReaderType& k_reader,
+    const VReaderType& v_reader,
+    const MaskReaderType& mask_reader,
+    uint32_t k_tile_bytes,
+    uint32_t v_tile_bytes,
+    uint32_t PSt,
+    // N-tier L1 params
+    uint32_t l1_kv_head_base,  // (batch_offset + head_offset) in head units
+    uint32_t l1_min_expected_hit_ratio_mille,
+    const uint32_t* tier_start_tiles,  // [5] array of start token tile indices
+    const uint32_t* tier_size_tiles,   // [5] array of token tile counts per tier
+    const L1K0& l1_k0_rd,
+    const L1V0& l1_v0_rd,
+    const L1K1& l1_k1_rd,
+    const L1V1& l1_v1_rd,
+    const L1K2& l1_k2_rd,
+    const L1V2& l1_v2_rd,
+    const L1K3& l1_k3_rd,
+    const L1V3& l1_v3_rd,
+    const L1K4& l1_k4_rd,
+    const L1V4& l1_v4_rd) {
+    // Compute total hot tiles to decide whether L1 reads are worth it
+    uint32_t seq_tiles = k_chunk_end * Sk_chunk_t;
+    uint32_t hot_tiles = 0;
+    for (uint32_t ti = 0; ti < num_tiers; ++ti) {
+        uint32_t lo = tier_start_tiles[ti];
+        uint32_t hi = lo + tier_size_tiles[ti];
+        if (lo < seq_tiles) {
+            hot_tiles += (hi < seq_tiles ? hi : seq_tiles) - lo;
+        }
+    }
+    uint32_t expected_hit_ratio_mille = seq_tiles == 0 ? 0 : (hot_tiles * 1000) / seq_tiles;
+    bool enable_l1_reads = hot_tiles > 0 && expected_hit_ratio_mille >= l1_min_expected_hit_ratio_mille;
+
+    uint32_t barrier_count = 0;
+    for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        uint32_t chunk_seq_tile = k_chunk * Sk_chunk_t;
+
+        cb_reserve_back(cb_k_in, k_chunk_tiles);
+        uint32_t k_write_ptr = get_write_ptr(cb_k_in);
+        uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
+        barrier_count = 0;
+
+        // Helper lambda macro: given global_seq_tile, find active tier index (-1 if none)
+        // Returns tier index or 0xFF_FF_FF_FF to mean DRAM
+        auto find_tier = [&](uint32_t gst) -> uint32_t {
+            if (!enable_l1_reads) {
+                return 0xFFFFFFFFu;
+            }
+            if constexpr (num_tiers >= 1) {
+                if (gst >= tier_start_tiles[0] && gst < tier_start_tiles[0] + tier_size_tiles[0]) {
+                    return 0u;
+                }
+            }
+            if constexpr (num_tiers >= 2) {
+                if (gst >= tier_start_tiles[1] && gst < tier_start_tiles[1] + tier_size_tiles[1]) {
+                    return 1u;
+                }
+            }
+            if constexpr (num_tiers >= 3) {
+                if (gst >= tier_start_tiles[2] && gst < tier_start_tiles[2] + tier_size_tiles[2]) {
+                    return 2u;
+                }
+            }
+            if constexpr (num_tiers >= 4) {
+                if (gst >= tier_start_tiles[3] && gst < tier_start_tiles[3] + tier_size_tiles[3]) {
+                    return 3u;
+                }
+            }
+            if constexpr (num_tiers >= 5) {
+                if (gst >= tier_start_tiles[4] && gst < tier_start_tiles[4] + tier_size_tiles[4]) {
+                    return 4u;
+                }
+            }
+            return 0xFFFFFFFFu;
+        };
+
+        // Read K chunk (transposed: col-major outer loop)
+        for (uint32_t col = 0; col < DHt; ++col) {
+            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+                uint32_t gst = chunk_seq_tile + row;
+                uint32_t tier_idx = find_tier(gst);
+                if (tier_idx != 0xFFFFFFFFu) {
+                    uint32_t local_row = gst - tier_start_tiles[tier_idx];
+                    uint32_t l1_k_tile_id = l1_kv_head_base * tier_size_tiles[tier_idx] * DHt + local_row * DHt + col;
+                    if constexpr (num_tiers >= 1) {
+                        if (tier_idx == 0u) {
+                            noc_async_read_tile(l1_k_tile_id, l1_k0_rd, k_write_ptr);
+                            goto k_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 2) {
+                        if (tier_idx == 1u) {
+                            noc_async_read_tile(l1_k_tile_id, l1_k1_rd, k_write_ptr);
+                            goto k_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 3) {
+                        if (tier_idx == 2u) {
+                            noc_async_read_tile(l1_k_tile_id, l1_k2_rd, k_write_ptr);
+                            goto k_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 4) {
+                        if (tier_idx == 3u) {
+                            noc_async_read_tile(l1_k_tile_id, l1_k3_rd, k_write_ptr);
+                            goto k_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 5) {
+                        if (tier_idx == 4u) {
+                            noc_async_read_tile(l1_k_tile_id, l1_k4_rd, k_write_ptr);
+                            goto k_done;
+                        }
+                    }
+                k_done:;
+                } else {
+                    noc_async_read_tile(k_start_tile_id + col + row * DHt, k_reader, k_write_ptr);
+                }
+                k_write_ptr += k_tile_bytes;
+                if (++barrier_count == barrier_threshold) {
+                    noc_async_read_barrier();
+                    barrier_count = 0;
+                }
+            }
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_k_in, k_chunk_tiles);
+
+        if constexpr (use_attention_mask) {
+            mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
+                PSt, Sk_chunk_t, mask_chunk_tiles, mask_start_tile_id, mask_reader);
+        }
+
+        // Read V chunk (row-major: sequence row outer loop)
+        cb_reserve_back(cb_v_in, v_chunk_tiles);
+        uint32_t v_write_ptr = get_write_ptr(cb_v_in);
+        barrier_count = 0;
+        for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+            uint32_t gst = chunk_seq_tile + row;
+            uint32_t tier_idx = find_tier(gst);
+            if (tier_idx != 0xFFFFFFFFu) {
+                uint32_t local_row = gst - tier_start_tiles[tier_idx];
+                uint32_t l1_v_tile_id_base = l1_kv_head_base * tier_size_tiles[tier_idx] * vDHt + local_row * vDHt;
+                for (uint32_t col = 0; col < vDHt; ++col) {
+                    uint32_t l1_v_tile_id = l1_v_tile_id_base + col;
+                    if constexpr (num_tiers >= 1) {
+                        if (tier_idx == 0u) {
+                            noc_async_read_tile(l1_v_tile_id, l1_v0_rd, v_write_ptr);
+                            goto v_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 2) {
+                        if (tier_idx == 1u) {
+                            noc_async_read_tile(l1_v_tile_id, l1_v1_rd, v_write_ptr);
+                            goto v_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 3) {
+                        if (tier_idx == 2u) {
+                            noc_async_read_tile(l1_v_tile_id, l1_v2_rd, v_write_ptr);
+                            goto v_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 4) {
+                        if (tier_idx == 3u) {
+                            noc_async_read_tile(l1_v_tile_id, l1_v3_rd, v_write_ptr);
+                            goto v_done;
+                        }
+                    }
+                    if constexpr (num_tiers >= 5) {
+                        if (tier_idx == 4u) {
+                            noc_async_read_tile(l1_v_tile_id, l1_v4_rd, v_write_ptr);
+                            goto v_done;
+                        }
+                    }
+                v_done:;
+                    v_write_ptr += v_tile_bytes;
+                    if (++barrier_count == barrier_threshold) {
+                        noc_async_read_barrier();
+                        barrier_count = 0;
+                    }
+                }
+            } else {
+                uint32_t dram_v_tile_id = k_start_tile_id + row * DHt;
+                for (uint32_t col = 0; col < vDHt; ++col) {
+                    noc_async_read_tile(dram_v_tile_id + col, v_reader, v_write_ptr);
+                    v_write_ptr += v_tile_bytes;
+                    if (++barrier_count == barrier_threshold) {
+                        noc_async_read_barrier();
+                        barrier_count = 0;
+                    }
+                }
+            }
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_v_in, v_chunk_tiles);
+
+        k_start_tile_id += k_chunk_tiles;
+    }
+}
+
 template <
     uint32_t DHt,
     uint32_t vDHt,

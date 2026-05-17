@@ -46,8 +46,19 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t l1_sink_size,
     float l1_min_expected_hit_ratio,
     std::optional<const Tensor> l1_k_tensor,
-    std::optional<const Tensor> l1_v_tensor) {
-    bool use_l1_kv_cache = l1_k_tensor.has_value() && l1_v_tensor.has_value();
+    std::optional<const Tensor> l1_v_tensor,
+    std::vector<std::optional<const Tensor>> l1_k_tiers,
+    std::vector<std::optional<const Tensor>> l1_v_tiers,
+    std::vector<uint32_t> l1_tier_token_starts,
+    std::vector<uint32_t> l1_tier_token_counts) {
+    // If tiers were provided, use them; otherwise fall back to the scalar l1_k/v_tensor.
+
+    if (l1_k_tiers.empty() && l1_k_tensor.has_value() && l1_v_tensor.has_value()) {
+        // Legacy single-tensor path: wrap in tier 0.
+        // Use push_back — optional<const T>::operator= is deleted, so cannot use initializer-list assignment.
+        l1_k_tiers.push_back(l1_k_tensor);
+        l1_v_tiers.push_back(l1_v_tensor);
+    }
     /*
     Q: 1 x B x PNH x DH
     K: B x NKV x S x DH
@@ -853,15 +864,19 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         reader_compile_time_args_common.push_back(0);
     }
 
-    // L1 KV cache: flag + accessor args
-    reader_compile_time_args_common.push_back(use_l1_kv_cache ? 1 : 0);
-    if (use_l1_kv_cache) {
-        tt_metal::TensorAccessorArgs(l1_k_tensor->buffer()).append_to(reader_compile_time_args_common);
-        tt_metal::TensorAccessorArgs(l1_v_tensor->buffer()).append_to(reader_compile_time_args_common);
-    } else {
-        log_debug(tt::LogOp, "Pushing zero placeholders for L1 KV args");
-        reader_compile_time_args_common.push_back(0);  // For l1_k_args
-        reader_compile_time_args_common.push_back(0);  // For l1_v_args
+    // N-tier L1 KV cache: num_tiers + chained accessor pairs for up to MAX_L1_TIERS tiers.
+    // Unused tier slots get placeholder 0 (L1-interleaved, NumArgsCT=1) so chaining still works.
+    constexpr size_t MAX_L1_TIERS = 5;
+    size_t num_active_l1_tiers = l1_k_tiers.size();
+    reader_compile_time_args_common.push_back(static_cast<uint32_t>(num_active_l1_tiers));
+    for (size_t ti = 0; ti < MAX_L1_TIERS; ++ti) {
+        if (ti < num_active_l1_tiers && l1_k_tiers[ti].has_value() && l1_v_tiers[ti].has_value()) {
+            tt_metal::TensorAccessorArgs(*l1_k_tiers[ti]->buffer()).append_to(reader_compile_time_args_common);
+            tt_metal::TensorAccessorArgs(*l1_v_tiers[ti]->buffer()).append_to(reader_compile_time_args_common);
+        } else {
+            reader_compile_time_args_common.push_back(0);  // placeholder K (L1-interleaved, NumArgsCT=1)
+            reader_compile_time_args_common.push_back(0);  // placeholder V
+        }
     }
 
     std::vector<uint32_t> writer_compile_time_args_common = {
@@ -1011,18 +1026,21 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t page_table_addr = is_paged_attention ? page_table_tensor.value().buffer()->address() : 0;
     uint32_t attn_mask_addr = use_attention_mask ? attn_mask.value().buffer()->address() : 0;
     uint32_t attention_sink_addr = use_attention_sink ? attention_sink.value().buffer()->address() : 0;
-    uint32_t l1_k_addr = use_l1_kv_cache ? l1_k_tensor->buffer()->address() : 0;
-    uint32_t l1_v_addr = use_l1_kv_cache ? l1_v_tensor->buffer()->address() : 0;
-    uint32_t l1_sink_size_tiles = l1_sink_size == 0 ? 0 : tt::div_up(l1_sink_size, TILE_HEIGHT);
-    uint32_t l1_total_size_tiles = 0;
-    if (use_l1_kv_cache) {
-        auto l1_k_shape = l1_k_tensor->padded_shape();
-        l1_total_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
-    }
-    uint32_t l1_recent_window_size_tiles =
-        l1_total_size_tiles > l1_sink_size_tiles ? (l1_total_size_tiles - l1_sink_size_tiles) : 0;
     uint32_t l1_min_expected_hit_ratio_mille = static_cast<uint32_t>(std::round(l1_min_expected_hit_ratio * 1000.0f));
     uint32_t out_addr = out0_buffer->address();
+
+    // Build initial per-tier runtime arg table: (k_addr, v_addr, start_tile, size_tiles) x num_active_l1_tiers
+    struct TierInitArgs {
+        uint32_t k_addr, v_addr, start_tile, size_tiles;
+    };
+    std::vector<TierInitArgs> tier_init;
+    for (size_t ti = 0; ti < num_active_l1_tiers; ++ti) {
+        const auto& tk = l1_k_tiers[ti].value();
+        const auto& tv = l1_v_tiers[ti].value();
+        uint32_t start_t = (ti < l1_tier_token_starts.size()) ? l1_tier_token_starts[ti] / TILE_HEIGHT : 0;
+        uint32_t size_t_ = tk.padded_shape()[2] / TILE_HEIGHT;
+        tier_init.push_back({tk.buffer()->address(), tv.buffer()->address(), start_t, size_t_});
+    }
 
     // Set rt args
     for (uint32_t i = 0; i < num_active_cores; ++i) {
@@ -1051,19 +1069,6 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         log_debug(tt::LogOp, "core_num_in_output: {}", core_num_in_output);
         log_debug(tt::LogOp, "cur_pos: {}", cur_pos);
 
-        // Compute L1 window start for this batch
-        // The L1 tensor stores the most recent tokens. The window start in the DRAM
-        // sequence is: max(0, cur_pos + 1 - l1_window_size_tiles * TILE_HEIGHT) / TILE_HEIGHT
-        // For simplicity in the PoC, the caller sets l1_window_start_tile based on how they built the L1 cache.
-        // Here we compute it dynamically from cur_pos if available.
-        uint32_t cur_l1_recent_window_start_tile = l1_sink_size_tiles;
-        if (use_l1_kv_cache && l1_recent_window_size_tiles > 0) {
-            uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
-            uint32_t unclamped_recent_start =
-                (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
-            cur_l1_recent_window_start_tile = std::max(l1_sink_size_tiles, unclamped_recent_start);
-        }
-
         // reader runtime args
         std::vector<uint32_t> reader_rt_args = {
             q_addr,
@@ -1081,12 +1086,14 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             core_num_in_reduce,
             core_num_in_output,
             cur_pos,
-            l1_k_addr,
-            l1_v_addr,
-            cur_l1_recent_window_start_tile,
-            l1_recent_window_size_tiles,
-            l1_sink_size_tiles,
             l1_min_expected_hit_ratio_mille};
+        // Append tier runtime args: (k_addr, v_addr, start_tile, size_tiles) x num_active_l1_tiers
+        for (size_t ti = 0; ti < num_active_l1_tiers; ++ti) {
+            reader_rt_args.push_back(tier_init[ti].k_addr);
+            reader_rt_args.push_back(tier_init[ti].v_addr);
+            reader_rt_args.push_back(tier_init[ti].start_tile);
+            reader_rt_args.push_back(tier_init[ti].size_tiles);
+        }
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
@@ -1121,8 +1128,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         for (uint32_t i = 0; i < core_group_idle.size(); ++i) {
             CoreCoord core = core_group_idle[i];
             log_debug(tt::LogOp, "Setting core {} to idle", core);
-            // reader runtime args (15 original + 6 L1 KV args = 21)
-            std::vector<uint32_t> reader_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            // reader runtime args: 16 fixed args + 0 tier args for idle cores (q_addr=0 causes early exit)
+            std::vector<uint32_t> reader_rt_args(16 + num_active_l1_tiers * 4, 0);
 
             // writer runtime args
             std::vector<uint32_t> writer_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -1155,7 +1162,9 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
          is_causal,
          use_mla,
          l1_sink_size,
-         l1_min_expected_hit_ratio](
+         l1_min_expected_hit_ratio,
+         l1_tier_token_starts,
+         l1_tier_token_counts](
             const void* operation,
             Program& program,
             const std::vector<Tensor>& input_tensors,
@@ -1184,20 +1193,27 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             uint32_t attn_mask_addr = use_attention_mask ? optional_input_tensors.at(2).value().buffer()->address() : 0;
             uint32_t attention_sink_addr =
                 use_attention_sink ? optional_input_tensors.at(3).value().buffer()->address() : 0;
-            bool use_l1_kv_cache_rt = optional_input_tensors.size() > 5 && optional_input_tensors.at(4).has_value() &&
-                                      optional_input_tensors.at(5).has_value();
-            uint32_t l1_k_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(4).value().buffer()->address() : 0;
-            uint32_t l1_v_addr = use_l1_kv_cache_rt ? optional_input_tensors.at(5).value().buffer()->address() : 0;
-            uint32_t l1_total_size_tiles = 0;
-            if (use_l1_kv_cache_rt) {
-                auto l1_k_shape = optional_input_tensors.at(4).value().padded_shape();
-                l1_total_size_tiles = l1_k_shape[2] / TILE_HEIGHT;
-            }
-            uint32_t l1_sink_size_tiles = l1_sink_size == 0 ? 0 : tt::div_up(l1_sink_size, TILE_HEIGHT);
-            uint32_t l1_recent_window_size_tiles =
-                l1_total_size_tiles > l1_sink_size_tiles ? (l1_total_size_tiles - l1_sink_size_tiles) : 0;
             uint32_t l1_min_expected_hit_ratio_mille =
                 static_cast<uint32_t>(std::round(l1_min_expected_hit_ratio * 1000.0f));
+
+            // Collect addresses for all tiers (tier 0 = legacy l1_k/v at [4,5], tier i at [4+2i, 5+2i])
+            // These are appended to reader runtime args after the existing 6 l1 args for Phase 3 kernel consumption.
+            struct TierRtArgs {
+                uint32_t k_addr, v_addr, start_tile, size_tiles;
+            };
+            std::vector<TierRtArgs> tier_rt;
+            for (size_t ti = 0;; ++ti) {
+                size_t k_idx = 4 + 2 * ti;
+                size_t v_idx = 5 + 2 * ti;
+                if (k_idx >= optional_input_tensors.size() || !optional_input_tensors.at(k_idx).has_value()) {
+                    break;
+                }
+                const auto& tk = optional_input_tensors.at(k_idx).value();
+                const auto& tv = optional_input_tensors.at(v_idx).value();
+                uint32_t start_t = (ti < l1_tier_token_starts.size()) ? l1_tier_token_starts[ti] / TILE_HEIGHT : 0;
+                uint32_t size_t_ = tk.padded_shape()[2] / TILE_HEIGHT;
+                tier_rt.push_back({tk.buffer()->address(), tv.buffer()->address(), start_t, size_t_});
+            }
             auto page_table_buffer = is_paged_attention ? optional_input_tensors.at(1).value().buffer() : nullptr;
             uint32_t page_table_stick_size = is_paged_attention ? page_table_buffer->aligned_page_size() : 0;
 
@@ -1241,19 +1257,14 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 reader_args[arg_idx++] = core_num_in_reduce;
                 reader_args[arg_idx++] = core_num_in_output;
                 reader_args[arg_idx++] = cur_pos;
-                uint32_t cur_l1_recent_window_start_tile = l1_sink_size_tiles;
-                if (use_l1_kv_cache_rt && l1_recent_window_size_tiles > 0) {
-                    uint32_t seq_tiles = (cur_pos + 1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
-                    uint32_t unclamped_recent_start =
-                        (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
-                    cur_l1_recent_window_start_tile = std::max(l1_sink_size_tiles, unclamped_recent_start);
-                }
-                reader_args[arg_idx++] = l1_k_addr;
-                reader_args[arg_idx++] = l1_v_addr;
-                reader_args[arg_idx++] = cur_l1_recent_window_start_tile;
-                reader_args[arg_idx++] = l1_recent_window_size_tiles;
-                reader_args[arg_idx++] = l1_sink_size_tiles;
                 reader_args[arg_idx++] = l1_min_expected_hit_ratio_mille;
+                // Tier runtime args: (k_addr, v_addr, start_tile, size_tiles) x num_active_tiers
+                for (const auto& tr : tier_rt) {
+                    reader_args[arg_idx++] = tr.k_addr;
+                    reader_args[arg_idx++] = tr.v_addr;
+                    reader_args[arg_idx++] = tr.start_tile;
+                    reader_args[arg_idx++] = tr.size_tiles;
+                }
 
                 // writer runtime args
                 arg_idx = 0;

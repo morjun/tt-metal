@@ -419,7 +419,27 @@ void py_module(py::module& module) {
         .def(
             "sfpu_inf",
             [](MeshDevice* device) { return tt::tt_metal::hal::get_inf(); },
-            R"doc(Returns Infinity value for current architecture.)doc");
+            R"doc(Returns Infinity value for current architecture.)doc")
+        .def(
+            "get_l1_headroom_per_core",
+            [](MeshDevice& self) {
+                py::dict result;
+                for (auto& [core, bytes] : self.get_l1_headroom_per_core()) {
+                    result[py::make_tuple(core.x, core.y)] = bytes;
+                }
+                return result;
+            },
+            R"doc(
+               Returns the available L1 headroom in bytes for each logical core.
+
+               This method must be called after the decode compile step (all programs compiled)
+               so that the per-core CB floor tracker is fully populated.
+
+               Returns:
+                   Dict[Tuple[int, int], int]: Mapping from (x, y) logical core coordinate
+                   to available headroom in bytes (lowest top-down tensor address minus
+                   worst-case CB region end across all compiled programs).
+           )doc");
 
     auto py_mesh_device_view = static_cast<py::class_<MeshDeviceView>>(module.attr("MeshDeviceView"));
     py_mesh_device_view.def("shape", &MeshDeviceView::shape, py::return_value_policy::reference_internal)

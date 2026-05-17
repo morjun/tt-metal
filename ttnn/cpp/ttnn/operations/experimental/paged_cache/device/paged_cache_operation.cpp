@@ -56,8 +56,12 @@ void PagedUpdateCacheDeviceOperation::validate(
     const auto validateTensorShapes = [](const Tensor& cache_tensor, const Tensor& input_tensor) {
         TT_FATAL(input_tensor.padded_shape()[0] == 1, "Dim 0 of input tensor must be 1");
         TT_FATAL(
-            cache_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
-            "Only interleaved cache is supported");
+            cache_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED ||
+                (cache_tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+                 cache_tensor.buffer()->buffer_type() == tt::tt_metal::BufferType::L1),
+            "Cache must be INTERLEAVED (DRAM/L1) or HEIGHT_SHARDED in L1; got layout={} buffer_type={}",
+            cache_tensor.memory_config().memory_layout(),
+            cache_tensor.buffer()->buffer_type());
         TT_FATAL(
             input_tensor.padded_shape()[-1] == cache_tensor.padded_shape()[-1],
             "Last dim of input tensor must match last dim of cache tensor");

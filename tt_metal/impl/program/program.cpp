@@ -950,6 +950,8 @@ void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device)
         }
         uint64_t cb_region_end = cb_allocator.l1_regions.back().second;  // cb_allocator.get_cb_region_end();
         log_l1_cb_map(this->id, this->runtime_id, cb_allocator, "validate", cb_region_end, max_l1_size, lowest_address);
+        // Update the device-side per-core CB floor tracker for headroom introspection.
+        device->update_max_cb_end(cb_allocator.core_range, cb_region_end);
         if (cb_region_end > max_l1_size) {
             TT_THROW(
                 "Statically allocated circular buffers on core range {} grow to {} B which is beyond max L1 size of {} "

@@ -32,6 +32,12 @@ tt::tt_metal::operation::ProgramWithCallbacks sdpa_decode_multi_core(
     uint32_t l1_sink_size = 0,
     float l1_min_expected_hit_ratio = 0.0f,
     std::optional<const Tensor> l1_k_tensor = std::nullopt,
-    std::optional<const Tensor> l1_v_tensor = std::nullopt);
+    std::optional<const Tensor> l1_v_tensor = std::nullopt,
+    // Adaptive tier tensors: index 0 is the same as l1_k/v_tensor (tier 0).
+    // For the N-tier path, all tiers are passed here instead.
+    std::vector<std::optional<const Tensor>> l1_k_tiers = {},
+    std::vector<std::optional<const Tensor>> l1_v_tiers = {},
+    std::vector<uint32_t> l1_tier_token_starts = {},
+    std::vector<uint32_t> l1_tier_token_counts = {});
 
 }  // namespace ttnn::operations::transformer::detail

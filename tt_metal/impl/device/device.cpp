@@ -648,6 +648,62 @@ std::optional<DeviceAddr> Device::lowest_occupied_compute_l1_address(
     return sub_device_manager_tracker_->lowest_occupied_compute_l1_address(sub_device_ids);
 }
 
+void Device::update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const {
+    for (auto y = cr.start_coord.y; y <= cr.end_coord.y; ++y) {
+        for (auto x = cr.start_coord.x; x <= cr.end_coord.x; ++x) {
+            CoreCoord c{x, y};
+            auto it = l1_max_cb_end_per_core_.find(c);
+            if (it == l1_max_cb_end_per_core_.end()) {
+                l1_max_cb_end_per_core_[c] = cb_end;
+            } else {
+                it->second = std::max(it->second, cb_end);
+            }
+        }
+    }
+}
+
+std::unordered_map<CoreCoord, uint64_t> Device::get_l1_headroom_per_core() const {
+    const uint32_t num_banks = allocator()->get_num_banks(BufferType::L1);
+    log_info(tt::LogMetal, "[L1 HEADROOM] num_banks={}", num_banks);
+    log_info(tt::LogMetal, "[L1 HEADROOM] tracker_size={}", l1_max_cb_end_per_core_.size());
+
+    std::unordered_map<CoreCoord, uint64_t> result;
+    result.reserve(num_banks);
+
+    // Print first few tracker entries for debugging
+    int tracker_samples = 0;
+    for (const auto& [core, cb_end] : l1_max_cb_end_per_core_) {
+        if (tracker_samples < 5) {
+            log_info(tt::LogMetal, "[L1 HEADROOM] tracker sample: core=({},{}) cb_end={}", core.x, core.y, cb_end);
+        }
+        tracker_samples++;
+    }
+
+    for (uint32_t bank_id = 0; bank_id < num_banks; ++bank_id) {
+        auto top_down_opt = allocator()->get_lowest_occupied_l1_address(bank_id);
+        auto core = allocator()->get_logical_core_from_bank_id(bank_id);
+        uint64_t cb_end = 0;
+        if (auto it = l1_max_cb_end_per_core_.find(core); it != l1_max_cb_end_per_core_.end()) {
+            cb_end = it->second;
+        }
+        uint64_t top_down = top_down_opt.value_or(l1_size_per_core());
+        uint64_t headroom = (top_down > cb_end) ? (top_down - cb_end) : 0;
+
+        log_info(
+            tt::LogMetal,
+            "[L1 HEADROOM] bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
+            bank_id,
+            core.x,
+            core.y,
+            top_down,
+            cb_end,
+            headroom);
+
+        result[core] = headroom;
+    }
+    return result;
+}
+
 CommandQueue& Device::command_queue(std::optional<uint8_t> cq_id) {
     detail::DispatchStateCheck(using_fast_dispatch_);
     if (!using_fast_dispatch_) {

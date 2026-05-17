@@ -345,6 +345,18 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
     auto l1_k_tensor = (optional_input_tensors.size() > 4) ? optional_input_tensors.at(4) : std::nullopt;
     auto l1_v_tensor = (optional_input_tensors.size() > 5) ? optional_input_tensors.at(5) : std::nullopt;
 
+    // Collect additional tier tensors from optional_inputs[6..] (tier 1, 2, ...)
+    std::vector<std::optional<const Tensor>> l1_k_tiers;
+    std::vector<std::optional<const Tensor>> l1_v_tiers;
+    if (l1_k_tensor.has_value() && l1_v_tensor.has_value()) {
+        l1_k_tiers.push_back(l1_k_tensor);
+        l1_v_tiers.push_back(l1_v_tensor);
+        for (size_t idx = 6; idx + 1 < optional_input_tensors.size(); idx += 2) {
+            l1_k_tiers.push_back(optional_input_tensors.at(idx));
+            l1_v_tiers.push_back(optional_input_tensors.at(idx + 1));
+        }
+    }
+
     auto& output_tensor = output_tensors.at(0);
 
     auto scale = this->scale;
@@ -378,7 +390,11 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
         this->l1_sink_size,
         this->l1_min_expected_hit_ratio,
         l1_k_tensor,
-        l1_v_tensor);
+        l1_v_tensor,
+        l1_k_tiers,
+        l1_v_tiers,
+        this->l1_tier_token_starts,
+        this->l1_tier_token_counts);
 }
 
 operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
@@ -389,6 +405,7 @@ operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
     bool has_l1_kv = (optional_input_tensors.size() > 5)
                          ? (optional_input_tensors.at(4).has_value() && optional_input_tensors.at(5).has_value())
                          : false;
+    uint32_t num_l1_tiers = static_cast<uint32_t>(this->l1_tier_token_starts.size());
     return operation::hash_operation<ScaledDotProductAttentionDecode>(
         this->scale,
         this->output_mem_config,
@@ -405,6 +422,7 @@ operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(
         has_attn_mask,
         has_cur_pos,
         has_l1_kv,
+        num_l1_tiers,
         input_tensors,
         // Hash on page_table_tensor to properly size page table CB
         optional_input_tensors.at(1),

@@ -104,6 +104,12 @@ public:
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids) const override;
 
+    void update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const override;
+    std::unordered_map<CoreCoord, uint64_t> get_l1_headroom_per_core() const override;
+    const std::unordered_map<CoreCoord, uint64_t>& l1_max_cb_end_per_core() const override {
+        return l1_max_cb_end_per_core_;
+    }
+
     // Set of logical ethernet core coordinates
     // core.x represents connectivity to one other chip, i.e. cores with <x> all connect to same chip
     // core.y represents different channels along one <x>
@@ -238,6 +244,10 @@ private:
     program_cache::detail::ProgramCache program_cache_;
 
     uint32_t trace_buffers_size_ = 0;
+
+    // Per-core worst-case CB floor tracker, updated during allocate_circular_buffers.
+    // Declared mutable so update_max_cb_end() can be called via const IDevice*.
+    mutable std::unordered_map<CoreCoord, uint64_t> l1_max_cb_end_per_core_;
 };
 
 }  // namespace tt::tt_metal

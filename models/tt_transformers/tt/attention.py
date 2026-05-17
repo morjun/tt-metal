@@ -503,22 +503,40 @@ class Attention(LightweightModule):
                 self.head_dim,
             )
             zeros = torch.zeros(shape)
-            k_tensor = ttnn.as_tensor(
-                zeros,
-                dtype=self.kv_cache_dtype,
-                layout=self.model_config["ATTN_W_LAYOUT_TILE"],
-                device=self.mesh_device,
-                memory_config=memcfg,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-            )
-            v_tensor = ttnn.as_tensor(
-                zeros,
-                dtype=self.kv_cache_dtype,
-                layout=self.model_config["ATTN_W_LAYOUT_TILE"],
-                device=self.mesh_device,
-                memory_config=memcfg,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-            )
+            # The headroom measurement can over-report available L1 due to
+            # fragmentation from existing L1 buffers.  Catch OOM here and
+            # skip the tier rather than crashing.
+            try:
+                k_tensor = ttnn.as_tensor(
+                    zeros,
+                    dtype=self.kv_cache_dtype,
+                    layout=self.model_config["ATTN_W_LAYOUT_TILE"],
+                    device=self.mesh_device,
+                    memory_config=memcfg,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    f"[L1 KV adaptive] OOM allocating K tier "
+                    f"({tile_rows_per_core} tile-rows × {len(cores)} cores, {tok_count} tokens) — skipping. {e}"
+                )
+                continue
+            try:
+                v_tensor = ttnn.as_tensor(
+                    zeros,
+                    dtype=self.kv_cache_dtype,
+                    layout=self.model_config["ATTN_W_LAYOUT_TILE"],
+                    device=self.mesh_device,
+                    memory_config=memcfg,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+            except RuntimeError as e:
+                ttnn.deallocate(k_tensor)
+                logger.warning(
+                    f"[L1 KV adaptive] OOM allocating V tier "
+                    f"({tile_rows_per_core} tile-rows × {len(cores)} cores, {tok_count} tokens) — skipping. {e}"
+                )
+                continue
             self.l1_kv_tiers.append((k_tensor, v_tensor, token_cursor, tok_count))
             logger.info(
                 f"[L1 KV adaptive] Tier: {len(cores)} cores × {tile_rows_per_core} tile-rows "
@@ -552,19 +570,21 @@ class Attention(LightweightModule):
         """
         from collections import defaultdict
 
-        if self.kv_cache_dtype == ttnn.bfloat16:
-            elem_bytes = 2
-        elif self.kv_cache_dtype == ttnn.bfloat8_b:
-            elem_bytes = 1
+        # Per-tile bytes including dtype-specific storage overhead. For bfloat8_b
+        # tt-metal stores 1024 mantissa bytes + 64 shared-exponent bytes per 32×32 tile,
+        # i.e. +6.25% over the naive mantissa-only count. Ignoring this overhead causes
+        # the budget to under-count by ~16 KiB/layer on the highest tier and triggers
+        # an OOM cascade ~25 layers into a 32-layer model.
+        if self.kv_cache_dtype == ttnn.bfloat8_b:
+            per_tile_bytes = 1088
+        elif self.kv_cache_dtype == ttnn.bfloat16:
+            per_tile_bytes = self.tile_size * self.tile_size * 2
         else:
-            elem_bytes = 2
+            per_tile_bytes = self.tile_size * self.tile_size * 2
 
-        # Cost per tile-row on one core: tile_size rows × head_dim cols × K+V × all layers
-        # (num_layers factor: all layers share this core's headroom budget)
-        # Note: we don't know num_layers here, but the headroom_map already reflects the
-        # worst-case CB snapshot. We pass num_layers as a config attribute if available.
         num_layers = getattr(self, "num_layers", 32)  # default 32 for Llama 3.1 8B
-        bytes_per_tile_row = self.tile_size * self.head_dim * elem_bytes * num_layers * 2
+        DHt = self.head_dim // self.tile_size
+        bytes_per_tile_row = per_tile_bytes * DHt * num_layers * 2
 
         # Build per-core tile-row capacity (floor, ignore safety margin)
         tier_cores: dict = defaultdict(list)  # tile_rows -> [(x,y), ...]
@@ -584,13 +604,24 @@ class Attention(LightweightModule):
         for tile_rows, cores in sorted(tier_cores.items()):
             cores = sorted(cores)
             n_cores = len(cores)
-            # Total flat-height rows this tier contributes:
-            #   tile_rows × n_cores tile-rows, each 32 element-rows
-            # Token count = total_flat_rows / (batch × n_local_kv_heads)
-            total_flat_rows = tile_rows * n_cores * self.tile_size
-            tok_count = total_flat_rows // (self.batch_size_per_device_group * self.n_local_kv_heads)
-            if tok_count == 0:
-                continue
+            B_H = self.batch_size_per_device_group * self.n_local_kv_heads
+
+            # Compute tok_count in tile units, ensuring two invariants:
+            #   1. B_H * tok_count_tiles % tile_rows == 0  → exact shard division
+            #   2. B_H * tok_count_tiles / tile_rows <= n_cores → num_shards <= n_cores
+            #
+            # Naively tok_count_tiles = tile_rows * n_cores // B_H, but when
+            # tok_count_tiles * tile_size < tile_size (i.e. tok_count < tile_size),
+            # ttnn pads the seq dim to tile_size, making actual tile-row count
+            # B_H * 1 which can exceed n_cores.  We round to a step that makes
+            # B_H * tok_count_tiles divisible by tile_rows.
+            step = tile_rows // math.gcd(tile_rows, B_H)
+            max_tok_tiles = (tile_rows * n_cores) // B_H  # floor → invariant 2
+            tok_count_tiles = (max_tok_tiles // step) * step  # round down → invariant 1
+            if tok_count_tiles == 0:
+                continue  # can't fit even one aligned tile-group in this tier
+
+            tok_count = tok_count_tiles * self.tile_size
 
             # shard_shape: each core holds tile_rows tile-rows × head_dim columns
             shard_shape = [

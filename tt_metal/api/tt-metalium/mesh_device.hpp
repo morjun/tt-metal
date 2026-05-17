@@ -190,6 +190,9 @@ public:
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address() const override;
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids) const override;
+    void update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const override;
+    std::unordered_map<CoreCoord, uint64_t> get_l1_headroom_per_core() const override;
+    const std::unordered_map<CoreCoord, uint64_t>& l1_max_cb_end_per_core() const override;
     const std::set<CoreCoord>& ethernet_cores() const override;
     const std::set<CoreCoord>& storage_only_cores() const override;
     uint32_t get_noc_unicast_encoding(uint8_t noc_index, const CoreCoord& core) const override;

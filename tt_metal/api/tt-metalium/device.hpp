@@ -142,6 +142,16 @@ public:
     virtual std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids) const = 0;
 
+    // Per-core L1 headroom introspection for adaptive KV cache placement.
+    // update_max_cb_end is called during program CB allocation to track the
+    // worst-case CB floor per core across all compiled programs.
+    virtual void update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const = 0;
+    // Returns {logical_core -> usable_bytes} where usable_bytes = lowest_top_down_addr - max_cb_end.
+    virtual std::unordered_map<CoreCoord, uint64_t> get_l1_headroom_per_core() const = 0;
+    // Read-only access to the per-core CB-end tracker. MeshDevice combines this with its
+    // own allocator's top_down to produce a correct headroom report.
+    virtual const std::unordered_map<CoreCoord, uint64_t>& l1_max_cb_end_per_core() const = 0;
+
     // Set of logical ethernet core coordinates
     // core.x represents connectivity to one other chip, i.e. cores with <x> all connect to same chip
     // core.y represents different channels along one <x>

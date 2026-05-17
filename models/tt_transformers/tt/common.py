@@ -689,6 +689,7 @@ def create_tt_model(
     l1_kv_safety_margin=64 * 1024,
     l1_kv_min_viable_tokens=64,
     use_adaptive_l1_kv_cache=False,
+    l1_kv_headroom_json=None,
 ):
     from models.tt_transformers.tt.model import Transformer
     from models.tt_transformers.tt.model_config import ModelArgs
@@ -707,6 +708,7 @@ def create_tt_model(
         l1_kv_safety_margin=l1_kv_safety_margin,
         l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
         use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
+        l1_kv_headroom_json=l1_kv_headroom_json,
     )
     if num_layers is not None:
         tt_model_args.n_layers = num_layers

@@ -48,7 +48,11 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     uint32_t l1_sink_size,
     float l1_min_expected_hit_ratio,
     const std::optional<const Tensor>& l1_k_tensor,
-    const std::optional<const Tensor>& l1_v_tensor) {
+    const std::optional<const Tensor>& l1_v_tensor,
+    const std::vector<std::optional<const Tensor>>& l1_k_tensors,
+    const std::vector<std::optional<const Tensor>>& l1_v_tensors,
+    const std::vector<uint32_t>& l1_tier_token_starts,
+    const std::vector<uint32_t>& l1_tier_token_counts) {
     [[maybe_unused]] auto arch =
         input_tensor_q.storage_type() == StorageType::DEVICE
             ? input_tensor_q.device()->arch()
@@ -74,6 +78,20 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     auto kernel_config_val = init_device_compute_kernel_config(
         input_tensor_q.device()->arch(), compute_kernel_config, MathFidelity::HiFi2, true, false, false);
 
+    // Determine effective l1_k/v tensors (tier 0): if tier vector is provided, use its first element.
+    auto effective_l1_k = !l1_k_tensors.empty() ? l1_k_tensors[0] : l1_k_tensor;
+    auto effective_l1_v = !l1_v_tensors.empty() ? l1_v_tensors[0] : l1_v_tensor;
+
+    // Build optional_inputs: [cur_pos, page_table(null), attn_mask, attention_sink, l1_k_0, l1_v_0, l1_k_1, l1_v_1,
+    // ...]
+    std::vector<std::optional<const Tensor>> optional_inputs = {
+        cur_pos_tensor, std::nullopt, attn_mask, attention_sink, effective_l1_k, effective_l1_v};
+    // Pack additional tiers (index 1..N-1) at [6, 7, 8, 9, ...]
+    for (size_t i = 1; i < l1_k_tensors.size(); ++i) {
+        optional_inputs.push_back(l1_k_tensors[i]);
+        optional_inputs.push_back(l1_v_tensors[i]);
+    }
+
     return operation::run(
                ScaledDotProductAttentionDecode{
                    .is_causal = is_causal,
@@ -86,9 +104,11 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
                    .k_chunk_size = k_chunk_size,
                    .paged_attention = false,
                    .l1_sink_size = l1_sink_size,
-                   .l1_min_expected_hit_ratio = l1_min_expected_hit_ratio},
+                   .l1_min_expected_hit_ratio = l1_min_expected_hit_ratio,
+                   .l1_tier_token_starts = l1_tier_token_starts,
+                   .l1_tier_token_counts = l1_tier_token_counts},
                {input_tensor_q, input_tensor_k, input_tensor_v},
-               {cur_pos_tensor, std::nullopt, attn_mask, attention_sink, l1_k_tensor, l1_v_tensor},
+               optional_inputs,
                {})
         .at(0);
 }

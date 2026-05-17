@@ -131,3 +131,14 @@ def pytest_addoption(parser):
         default=False,
         help="Enable the adaptive N-tier L1 KV cache (measures per-core headroom after decode compile and allocates tiers)",
     )
+    parser.addoption(
+        "--l1_kv_headroom_json",
+        action="store",
+        default=None,
+        type=str,
+        help=(
+            "Path to an offline headroom-map JSON (produced by TT_METAL_LOG_L1_CB_MAP profiling). "
+            "When provided, gap_bytes_free_headroom per core is used directly instead of the live scan. "
+            "This is the most accurate source as it captures both CB and mid-step transient top-down buffers."
+        ),
+    )

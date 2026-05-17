@@ -55,11 +55,21 @@ void kernel_main() {
     constexpr auto page_table_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
     constexpr auto attention_sink_args = TensorAccessorArgs<page_table_args.next_compile_time_args_offset()>();
 
-    // L1 KV cache dual-source args
-    constexpr uint32_t l1_kv_flag_offset = attention_sink_args.next_compile_time_args_offset();
-    constexpr bool use_l1_kv_cache = get_compile_time_arg_val(l1_kv_flag_offset) == 1;
-    constexpr auto l1_k_args = TensorAccessorArgs<l1_kv_flag_offset + 1>();
-    constexpr auto l1_v_args = TensorAccessorArgs<l1_k_args.next_compile_time_args_offset()>();
+    // N-tier L1 KV cache: num_tiers + chained accessor pairs for up to 5 tiers.
+    // Unused tiers have placeholder 0 (L1-interleaved, NumArgsCT=1), keeping chaining valid.
+    constexpr uint32_t l1_kv_count_offset = attention_sink_args.next_compile_time_args_offset();
+    constexpr uint32_t num_l1_tiers = get_compile_time_arg_val(l1_kv_count_offset);
+    constexpr bool use_l1_kv_cache = num_l1_tiers > 0;
+    constexpr auto l1_k0_args = TensorAccessorArgs<l1_kv_count_offset + 1>();
+    constexpr auto l1_v0_args = TensorAccessorArgs<l1_k0_args.next_compile_time_args_offset()>();
+    constexpr auto l1_k1_args = TensorAccessorArgs<l1_v0_args.next_compile_time_args_offset()>();
+    constexpr auto l1_v1_args = TensorAccessorArgs<l1_k1_args.next_compile_time_args_offset()>();
+    constexpr auto l1_k2_args = TensorAccessorArgs<l1_v1_args.next_compile_time_args_offset()>();
+    constexpr auto l1_v2_args = TensorAccessorArgs<l1_k2_args.next_compile_time_args_offset()>();
+    constexpr auto l1_k3_args = TensorAccessorArgs<l1_v2_args.next_compile_time_args_offset()>();
+    constexpr auto l1_v3_args = TensorAccessorArgs<l1_k3_args.next_compile_time_args_offset()>();
+    constexpr auto l1_k4_args = TensorAccessorArgs<l1_v3_args.next_compile_time_args_offset()>();
+    constexpr auto l1_v4_args = TensorAccessorArgs<l1_k4_args.next_compile_time_args_offset()>();
 
     uint32_t arg_idx = 0;
     const uint32_t q_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -77,13 +87,39 @@ void kernel_main() {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
-    // L1 KV cache runtime args (consumed even when use_l1_kv_cache is false, just zeroed)
-    const uint32_t l1_k_addr = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_v_addr = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_recent_window_start_tile = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_recent_window_size_tiles = get_arg_val<uint32_t>(arg_idx++);
-    const uint32_t l1_sink_size_tiles = get_arg_val<uint32_t>(arg_idx++);
+    // L1 KV cache N-tier runtime args: ratio first, then (k_addr, v_addr, start_tile, size_tiles) x num_l1_tiers
     const uint32_t l1_min_expected_hit_ratio_mille = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t tier_k_addrs[5] = {}, tier_v_addrs[5] = {}, tier_start_tiles[5] = {}, tier_size_tiles[5] = {};
+    if constexpr (num_l1_tiers >= 1) {
+        tier_k_addrs[0] = get_arg_val<uint32_t>(arg_idx++);
+        tier_v_addrs[0] = get_arg_val<uint32_t>(arg_idx++);
+        tier_start_tiles[0] = get_arg_val<uint32_t>(arg_idx++);
+        tier_size_tiles[0] = get_arg_val<uint32_t>(arg_idx++);
+    }
+    if constexpr (num_l1_tiers >= 2) {
+        tier_k_addrs[1] = get_arg_val<uint32_t>(arg_idx++);
+        tier_v_addrs[1] = get_arg_val<uint32_t>(arg_idx++);
+        tier_start_tiles[1] = get_arg_val<uint32_t>(arg_idx++);
+        tier_size_tiles[1] = get_arg_val<uint32_t>(arg_idx++);
+    }
+    if constexpr (num_l1_tiers >= 3) {
+        tier_k_addrs[2] = get_arg_val<uint32_t>(arg_idx++);
+        tier_v_addrs[2] = get_arg_val<uint32_t>(arg_idx++);
+        tier_start_tiles[2] = get_arg_val<uint32_t>(arg_idx++);
+        tier_size_tiles[2] = get_arg_val<uint32_t>(arg_idx++);
+    }
+    if constexpr (num_l1_tiers >= 4) {
+        tier_k_addrs[3] = get_arg_val<uint32_t>(arg_idx++);
+        tier_v_addrs[3] = get_arg_val<uint32_t>(arg_idx++);
+        tier_start_tiles[3] = get_arg_val<uint32_t>(arg_idx++);
+        tier_size_tiles[3] = get_arg_val<uint32_t>(arg_idx++);
+    }
+    if constexpr (num_l1_tiers >= 5) {
+        tier_k_addrs[4] = get_arg_val<uint32_t>(arg_idx++);
+        tier_v_addrs[4] = get_arg_val<uint32_t>(arg_idx++);
+        tier_start_tiles[4] = get_arg_val<uint32_t>(arg_idx++);
+        tier_size_tiles[4] = get_arg_val<uint32_t>(arg_idx++);
+    }
 
     // idle core
     if (q_addr == 0) {
@@ -91,10 +127,8 @@ void kernel_main() {
     }
     // Get cur_pos
     constexpr uint32_t cur_pos_base = St * 32 - 1;
-    uint32_t cur_pos = cur_pos_base;  // default to non-causal, which we do attention on the entire kv cache. In this
-                                      // case we set cur_pos to the last position
+    uint32_t cur_pos = cur_pos_base;
     if constexpr (is_causal) {
-        // using UINT32_MAX as a flag to indicate that cur_pos is not provided as a list
         if (cur_pos_arg != UINT32_MAX) {
             cur_pos = cur_pos_arg;
         } else {
@@ -124,16 +158,6 @@ void kernel_main() {
 
     auto Sk_chunk_t_dynamic = get_dynamic_Sk_chunk_t<Sk_chunk_t, max_dynamic_chunk_size>(cur_pos);
     auto k_chunk_size_dynamic = Sk_chunk_t_dynamic * tt::constants::TILE_HEIGHT;
-    uint32_t cur_l1_recent_window_start_tile = l1_recent_window_start_tile;
-    if constexpr (use_l1_kv_cache) {
-        if (l1_recent_window_size_tiles > 0) {
-            uint32_t seq_tiles = (cur_pos + 1 + tt::constants::TILE_HEIGHT - 1) / tt::constants::TILE_HEIGHT;
-            uint32_t unclamped_recent_start =
-                (seq_tiles > l1_recent_window_size_tiles) ? (seq_tiles - l1_recent_window_size_tiles) : 0;
-            cur_l1_recent_window_start_tile =
-                unclamped_recent_start < l1_sink_size_tiles ? l1_sink_size_tiles : unclamped_recent_start;
-        }
-    }
 
     // Sequence length assignment
     auto [PSt, k_num_chunks, k_chunk_start, k_chunk_end, window_start_unaligned, window_start_chunk] = get_runtime_args(
@@ -393,54 +417,240 @@ void kernel_main() {
             uint32_t k_start_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
 
             if constexpr (use_l1_kv_cache) {
-                // Construct L1 KV readers
-                const auto l1_k_reader = TensorAccessor(l1_k_args, l1_k_addr, k_tile_bytes);
-                const auto l1_v_reader = TensorAccessor(l1_v_args, l1_v_addr, v_tile_bytes);
-                const uint32_t l1_total_size_tiles = l1_sink_size_tiles + l1_recent_window_size_tiles;
+                // Build tier 0 reader (always present when use_l1_kv_cache)
+                const auto l1_k0_reader = TensorAccessor(l1_k0_args, tier_k_addrs[0], k_tile_bytes);
+                const auto l1_v0_reader = TensorAccessor(l1_v0_args, tier_v_addrs[0], v_tile_bytes);
 
-                const uint32_t l1_k_batch_offset =
-                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_total_size_tiles * DHt;
-                const uint32_t l1_k_head_offset = cur_head * l1_total_size_tiles * DHt;
-                const uint32_t l1_k_start_tile_id_for_head = l1_k_batch_offset + l1_k_head_offset;
+                const uint32_t l1_k_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads;
+                const uint32_t l1_k_head_offset = cur_head;
+                const uint32_t l1_kv_head_base = l1_k_batch_offset + l1_k_head_offset;
 
-                const uint32_t l1_v_batch_offset =
-                    ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * l1_total_size_tiles * vDHt;
-                const uint32_t l1_v_head_offset = cur_head * l1_total_size_tiles * vDHt;
-                const uint32_t l1_v_start_tile_id_for_head = l1_v_batch_offset + l1_v_head_offset;
-
-                read_kv_mask_chunks_dual_source<
-                    DHt,
-                    vDHt,
-                    barrier_threshold,
-                    mask_tile_bytes,
-                    PNHt,
-                    use_attention_mask,
-                    cb_k_in,
-                    cb_v_in,
-                    cb_mask_in,
-                    reuse_k>(
-                    k_chunk_start,
-                    k_chunk_end,
-                    k_start_tile_id,
-                    mask_start_tile_id,
-                    Sk_chunk_t_dynamic,
-                    k_chunk_tiles,
-                    v_chunk_tiles,
-                    mask_chunk_tiles,
-                    k_reader,
-                    v_reader,
-                    mask_reader,
-                    k_tile_bytes,
-                    v_tile_bytes,
-                    PSt,
-                    l1_k_reader,
-                    l1_v_reader,
-                    cur_l1_recent_window_start_tile,
-                    l1_recent_window_size_tiles,
-                    l1_sink_size_tiles,
-                    l1_min_expected_hit_ratio_mille,
-                    l1_k_start_tile_id_for_head,
-                    l1_v_start_tile_id_for_head);
+                if constexpr (num_l1_tiers == 1) {
+                    read_kv_mask_chunks_n_tier<
+                        DHt,
+                        vDHt,
+                        barrier_threshold,
+                        mask_tile_bytes,
+                        PNHt,
+                        use_attention_mask,
+                        cb_k_in,
+                        cb_v_in,
+                        cb_mask_in,
+                        reuse_k,
+                        1>(
+                        k_chunk_start,
+                        k_chunk_end,
+                        k_start_tile_id,
+                        mask_start_tile_id,
+                        Sk_chunk_t_dynamic,
+                        k_chunk_tiles,
+                        v_chunk_tiles,
+                        mask_chunk_tiles,
+                        k_reader,
+                        v_reader,
+                        mask_reader,
+                        k_tile_bytes,
+                        v_tile_bytes,
+                        PSt,
+                        l1_kv_head_base,
+                        l1_min_expected_hit_ratio_mille,
+                        tier_start_tiles,
+                        tier_size_tiles,
+                        l1_k0_reader,
+                        l1_v0_reader,
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused tier 1 placeholder
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused tier 2 placeholder
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused tier 3 placeholder
+                        l1_k0_reader,
+                        l1_v0_reader);  // unused tier 4 placeholder
+                } else if constexpr (num_l1_tiers == 2) {
+                    const auto l1_k1_reader = TensorAccessor(l1_k1_args, tier_k_addrs[1], k_tile_bytes);
+                    const auto l1_v1_reader = TensorAccessor(l1_v1_args, tier_v_addrs[1], v_tile_bytes);
+                    read_kv_mask_chunks_n_tier<
+                        DHt,
+                        vDHt,
+                        barrier_threshold,
+                        mask_tile_bytes,
+                        PNHt,
+                        use_attention_mask,
+                        cb_k_in,
+                        cb_v_in,
+                        cb_mask_in,
+                        reuse_k,
+                        2>(
+                        k_chunk_start,
+                        k_chunk_end,
+                        k_start_tile_id,
+                        mask_start_tile_id,
+                        Sk_chunk_t_dynamic,
+                        k_chunk_tiles,
+                        v_chunk_tiles,
+                        mask_chunk_tiles,
+                        k_reader,
+                        v_reader,
+                        mask_reader,
+                        k_tile_bytes,
+                        v_tile_bytes,
+                        PSt,
+                        l1_kv_head_base,
+                        l1_min_expected_hit_ratio_mille,
+                        tier_start_tiles,
+                        tier_size_tiles,
+                        l1_k0_reader,
+                        l1_v0_reader,
+                        l1_k1_reader,
+                        l1_v1_reader,
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused
+                        l1_k0_reader,
+                        l1_v0_reader);  // unused
+                } else if constexpr (num_l1_tiers == 3) {
+                    const auto l1_k1_reader = TensorAccessor(l1_k1_args, tier_k_addrs[1], k_tile_bytes);
+                    const auto l1_v1_reader = TensorAccessor(l1_v1_args, tier_v_addrs[1], v_tile_bytes);
+                    const auto l1_k2_reader = TensorAccessor(l1_k2_args, tier_k_addrs[2], k_tile_bytes);
+                    const auto l1_v2_reader = TensorAccessor(l1_v2_args, tier_v_addrs[2], v_tile_bytes);
+                    read_kv_mask_chunks_n_tier<
+                        DHt,
+                        vDHt,
+                        barrier_threshold,
+                        mask_tile_bytes,
+                        PNHt,
+                        use_attention_mask,
+                        cb_k_in,
+                        cb_v_in,
+                        cb_mask_in,
+                        reuse_k,
+                        3>(
+                        k_chunk_start,
+                        k_chunk_end,
+                        k_start_tile_id,
+                        mask_start_tile_id,
+                        Sk_chunk_t_dynamic,
+                        k_chunk_tiles,
+                        v_chunk_tiles,
+                        mask_chunk_tiles,
+                        k_reader,
+                        v_reader,
+                        mask_reader,
+                        k_tile_bytes,
+                        v_tile_bytes,
+                        PSt,
+                        l1_kv_head_base,
+                        l1_min_expected_hit_ratio_mille,
+                        tier_start_tiles,
+                        tier_size_tiles,
+                        l1_k0_reader,
+                        l1_v0_reader,
+                        l1_k1_reader,
+                        l1_v1_reader,
+                        l1_k2_reader,
+                        l1_v2_reader,
+                        l1_k0_reader,
+                        l1_v0_reader,  // unused
+                        l1_k0_reader,
+                        l1_v0_reader);  // unused
+                } else if constexpr (num_l1_tiers == 4) {
+                    const auto l1_k1_reader = TensorAccessor(l1_k1_args, tier_k_addrs[1], k_tile_bytes);
+                    const auto l1_v1_reader = TensorAccessor(l1_v1_args, tier_v_addrs[1], v_tile_bytes);
+                    const auto l1_k2_reader = TensorAccessor(l1_k2_args, tier_k_addrs[2], k_tile_bytes);
+                    const auto l1_v2_reader = TensorAccessor(l1_v2_args, tier_v_addrs[2], v_tile_bytes);
+                    const auto l1_k3_reader = TensorAccessor(l1_k3_args, tier_k_addrs[3], k_tile_bytes);
+                    const auto l1_v3_reader = TensorAccessor(l1_v3_args, tier_v_addrs[3], v_tile_bytes);
+                    read_kv_mask_chunks_n_tier<
+                        DHt,
+                        vDHt,
+                        barrier_threshold,
+                        mask_tile_bytes,
+                        PNHt,
+                        use_attention_mask,
+                        cb_k_in,
+                        cb_v_in,
+                        cb_mask_in,
+                        reuse_k,
+                        4>(
+                        k_chunk_start,
+                        k_chunk_end,
+                        k_start_tile_id,
+                        mask_start_tile_id,
+                        Sk_chunk_t_dynamic,
+                        k_chunk_tiles,
+                        v_chunk_tiles,
+                        mask_chunk_tiles,
+                        k_reader,
+                        v_reader,
+                        mask_reader,
+                        k_tile_bytes,
+                        v_tile_bytes,
+                        PSt,
+                        l1_kv_head_base,
+                        l1_min_expected_hit_ratio_mille,
+                        tier_start_tiles,
+                        tier_size_tiles,
+                        l1_k0_reader,
+                        l1_v0_reader,
+                        l1_k1_reader,
+                        l1_v1_reader,
+                        l1_k2_reader,
+                        l1_v2_reader,
+                        l1_k3_reader,
+                        l1_v3_reader,
+                        l1_k0_reader,
+                        l1_v0_reader);  // unused
+                } else {                // num_l1_tiers == 5
+                    const auto l1_k1_reader = TensorAccessor(l1_k1_args, tier_k_addrs[1], k_tile_bytes);
+                    const auto l1_v1_reader = TensorAccessor(l1_v1_args, tier_v_addrs[1], v_tile_bytes);
+                    const auto l1_k2_reader = TensorAccessor(l1_k2_args, tier_k_addrs[2], k_tile_bytes);
+                    const auto l1_v2_reader = TensorAccessor(l1_v2_args, tier_v_addrs[2], v_tile_bytes);
+                    const auto l1_k3_reader = TensorAccessor(l1_k3_args, tier_k_addrs[3], k_tile_bytes);
+                    const auto l1_v3_reader = TensorAccessor(l1_v3_args, tier_v_addrs[3], v_tile_bytes);
+                    const auto l1_k4_reader = TensorAccessor(l1_k4_args, tier_k_addrs[4], k_tile_bytes);
+                    const auto l1_v4_reader = TensorAccessor(l1_v4_args, tier_v_addrs[4], v_tile_bytes);
+                    read_kv_mask_chunks_n_tier<
+                        DHt,
+                        vDHt,
+                        barrier_threshold,
+                        mask_tile_bytes,
+                        PNHt,
+                        use_attention_mask,
+                        cb_k_in,
+                        cb_v_in,
+                        cb_mask_in,
+                        reuse_k,
+                        5>(
+                        k_chunk_start,
+                        k_chunk_end,
+                        k_start_tile_id,
+                        mask_start_tile_id,
+                        Sk_chunk_t_dynamic,
+                        k_chunk_tiles,
+                        v_chunk_tiles,
+                        mask_chunk_tiles,
+                        k_reader,
+                        v_reader,
+                        mask_reader,
+                        k_tile_bytes,
+                        v_tile_bytes,
+                        PSt,
+                        l1_kv_head_base,
+                        l1_min_expected_hit_ratio_mille,
+                        tier_start_tiles,
+                        tier_size_tiles,
+                        l1_k0_reader,
+                        l1_v0_reader,
+                        l1_k1_reader,
+                        l1_v1_reader,
+                        l1_k2_reader,
+                        l1_v2_reader,
+                        l1_k3_reader,
+                        l1_v3_reader,
+                        l1_k4_reader,
+                        l1_v4_reader);
+                }
             } else {
                 read_kv_mask_chunks<
                     DHt,

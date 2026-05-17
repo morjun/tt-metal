@@ -29,7 +29,13 @@ struct ExecuteScaledDotProductAttentionDecode {
         uint32_t l1_sink_size = 0,
         float l1_min_expected_hit_ratio = 0.0f,
         const std::optional<const Tensor>& l1_k_tensor = std::nullopt,
-        const std::optional<const Tensor>& l1_v_tensor = std::nullopt);
+        const std::optional<const Tensor>& l1_v_tensor = std::nullopt,
+        // N-tier adaptive L1 KV cache: pass all tiers as vectors.
+        // When non-empty, these take precedence over the scalar l1_k/v_tensor params.
+        const std::vector<std::optional<const Tensor>>& l1_k_tensors = {},
+        const std::vector<std::optional<const Tensor>>& l1_v_tensors = {},
+        const std::vector<uint32_t>& l1_tier_token_starts = {},
+        const std::vector<uint32_t>& l1_tier_token_counts = {});
 };
 
 struct ExecutePagedScaledDotProductAttentionDecode {

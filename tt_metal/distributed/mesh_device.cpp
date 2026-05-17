@@ -1035,6 +1035,59 @@ std::optional<DeviceAddr> MeshDevice::lowest_occupied_compute_l1_address(
     return sub_device_manager_tracker_->lowest_occupied_compute_l1_address(sub_device_ids);
 }
 
+void MeshDevice::update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const {
+    // MeshDevice does not track CB state itself; the underlying physical Device does.
+    // This path is only called when programs dispatch through the MeshDevice's
+    // command queue — delegate to each constituent device.
+    for (auto* device : view_->get_devices()) {
+        device->update_max_cb_end(cr, cb_end);
+    }
+}
+
+std::unordered_map<CoreCoord, uint64_t> MeshDevice::get_l1_headroom_per_core() const {
+    // CRITICAL: buffers created via MeshBuffer (the path ttnn.as_tensor uses on a
+    // MeshDevice) are tracked by the MeshDevice's OWN allocator — not by the
+    // underlying physical Device's allocator. So we must query the mesh allocator
+    // for top_down. The CB-end tracker, however, lives on each physical Device
+    // (populated by update_max_cb_end during program CB allocation), so we read
+    // cb_end from the reference physical device.
+    const auto& mesh_alloc = this->allocator();
+    const uint32_t num_banks = mesh_alloc->get_num_banks(BufferType::L1);
+    log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) num_banks={}", num_banks);
+
+    auto* ref_device = get_devices().front();
+    const auto& cb_tracker = ref_device->l1_max_cb_end_per_core();
+    log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) cb_tracker_size={}", cb_tracker.size());
+
+    std::unordered_map<CoreCoord, uint64_t> result;
+    result.reserve(num_banks);
+    for (uint32_t bank_id = 0; bank_id < num_banks; ++bank_id) {
+        auto top_down_opt = mesh_alloc->get_lowest_occupied_l1_address(bank_id);
+        auto core = mesh_alloc->get_logical_core_from_bank_id(bank_id);
+        uint64_t cb_end = 0;
+        if (auto it = cb_tracker.find(core); it != cb_tracker.end()) {
+            cb_end = it->second;
+        }
+        uint64_t top_down = top_down_opt.value_or(l1_size_per_core());
+        uint64_t headroom = (top_down > cb_end) ? (top_down - cb_end) : 0;
+        log_info(
+            tt::LogMetal,
+            "[L1 HEADROOM] (mesh) bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
+            bank_id,
+            core.x,
+            core.y,
+            top_down,
+            cb_end,
+            headroom);
+        result[core] = headroom;
+    }
+    return result;
+}
+
+const std::unordered_map<CoreCoord, uint64_t>& MeshDevice::l1_max_cb_end_per_core() const {
+    return get_devices().front()->l1_max_cb_end_per_core();
+}
+
 const std::unique_ptr<Allocator>& MeshDevice::allocator() const {
     return sub_device_manager_tracker_->get_default_sub_device_manager()->allocator(SubDeviceId{0});
 }
