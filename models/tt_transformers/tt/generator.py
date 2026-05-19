@@ -2,12 +2,20 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List
 
 import torch
 from loguru import logger
+
+# Toggle for the L1 KV cache diagnostic logs (checkpoints, headroom diffs,
+# padding overhead, T1→T2/T3/T4 deltas). Set TT_METAL_LOG_L1_KV_DIAG=1 to enable.
+# Off by default — these lines are verbose and only useful when debugging
+# allocator-space issues. Matches the gate used on the C++ side
+# (bank_manager.cpp [L1 per-core query], device.cpp / mesh_device.cpp [L1 HEADROOM]).
+_L1_KV_DIAG = os.environ.get("TT_METAL_LOG_L1_KV_DIAG") is not None
 
 import ttnn
 from models.common.llama_models import (
@@ -567,12 +575,15 @@ class Generator:
         # _post_compile_allocate_l1_kv stashed a T2 snapshot, then clear so we
         # don't re-log every token. Diff against T2 shows what step 2's pre-decode
         # ops (prepare_inputs_decode, then ttnn_decode_forward internals) allocate.
-        _t3_t4_active = getattr(self, "_t2_headroom_map", None) is not None
-        if _t3_t4_active:
+        # Gated by TT_METAL_LOG_L1_KV_DIAG (same as T1/T2) — _t2_headroom_map is
+        # left None when the gate is off, so this whole block becomes a no-op.
+        # Capture into a local so static type-checkers can narrow it past the None check.
+        _t2_snapshot = getattr(self, "_t2_headroom_map", None) if _L1_KV_DIAG else None
+        if _t2_snapshot is not None:
             mesh_dev = self.model_args[0].mesh_device
             logger.info("[L1 KV checkpoint] === T3: start of step-2 decode body, pre prepare_inputs_decode ===")
             t3_map = mesh_dev.get_l1_headroom_per_core()
-            self._log_post_alloc_diff(self._t2_headroom_map, t3_map, tag="T2→T3")
+            self._log_post_alloc_diff(_t2_snapshot, t3_map, tag="T2→T3")
 
         tt_logits = []
 
@@ -600,10 +611,10 @@ class Generator:
             tt_l1_update_pos.append(tt_l1_update_pos_i)
             tt_l1_write_enabled.append(tt_l1_write_enabled_i)
 
-        if _t3_t4_active:
+        if _t2_snapshot is not None:
             logger.info("[L1 KV checkpoint] === T4: after prepare_inputs_decode, pre ttnn_decode_forward ===")
             t4_map = self.model_args[0].mesh_device.get_l1_headroom_per_core()
-            self._log_post_alloc_diff(self._t2_headroom_map, t4_map, tag="T2→T4")
+            self._log_post_alloc_diff(_t2_snapshot, t4_map, tag="T2→T4")
             self._t2_headroom_map = None  # consume — diagnostics fire once
 
         for i in range(self.data_parallel):
@@ -640,29 +651,31 @@ class Generator:
             return
 
         mesh_dev = self.model_args[0].mesh_device
-        logger.info("[L1 KV checkpoint] === T1: before any KV tier allocation ===")
+        if _L1_KV_DIAG:
+            logger.info("[L1 KV checkpoint] === T1: before any KV tier allocation ===")
         live_headroom_map = mesh_dev.get_l1_headroom_per_core()  # always probe, used for diff
 
         json_path = getattr(self.model_args[0], "l1_kv_headroom_json", None)
         if json_path:
             headroom_map = self._load_headroom_json(json_path)
             logger.info(f"[L1 KV] Using offline headroom JSON: {json_path} ({len(headroom_map)} cores)")
-            self._log_headroom_diff(headroom_map, live_headroom_map)
+            if _L1_KV_DIAG:
+                self._log_headroom_diff(headroom_map, live_headroom_map)
         else:
             headroom_map = live_headroom_map
             logger.info("[L1 KV] Using live headroom scan (improved: mid-step measurement)")
 
-        # DEBUG: print full headroom map sorted by core coordinate
-        sorted_headroom = sorted(headroom_map.items(), key=lambda kv: (kv[0][1], kv[0][0]))
-        headroom_lines = ", ".join(f"({x},{y}):{b}" for (x, y), b in sorted_headroom)
         logger.info(
             f"[L1 KV] Headroom acquired for {len(headroom_map)} cores. "
             f"Safety margin: {self.l1_kv_safety_margin // 1024} KiB. "
             f"min_viable_tokens: {self.l1_kv_min_viable_tokens}. "
             f"Allocating adaptive L1 KV cache..."
         )
-        logger.info(f"[L1 KV] Full headroom map (core: bytes): {headroom_lines}")
-        self._log_padding_overhead()
+        if _L1_KV_DIAG:
+            sorted_headroom = sorted(headroom_map.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+            headroom_lines = ", ".join(f"({x},{y}):{b}" for (x, y), b in sorted_headroom)
+            logger.info(f"[L1 KV] Full headroom map (core: bytes): {headroom_lines}")
+            self._log_padding_overhead()
 
         for model_i in self.model:
             for layer in model_i.layers:
@@ -678,11 +691,15 @@ class Generator:
 
         # T2 checkpoint: capture per-bank top_down/cb_end immediately after KV alloc.
         # Diff against T1 tells us exactly which banks the KV tiers landed on and how
-        # much top-down space each consumed.
-        logger.info("[L1 KV checkpoint] === T2: immediately after all KV tier allocations ===")
-        post_alloc_map = mesh_dev.get_l1_headroom_per_core()
-        self._log_post_alloc_diff(live_headroom_map, post_alloc_map, tag="T1→T2")
-        self._t2_headroom_map = post_alloc_map  # stash for T3 comparison
+        # much top-down space each consumed. Skipped unless TT_METAL_LOG_L1_KV_DIAG=1
+        # because the underlying device-side per-bank query is itself verbose.
+        if _L1_KV_DIAG:
+            logger.info("[L1 KV checkpoint] === T2: immediately after all KV tier allocations ===")
+            post_alloc_map = mesh_dev.get_l1_headroom_per_core()
+            self._log_post_alloc_diff(live_headroom_map, post_alloc_map, tag="T1→T2")
+            self._t2_headroom_map = post_alloc_map  # stash for T3 comparison
+        else:
+            self._t2_headroom_map = None  # skip T3/T4 path entirely when diag is off
 
     @staticmethod
     def _log_post_alloc_diff(t1: dict, t2: dict, tag: str = "Δ") -> None:

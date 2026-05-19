@@ -574,15 +574,37 @@ std::optional<DeviceAddr> BankManager::lowest_occupied_address_for_cores(
         return std::nullopt;
     }
     DeviceAddr lowest = std::numeric_limits<DeviceAddr>::max();
+    CoreRangeSet lowest_buf_cores{};
+    bool lowest_is_interleaved = false;
     bool any = false;
     for (const auto& [addr, cores] : live) {
         // Empty core set is the sentinel for "interleaved across every compute bank"
         // — those buffers participate in every per-core query.
         const bool is_interleaved = cores.ranges().empty();
         if (is_interleaved || cores.intersects(target_cores)) {
-            lowest = std::min(lowest, addr);
+            if (addr < lowest) {
+                lowest = addr;
+                lowest_buf_cores = cores;
+                lowest_is_interleaved = is_interleaved;
+            }
             any = true;
         }
+    }
+    // Diagnostic (gated by TT_METAL_LOG_L1_KV_DIAG=1): when the lowest matching
+    // buffer would trip a validate, log which buffer is responsible. Helps identify
+    // whether the matching buffer is one we registered (sharded, with cores) or an
+    // interleaved one. Off by default — this is in a hot path (one query per
+    // program dispatch ≈ thousands per token) so unconditional logging measurably
+    // slows decode throughput.
+    static const bool l1_kv_diag = std::getenv("TT_METAL_LOG_L1_KV_DIAG") != nullptr;
+    if (any && l1_kv_diag) {
+        log_info(
+            tt::LogMetal,
+            "[L1 per-core query] target={} lowest_addr={} buf_cores={} interleaved={}",
+            target_cores.str(),
+            lowest,
+            lowest_is_interleaved ? std::string("<all-cores sentinel>") : lowest_buf_cores.str(),
+            lowest_is_interleaved);
     }
     return any ? std::make_optional(lowest) : std::nullopt;
 }

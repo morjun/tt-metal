@@ -558,14 +558,49 @@ class Attention(LightweightModule):
         self,
         headroom_map: dict,
         safety_margin_bytes: int,
+        bank_allocatable_bytes: int = 1_470_080,  # Blackhole P150 main L1 region
+        # 1024 KiB pad caps cumulative KV at ~1 tile-row, so model-side sharded
+        # intermediates (e.g., the 63-core L-shape buffer the QKV/embedding path
+        # produces) land high enough to stay above every program's CB top.
+        # Reducing this lets KV grow but pushes those intermediates lower, where
+        # they collide with whichever CB top is next-highest. Diagnostic
+        # `[L1 per-core query]` log lines identify the offending buffer.
+        runtime_pad_bytes: int = 1024 * 1024,
     ) -> list:
         """
         Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
         Returns list of (memcfg, tile_rows_per_core, sorted_cores, token_count) tuples,
         ordered from lowest to highest tile-rows.
 
+        Two gates limit how much KV the tier set may claim:
+
+        1. Per-core gate (physical headroom): for each core, the per-tile-row
+           cost across all layers must fit in
+           ``headroom_map[core] - safety_margin_bytes``. This determines the
+           maximum ``tile_rows`` for that core's tier.
+
+        2. Cumulative-depth gate (allocator algorithm-space): the tt-metal L1
+           BankManager tracks a single shared address space per AllocatorID.
+           Every sharded buffer — across ALL tiers and physically disjoint
+           cores — consumes ``size_per_bank`` slots from that one space, so the
+           sum across tiers must fit in
+           ``bank_allocatable_bytes - runtime_pad_bytes - safety_margin_bytes``.
+           Without this gate, per-core budgeting passes but cumulative depth
+           overflows the algorithm, OOM cascades on later layers, and runtime
+           intermediates land at addresses low enough to clash with CB regions
+           of unrelated programs.
+
+        Cumulative gate is applied greedily by token-efficiency
+        (tokens-per-algo-byte): the most efficient tier (typically the column
+        tier — most cores × moderate tile-rows) is kept first, then lower-rank
+        tiers absorb whatever budget remains, shrinking their ``tile_rows`` as
+        needed; a tier shrunk to zero is dropped.
+
+        See research_codes/documents/l1_kv_cache_cache/per_core_validate_walkthrough.md §7
+        for the failure mode that motivated the second gate.
+
         Cost formula (all 32 layers, K+V, bfloat8_b):
-            bytes_per_tile_row = tile_size * head_dim * elem_bytes * num_layers * 2
+            bytes_per_tile_row = per_tile_bytes * DHt * num_layers * 2
             tile_rows_per_core = floor((H - safety_margin) / bytes_per_tile_row)
         """
         from collections import defaultdict
@@ -600,35 +635,100 @@ class Attention(LightweightModule):
         if not tier_cores:
             return []
 
-        result = []
-        for tile_rows, cores in sorted(tier_cores.items()):
-            cores = sorted(cores)
-            n_cores = len(cores)
-            B_H = self.batch_size_per_device_group * self.n_local_kv_heads
+        # Helper: compute tok_count for a tier given tile_rows and n_cores.
+        # Returns 0 if no aligned tile-group fits (caller drops the tier).
+        B_H = self.batch_size_per_device_group * self.n_local_kv_heads
 
-            # Compute tok_count in tile units, ensuring two invariants:
-            #   1. B_H * tok_count_tiles % tile_rows == 0  → exact shard division
-            #   2. B_H * tok_count_tiles / tile_rows <= n_cores → num_shards <= n_cores
-            #
-            # Naively tok_count_tiles = tile_rows * n_cores // B_H, but when
-            # tok_count_tiles * tile_size < tile_size (i.e. tok_count < tile_size),
-            # ttnn pads the seq dim to tile_size, making actual tile-row count
-            # B_H * 1 which can exceed n_cores.  We round to a step that makes
-            # B_H * tok_count_tiles divisible by tile_rows.
+        def _tok_count_for(tile_rows: int, n_cores: int) -> int:
+            if tile_rows == 0 or n_cores == 0:
+                return 0
             step = tile_rows // math.gcd(tile_rows, B_H)
-            max_tok_tiles = (tile_rows * n_cores) // B_H  # floor → invariant 2
-            tok_count_tiles = (max_tok_tiles // step) * step  # round down → invariant 1
-            if tok_count_tiles == 0:
-                continue  # can't fit even one aligned tile-group in this tier
+            max_tok_tiles = (tile_rows * n_cores) // B_H
+            tok_count_tiles = (max_tok_tiles // step) * step
+            return tok_count_tiles * self.tile_size
 
-            tok_count = tok_count_tiles * self.tile_size
+        # ── Cumulative-depth gate ─────────────────────────────────────────────
+        # The tt-metal L1 BankManager tracks a single shared address space per
+        # AllocatorID. Each sharded allocation consumes one ``size_per_bank``
+        # slot regardless of which physical cores it lives on, so the sum
+        # across all tiers must stay under
+        #     bank_allocatable - runtime_pad - safety_margin
+        # Per tier, cumulative algo-space cost = bytes_per_tile_row × tile_rows
+        # (definition: bytes_per_tile_row already includes the 64x for K+V × all
+        # layers; multiplying by tile_rows gives the algo-space "depth" the tier
+        # occupies across the whole 32-layer run).
+        algo_budget = max(0, bank_allocatable_bytes - runtime_pad_bytes - safety_margin_bytes)
 
+        # Initial candidate tiers: (tile_rows, sorted cores, tok_count, cumulative).
+        initial = []
+        for tile_rows, cores in sorted(tier_cores.items()):
+            cores_sorted = sorted(cores)
+            tok_count = _tok_count_for(tile_rows, len(cores_sorted))
+            if tok_count == 0:
+                continue
+            cumulative = bytes_per_tile_row * tile_rows
+            initial.append((tile_rows, cores_sorted, tok_count, cumulative))
+
+        if not initial:
+            return []
+
+        # Greedy fit by token-efficiency: keep the most token-dense tiers first.
+        # Within budget, lower-ranked tiers may shrink their tile_rows.
+        ranked = sorted(initial, key=lambda t: -(t[2] / t[3]))  # desc by tok_count/byte
+
+        accepted = []  # (tile_rows, cores, tok_count, cumulative)
+        used = 0
+        for tile_rows, cores_sorted, tok_count, cumulative in ranked:
+            remaining = algo_budget - used
+            if cumulative <= remaining:
+                accepted.append((tile_rows, cores_sorted, tok_count, cumulative))
+                used += cumulative
+                continue
+            # Try shrinking tile_rows until it fits (or hits 0).
+            max_fit_T = remaining // bytes_per_tile_row
+            shrunk_T = min(tile_rows, max_fit_T)
+            while shrunk_T > 0:
+                shrunk_tok = _tok_count_for(shrunk_T, len(cores_sorted))
+                if shrunk_tok == 0:
+                    shrunk_T -= 1
+                    continue
+                shrunk_cum = bytes_per_tile_row * shrunk_T
+                if shrunk_cum <= remaining:
+                    accepted.append((shrunk_T, cores_sorted, shrunk_tok, shrunk_cum))
+                    used += shrunk_cum
+                    logger.info(
+                        f"[L1 KV adaptive] Cumulative cap: shrunk tier "
+                        f"({len(cores_sorted)} cores) {tile_rows} → {shrunk_T} tile-rows "
+                        f"to fit (saved {(tile_rows - shrunk_T) * bytes_per_tile_row} B)."
+                    )
+                    break
+                shrunk_T -= 1
+            else:
+                logger.info(
+                    f"[L1 KV adaptive] Cumulative cap: dropped tier "
+                    f"({len(cores_sorted)} cores × {tile_rows} tile-rows) — "
+                    f"no shrunk T fits in remaining {remaining} B."
+                )
+
+        logger.info(
+            f"[L1 KV adaptive] Cumulative algo-space: {used} / {algo_budget} B used "
+            f"({100*used/algo_budget:.1f}%); bank={bank_allocatable_bytes}, "
+            f"runtime_pad={runtime_pad_bytes}, safety={safety_margin_bytes}."
+        )
+
+        # Re-sort accepted tiers from smallest tile_rows to largest, so the token
+        # cursor in _allocate_adaptive_l1_kv_tiers grows monotonically (preserves
+        # the existing contract that earlier tiers cover lower token indices).
+        accepted.sort(key=lambda t: t[0])
+
+        result = []
+        for tile_rows, cores_sorted, tok_count, _ in accepted:
             # shard_shape: each core holds tile_rows tile-rows × head_dim columns
             shard_shape = [
                 tile_rows * self.tile_size,  # shard height in elements
                 self.head_dim,  # shard width (full head)
             ]
-            core_range_set = self._cores_to_core_range_set(cores)
+            core_range_set = self._cores_to_core_range_set(cores_sorted)
             shard_spec = ttnn.ShardSpec(
                 core_range_set,
                 shard_shape,
@@ -639,7 +739,7 @@ class Attention(LightweightModule):
                 ttnn.BufferType.L1,
                 shard_spec,
             )
-            result.append((memcfg, tile_rows, cores, tok_count))
+            result.append((memcfg, tile_rows, cores_sorted, tok_count))
 
         return result
 

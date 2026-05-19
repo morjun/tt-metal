@@ -1056,13 +1056,16 @@ std::unordered_map<CoreCoord, uint64_t> MeshDevice::get_l1_headroom_per_core() c
     // for top_down. The CB-end tracker, however, lives on each physical Device
     // (populated by update_max_cb_end during program CB allocation), so we read
     // cb_end from the reference physical device.
+    // Gated by TT_METAL_LOG_L1_KV_DIAG=1.
+    static const bool l1_kv_diag = std::getenv("TT_METAL_LOG_L1_KV_DIAG") != nullptr;
     const auto& mesh_alloc = this->allocator();
     const uint32_t num_banks = mesh_alloc->get_num_banks(BufferType::L1);
-    log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) num_banks={}", num_banks);
-
     auto* ref_device = get_devices().front();
     const auto& cb_tracker = ref_device->l1_max_cb_end_per_core();
-    log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) cb_tracker_size={}", cb_tracker.size());
+    if (l1_kv_diag) {
+        log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) num_banks={}", num_banks);
+        log_info(tt::LogMetal, "[L1 HEADROOM] (mesh) cb_tracker_size={}", cb_tracker.size());
+    }
 
     std::unordered_map<CoreCoord, uint64_t> result;
     result.reserve(num_banks);
@@ -1075,15 +1078,17 @@ std::unordered_map<CoreCoord, uint64_t> MeshDevice::get_l1_headroom_per_core() c
         }
         uint64_t top_down = top_down_opt.value_or(l1_size_per_core());
         uint64_t headroom = (top_down > cb_end) ? (top_down - cb_end) : 0;
-        log_info(
-            tt::LogMetal,
-            "[L1 HEADROOM] (mesh) bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
-            bank_id,
-            core.x,
-            core.y,
-            top_down,
-            cb_end,
-            headroom);
+        if (l1_kv_diag) {
+            log_info(
+                tt::LogMetal,
+                "[L1 HEADROOM] (mesh) bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
+                bank_id,
+                core.x,
+                core.y,
+                top_down,
+                cb_end,
+                headroom);
+        }
         result[core] = headroom;
     }
     return result;

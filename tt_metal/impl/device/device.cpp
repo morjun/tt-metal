@@ -668,20 +668,26 @@ void Device::update_max_cb_end(const CoreRange& cr, uint64_t cb_end) const {
 }
 
 std::unordered_map<CoreCoord, uint64_t> Device::get_l1_headroom_per_core() const {
+    // Gated by TT_METAL_LOG_L1_KV_DIAG=1; the per-bank dump is verbose (110
+    // lines × N calls) and noticeably slows the run if always on.
+    static const bool l1_kv_diag = std::getenv("TT_METAL_LOG_L1_KV_DIAG") != nullptr;
     const uint32_t num_banks = allocator()->get_num_banks(BufferType::L1);
-    log_info(tt::LogMetal, "[L1 HEADROOM] num_banks={}", num_banks);
-    log_info(tt::LogMetal, "[L1 HEADROOM] tracker_size={}", l1_max_cb_end_per_core_.size());
+    if (l1_kv_diag) {
+        log_info(tt::LogMetal, "[L1 HEADROOM] num_banks={}", num_banks);
+        log_info(tt::LogMetal, "[L1 HEADROOM] tracker_size={}", l1_max_cb_end_per_core_.size());
+    }
 
     std::unordered_map<CoreCoord, uint64_t> result;
     result.reserve(num_banks);
 
-    // Print first few tracker entries for debugging
-    int tracker_samples = 0;
-    for (const auto& [core, cb_end] : l1_max_cb_end_per_core_) {
-        if (tracker_samples < 5) {
-            log_info(tt::LogMetal, "[L1 HEADROOM] tracker sample: core=({},{}) cb_end={}", core.x, core.y, cb_end);
+    if (l1_kv_diag) {
+        int tracker_samples = 0;
+        for (const auto& [core, cb_end] : l1_max_cb_end_per_core_) {
+            if (tracker_samples < 5) {
+                log_info(tt::LogMetal, "[L1 HEADROOM] tracker sample: core=({},{}) cb_end={}", core.x, core.y, cb_end);
+            }
+            tracker_samples++;
         }
-        tracker_samples++;
     }
 
     for (uint32_t bank_id = 0; bank_id < num_banks; ++bank_id) {
@@ -694,15 +700,17 @@ std::unordered_map<CoreCoord, uint64_t> Device::get_l1_headroom_per_core() const
         uint64_t top_down = top_down_opt.value_or(l1_size_per_core());
         uint64_t headroom = (top_down > cb_end) ? (top_down - cb_end) : 0;
 
-        log_info(
-            tt::LogMetal,
-            "[L1 HEADROOM] bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
-            bank_id,
-            core.x,
-            core.y,
-            top_down,
-            cb_end,
-            headroom);
+        if (l1_kv_diag) {
+            log_info(
+                tt::LogMetal,
+                "[L1 HEADROOM] bank_id={} core=({},{}) top_down={} cb_end={} headroom={}",
+                bank_id,
+                core.x,
+                core.y,
+                top_down,
+                cb_end,
+                headroom);
+        }
 
         result[core] = headroom;
     }

@@ -1,8 +1,8 @@
-# Per-Core CB Validate — Implementation Walkthrough (Steps 1–4)
+# Per-Core CB Validate — Implementation Walkthrough (Steps 1–5)
 
-> Status: landed; 13 files, ~249 added / ~5 removed
+> Status: landed; 14 files, ~360 added / ~5 removed
 > Companion doc: [per_core_validate_patch_design.md](./per_core_validate_patch_design.md) (the design spec)
-> Last updated: 2026-05-17
+> Last updated: 2026-05-18
 
 This walkthrough records what we actually built, file-by-file, with code excerpts and
 verification results. It complements the design doc by capturing the implementation
@@ -596,6 +596,152 @@ require further allocator changes.
 
 ---
 
+## 7-bis. Step 5 — cumulative-depth cap (Python side)
+
+We took **Option 1** from §7.3. The Python budget formula in
+`attention.py::_build_adaptive_l1_memcfg_tiers` got a second gate: after the
+per-core tile-row computation, candidate tiers are sorted by
+**token-efficiency** (`tok_count / cumulative_algo_bytes`) and packed greedily
+into a fixed algo-space budget. Tiers that don't fit at their full `tile_rows`
+are shrunk; tiers that can't fit at any `tile_rows ≥ 1` are dropped.
+
+### 7-bis.1 New parameters
+
+```python
+def _build_adaptive_l1_memcfg_tiers(
+    self,
+    headroom_map: dict,
+    safety_margin_bytes: int,
+    bank_allocatable_bytes: int = 1_470_080,  # Blackhole P150 main L1 region
+    runtime_pad_bytes: int = 480 * 1024,
+) -> list:
+```
+
+`bank_allocatable_bytes` hard-codes the Blackhole P150 main-L1 region
+(1,572,864 − `l1_unreserved_base` − `l1_small_size` = 1,470,080). Override per
+arch as needed.
+
+`runtime_pad_bytes = 480 KiB` was picked empirically: with smaller pads (128 /
+256 KiB) the demo still tripped over higher-CB-top programs (67 at 627 KiB on
+`(0,0)`). Raise this further if the model has additional programs with even
+higher CB tops on cores you can't avoid.
+
+### 7-bis.2 Greedy packing algorithm
+
+```
+algo_budget = bank_allocatable - runtime_pad - safety_margin
+
+# initial candidates from the per-core gate
+initial = [(tile_rows, cores, tok_count, bytes_per_tile_row * tile_rows) … ]
+
+# sort by token-efficiency descending (most tokens per algo byte first)
+ranked = sorted(initial, key=lambda t: -(t.tok_count / t.cumulative_bytes))
+
+accepted, used = [], 0
+for tier in ranked:
+    remaining = algo_budget - used
+    if tier.cumulative_bytes <= remaining:
+        accept tier at full tile_rows
+    else:
+        # try shrinking tile_rows until it fits, or drop the tier
+        shrunk_T = remaining // bytes_per_tile_row
+        while shrunk_T > 0:
+            if shrunk_tier_fits: accept; break
+            else: shrunk_T -= 1
+        else: drop the tier
+```
+
+This preserves the **most token-dense** tier (typically the column tier — 27
+cores × moderate tile-rows beats both the y=8 row (8 cores) and the idle row
+(11 cores) on tokens-per-byte).
+
+### 7-bis.3 Observed selection (32-layer Llama 3.1 8B, bfp8 KV)
+
+With `runtime_pad_bytes = 480 KiB`, `safety_margin = 64 KiB`:
+
+```
+algo_budget = 1,470,080 − 491,520 − 65,536 = 913,024 B
+bytes_per_tile_row = 4 (tiles wide) × 1088 (bfp8 tile) × 32 layers × 2 (K+V)
+                  = 278,528 B  per tile-row per tier
+
+Initial tiers (per-core gate):
+  Tier 1 (y=8,    8 cores, T=2):  557,056 B  → 64 tokens
+  Tier 2 (column, 27 cores, T=3):  835,584 B  → 288 tokens
+  Tier 3 (y=9,    11 cores, T=4): 1,114,112 B  → 160 tokens
+
+Token efficiency (tokens / cumulative byte):
+  Tier 2: 3.45e-4   ← most efficient
+  Tier 3: 1.44e-4
+  Tier 1: 1.15e-4
+
+Greedy fit:
+  Accept Tier 2 (full):  used=835,584, remaining=77,440
+  Tier 3 (4 → ?):        max_fit=0, drop
+  Tier 1 (2 → ?):        max_fit=0, drop
+
+Final: Tier 2 only (288 tokens / layer, 91.5% of budget used)
+```
+
+Compared to the pre-Step-5 attempt (which over-promised `Tier1 + Tier2 +
+Tier3` = 320 tokens but OOM'd at layer 25), Step 5 sacrifices ~10% of the
+nominal token capacity but lets **all 32 layers** allocate cleanly with no
+OOM cascade.
+
+### 7-bis.4 What Step 5 fixes and does not fix
+
+| Symptom | Pre-Step-5 | Post-Step-5 |
+|---|---|---|
+| KV OOM cascade (layers 25–32) | yes | **no** |
+| Program 65 clash (cb_top ~110 KiB, cores `(0,0)-(7,3)`) | yes | **no** |
+| Program 67 clash (cb_top 627 KiB, core `(0,0)`) | n/a (didn't reach) | **no** |
+| Program 49 clash (cb_top 723 KiB, cores `(0,0)-(7,8)`) | n/a | **yes** ← new |
+| End-to-end demo passes | no | no |
+
+The remaining failure is on `nlp_create_qkv_heads_decode` (program 49,
+`cb_region_end = 722,944` on cores `(0,0)-(7,8)`, matching `pid=47` in the
+analysis doc). A buffer at 691,456 occupies cores intersecting that range.
+Per-core query correctly identifies this as a real intersection — it is **not**
+from our KV tiers (which are on column / y=9 cores disjoint from
+`(0,0)-(7,8)`). It must be a model-level sharded buffer (likely the QKV
+projection output, or an embedding output, sharded across the 8×9 grid).
+
+### 7-bis.5 Why pushing `runtime_pad_bytes` higher hits diminishing returns
+
+Each `runtime_pad_bytes` increase pushes more cumulative depth out of the way
+of one specific program's CB region, but reveals the next-highest-CB program's
+clash. The pattern observed:
+
+| `runtime_pad_bytes` | Cumulative KV | Clashing program after | `cb_top` on `(0,0)` |
+|---:|---:|---|---:|
+| 128 KiB | 1,114,112 B | program 67 (`(0,0)`) | 627,200 |
+| 480 KiB | 835,584 B  | program 49 (`(0,0)-(7,8)`) | 722,944 |
+| 700 KiB+ (untested) | < 770 KiB | next-highest cb_top program | … |
+
+The ceiling is determined by `max(cb_region_end across programs whose cores
+intersect the cores any L1 buffer is on)`. Per the
+[`l1_cb_map_analysis`](./l1_cb_map_analysis.md) doc, that's
+`nlp_concat_heads_decode` reducer at `pid=43` (`cb_region_end = 1,249,664` on
+just `(0,0)`). To unblock fully without further changes, runtime_pad would
+need to be `1,572,864 − 1,249,664 − safety = 257 KiB worth of cumulative
+budget` — basically the original uniform-window cap pre-adaptive.
+
+So the per-core validate patch helped us shed the **disjoint-core false
+positives** (Tier buffers on y=9 no longer falsely clash with `(0,0)` CBs).
+What remains is the **genuine global constraint** from sharded buffers in the
+model's runtime path that happen to land on cores overlapping high-CB-top
+programs. Removing those constraints requires runtime-op refactoring
+(steering intermediates to disjoint cores, or moving them to DRAM), not
+allocator-level changes.
+
+### 7-bis.6 Step-5 file totals
+
+| File | Lines added |
+|---|---:|
+| `models/tt_transformers/tt/attention.py` | ~110 (helper + greedy fit + logging) |
+| **Subtotal** | **+110** |
+
+---
+
 ## 8. What the patch does and does not do
 
 **Does:**
@@ -605,16 +751,24 @@ require further allocator changes.
   caller (not just program validate).
 - Preserve backward-compatibility: existing global queries unchanged; new
   query is additive.
+- (Step 5) Add a cumulative algo-space gate to the Python tier builder so the
+  shared-address-space ceiling is respected, eliminating the OOM cascade and
+  the low-CB-top clashes.
 
 **Does not:**
 - Change the underlying allocator's algorithm-space accounting. Multiple
   sharded buffers on disjoint banks still consume slots from a shared address
   space.
-- Change Python-side budget formulas.
-- Address runtime-intermediate placement during step-2 forward.
+- Move model runtime intermediates (QKV projection, embedding outputs, concat
+  outputs) off cores that overlap high-CB-top programs. As long as those
+  intermediates use sharded L1 on cores intersecting `nlp_create_qkv_heads_decode`
+  or `nlp_concat_heads_decode`'s core ranges, their physical occupancy will
+  clash with those programs' CB regions and the validate (correctly) fires.
 
-The patch is a precondition for the adaptive multi-tier scheme to work at all,
-but is not by itself sufficient.
+The C++ patch (Steps 1–4) is a precondition for the adaptive multi-tier scheme
+to work at all. The Python cap (Step 5) is necessary for it to be useful in
+practice. End-to-end correctness still requires runtime-op placement work
+that's outside this patch's scope.
 
 ---
 
@@ -647,4 +801,5 @@ These would harden the patch against future refactors of the bank manager.
 | `tt_metal/impl/device/device.cpp`, `tt_metal/distributed/mesh_device.cpp` | Forwarders |
 | `tt_metal/impl/program/program.cpp` | The behaviour change (lines ~939–984) |
 | `tests/.../test_l1_banking_allocator.cpp` | Unit test |
+| `models/tt_transformers/tt/attention.py` | Step 5 cumulative-depth cap |
 | `research_codes/documents/l1_kv_cache_cache/per_core_validate_patch_design.md` | Design spec |
