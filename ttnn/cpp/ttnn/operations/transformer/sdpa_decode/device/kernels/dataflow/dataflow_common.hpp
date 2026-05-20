@@ -651,8 +651,19 @@ void read_kv_mask_chunks_n_tier(
     // N-tier L1 params
     uint32_t l1_kv_head_base,  // (batch_offset + head_offset) in head units
     uint32_t l1_min_expected_hit_ratio_mille,
-    const uint32_t* tier_start_tiles,  // [5] array of start token tile indices
-    const uint32_t* tier_size_tiles,   // [5] array of token tile counts per tier
+    const uint32_t* tier_start_tiles,  // [5] flat L1 tile-offset where each tier starts
+    const uint32_t* tier_size_tiles,   // [5] tier size in tile units
+    // Ring-buffer semantics (Option A fix):
+    //   The Python write path stores token K/V at L1[cur_pos % T_total], where
+    //   T_total = sum(tier_size_tiles[0..num_tiers)) * TILE_HEIGHT. Without ring-aware
+    //   reads, the kernel naively returned L1[gst] for sequence tile gst — which
+    //   reads stale data once cur_pos >= T_total (the slot has been overwritten by
+    //   a later token). These two extra params let the kernel compute the
+    //   fresh-token window [cur_pos - T_total + 1, cur_pos] and ring-remap reads.
+    //   See research_codes/documents/l1_kv_cache_cache/per_core_validate_walkthrough.md
+    //   for the bug description.
+    uint32_t cur_pos_tokens,
+    uint32_t total_l1_tiles,
     const L1K0& l1_k0_rd,
     const L1V0& l1_v0_rd,
     const L1K1& l1_k1_rd,
@@ -663,18 +674,32 @@ void read_kv_mask_chunks_n_tier(
     const L1V3& l1_v3_rd,
     const L1K4& l1_k4_rd,
     const L1V4& l1_v4_rd) {
-    // Compute total hot tiles to decide whether L1 reads are worth it
-    uint32_t seq_tiles = k_chunk_end * Sk_chunk_t;
-    uint32_t hot_tiles = 0;
-    for (uint32_t ti = 0; ti < num_tiers; ++ti) {
-        uint32_t lo = tier_start_tiles[ti];
-        uint32_t hi = lo + tier_size_tiles[ti];
-        if (lo < seq_tiles) {
-            hot_tiles += (hi < seq_tiles ? hi : seq_tiles) - lo;
-        }
+    // Compute the fresh-tile window on the sequence axis. Only tiles whose 32
+    // tokens are ALL within the ring's currently-live range are read from L1;
+    // tiles that straddle the ring boundary fall back to DRAM (an extra read
+    // for at most one tile per chunk, but correctness > tier hit-rate).
+    constexpr uint32_t TILE_HEIGHT_LOCAL = 32;
+    const uint32_t total_l1_tokens = total_l1_tiles * TILE_HEIGHT_LOCAL;
+    uint32_t fresh_lo_tile;
+    uint32_t fresh_hi_tile;
+    if (cur_pos_tokens + 1u <= total_l1_tokens) {
+        // No ring wrap yet: fresh tile range is [0, floor((cur_pos+1)/TILE_HEIGHT)).
+        fresh_lo_tile = 0u;
+        fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
+    } else {
+        // Wrap: fresh tokens are (cur_pos - T_total, cur_pos]; convert to fully-
+        // contained tile range, ceiling on lo, floor on hi.
+        uint32_t earliest_fresh_token = cur_pos_tokens + 1u - total_l1_tokens;
+        fresh_lo_tile = (earliest_fresh_token + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
+        fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
     }
+
+    // Hit-ratio heuristic: count fresh tiles vs total tiles to read.
+    uint32_t seq_tiles = k_chunk_end * Sk_chunk_t;
+    uint32_t hot_tiles = (fresh_hi_tile > fresh_lo_tile) ? (fresh_hi_tile - fresh_lo_tile) : 0u;
     uint32_t expected_hit_ratio_mille = seq_tiles == 0 ? 0 : (hot_tiles * 1000) / seq_tiles;
-    bool enable_l1_reads = hot_tiles > 0 && expected_hit_ratio_mille >= l1_min_expected_hit_ratio_mille;
+    bool enable_l1_reads =
+        hot_tiles > 0 && total_l1_tiles > 0 && expected_hit_ratio_mille >= l1_min_expected_hit_ratio_mille;
 
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
@@ -685,34 +710,43 @@ void read_kv_mask_chunks_n_tier(
         uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
         barrier_count = 0;
 
-        // Helper lambda macro: given global_seq_tile, find active tier index (-1 if none)
-        // Returns tier index or 0xFF_FF_FF_FF to mean DRAM
-        auto find_tier = [&](uint32_t gst) -> uint32_t {
+        // Helper lambda: given global sequence tile gst, return (tier_idx, flat_tile)
+        // for an L1 read, or {0xFFFFFFFF, _} to mean DRAM. The fresh-window check
+        // gates L1 entirely for stale or future tiles; flat_tile is gst mapped through
+        // the ring (gst % total_l1_tiles) and then dispatched to whichever tier owns
+        // it in the flat L1 layout.
+        auto find_tier = [&](uint32_t gst, uint32_t& out_flat_tile) -> uint32_t {
+            out_flat_tile = 0u;
             if (!enable_l1_reads) {
                 return 0xFFFFFFFFu;
             }
+            if (gst < fresh_lo_tile || gst >= fresh_hi_tile) {
+                return 0xFFFFFFFFu;
+            }
+            uint32_t flat_tile = (total_l1_tiles == 0) ? gst : (gst % total_l1_tiles);
+            out_flat_tile = flat_tile;
             if constexpr (num_tiers >= 1) {
-                if (gst >= tier_start_tiles[0] && gst < tier_start_tiles[0] + tier_size_tiles[0]) {
+                if (flat_tile >= tier_start_tiles[0] && flat_tile < tier_start_tiles[0] + tier_size_tiles[0]) {
                     return 0u;
                 }
             }
             if constexpr (num_tiers >= 2) {
-                if (gst >= tier_start_tiles[1] && gst < tier_start_tiles[1] + tier_size_tiles[1]) {
+                if (flat_tile >= tier_start_tiles[1] && flat_tile < tier_start_tiles[1] + tier_size_tiles[1]) {
                     return 1u;
                 }
             }
             if constexpr (num_tiers >= 3) {
-                if (gst >= tier_start_tiles[2] && gst < tier_start_tiles[2] + tier_size_tiles[2]) {
+                if (flat_tile >= tier_start_tiles[2] && flat_tile < tier_start_tiles[2] + tier_size_tiles[2]) {
                     return 2u;
                 }
             }
             if constexpr (num_tiers >= 4) {
-                if (gst >= tier_start_tiles[3] && gst < tier_start_tiles[3] + tier_size_tiles[3]) {
+                if (flat_tile >= tier_start_tiles[3] && flat_tile < tier_start_tiles[3] + tier_size_tiles[3]) {
                     return 3u;
                 }
             }
             if constexpr (num_tiers >= 5) {
-                if (gst >= tier_start_tiles[4] && gst < tier_start_tiles[4] + tier_size_tiles[4]) {
+                if (flat_tile >= tier_start_tiles[4] && flat_tile < tier_start_tiles[4] + tier_size_tiles[4]) {
                     return 4u;
                 }
             }
@@ -723,9 +757,10 @@ void read_kv_mask_chunks_n_tier(
         for (uint32_t col = 0; col < DHt; ++col) {
             for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
                 uint32_t gst = chunk_seq_tile + row;
-                uint32_t tier_idx = find_tier(gst);
+                uint32_t flat_tile = 0;
+                uint32_t tier_idx = find_tier(gst, flat_tile);
                 if (tier_idx != 0xFFFFFFFFu) {
-                    uint32_t local_row = gst - tier_start_tiles[tier_idx];
+                    uint32_t local_row = flat_tile - tier_start_tiles[tier_idx];
                     uint32_t l1_k_tile_id = l1_kv_head_base * tier_size_tiles[tier_idx] * DHt + local_row * DHt + col;
                     if constexpr (num_tiers >= 1) {
                         if (tier_idx == 0u) {
@@ -782,9 +817,10 @@ void read_kv_mask_chunks_n_tier(
         barrier_count = 0;
         for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
             uint32_t gst = chunk_seq_tile + row;
-            uint32_t tier_idx = find_tier(gst);
+            uint32_t flat_tile = 0;
+            uint32_t tier_idx = find_tier(gst, flat_tile);
             if (tier_idx != 0xFFFFFFFFu) {
-                uint32_t local_row = gst - tier_start_tiles[tier_idx];
+                uint32_t local_row = flat_tile - tier_start_tiles[tier_idx];
                 uint32_t l1_v_tile_id_base = l1_kv_head_base * tier_size_tiles[tier_idx] * vDHt + local_row * vDHt;
                 for (uint32_t col = 0; col < vDHt; ++col) {
                     uint32_t l1_v_tile_id = l1_v_tile_id_base + col;

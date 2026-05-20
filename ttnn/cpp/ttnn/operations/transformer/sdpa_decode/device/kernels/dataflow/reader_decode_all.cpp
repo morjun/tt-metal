@@ -425,6 +425,14 @@ void kernel_main() {
                 const uint32_t l1_k_head_offset = cur_head;
                 const uint32_t l1_kv_head_base = l1_k_batch_offset + l1_k_head_offset;
 
+                // Total L1 ring capacity in tiles = sum of per-tier sizes. Used by the
+                // ring-aware n_tier reader to (1) gate L1 reads to the fresh-token
+                // window around cur_pos and (2) ring-remap gst → flat_tile.
+                uint32_t total_l1_tiles = 0;
+                for (uint32_t ti = 0; ti < num_l1_tiers; ++ti) {
+                    total_l1_tiles += tier_size_tiles[ti];
+                }
+
                 if constexpr (num_l1_tiers == 1) {
                     read_kv_mask_chunks_n_tier<
                         DHt,
@@ -456,6 +464,8 @@ void kernel_main() {
                         l1_min_expected_hit_ratio_mille,
                         tier_start_tiles,
                         tier_size_tiles,
+                        cur_pos,
+                        total_l1_tiles,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k0_reader,
@@ -499,6 +509,8 @@ void kernel_main() {
                         l1_min_expected_hit_ratio_mille,
                         tier_start_tiles,
                         tier_size_tiles,
+                        cur_pos,
+                        total_l1_tiles,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -544,6 +556,8 @@ void kernel_main() {
                         l1_min_expected_hit_ratio_mille,
                         tier_start_tiles,
                         tier_size_tiles,
+                        cur_pos,
+                        total_l1_tiles,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -591,6 +605,8 @@ void kernel_main() {
                         l1_min_expected_hit_ratio_mille,
                         tier_start_tiles,
                         tier_size_tiles,
+                        cur_pos,
+                        total_l1_tiles,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -640,6 +656,8 @@ void kernel_main() {
                         l1_min_expected_hit_ratio_mille,
                         tier_start_tiles,
                         tier_size_tiles,
+                        cur_pos,
+                        total_l1_tiles,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,

@@ -710,11 +710,14 @@ class Attention(LightweightModule):
                     f"no shrunk T fits in remaining {remaining} B."
                 )
 
-        logger.info(
-            f"[L1 KV adaptive] Cumulative algo-space: {used} / {algo_budget} B used "
-            f"({100*used/algo_budget:.1f}%); bank={bank_allocatable_bytes}, "
-            f"runtime_pad={runtime_pad_bytes}, safety={safety_margin_bytes}."
-        )
+        if algo_budget > 0:
+            logger.info(
+                f"[L1 KV adaptive] Cumulative algo-space: {used} / {algo_budget} B used "
+                f"({100*used/algo_budget:.1f}%); bank={bank_allocatable_bytes}, "
+                f"runtime_pad={runtime_pad_bytes}, safety={safety_margin_bytes}."
+            )
+        else:
+            logger.warning(f"[L1 KV adaptive] NO BUDGET!")
 
         # Re-sort accepted tiers from smallest tile_rows to largest, so the token
         # cursor in _allocate_adaptive_l1_kv_tiers grows monotonically (preserves
