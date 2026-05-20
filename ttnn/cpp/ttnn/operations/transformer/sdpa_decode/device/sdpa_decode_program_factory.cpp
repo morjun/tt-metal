@@ -1095,10 +1095,16 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             reader_rt_args.push_back(tier_init[ti].start_tile);
             reader_rt_args.push_back(tier_init[ti].size_tiles);
         }
-        // Append decode_start_pos when any tier is active. The kernel only reads
-        // this arg under `num_l1_tiers > 0`, so we must omit it for the no-L1 path.
+        // Append decode_start_pos and sink_tile_count when any tier is active.
+        // The kernel only reads these args under `num_l1_tiers > 0`, so we must
+        // omit them for the no-L1 path.
         if (num_active_l1_tiers > 0) {
             reader_rt_args.push_back(l1_decode_start_pos);
+            // l1_sink_size is in TOKENS; convert to tiles (sink_size must be a
+            // multiple of TILE_HEIGHT — enforced model-side by aligning the
+            // sink seed to a tile boundary).
+            uint32_t sink_tile_count = l1_sink_size / TILE_HEIGHT;
+            reader_rt_args.push_back(sink_tile_count);
         }
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
@@ -1272,9 +1278,11 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                     reader_args[arg_idx++] = tr.start_tile;
                     reader_args[arg_idx++] = tr.size_tiles;
                 }
-                // decode_start_pos: present only when at least one tier is active.
+                // decode_start_pos + sink_tile_count: present only when at least
+                // one tier is active.
                 if (!tier_rt.empty()) {
                     reader_args[arg_idx++] = l1_decode_start_pos;
+                    reader_args[arg_idx++] = l1_sink_size / TILE_HEIGHT;
                 }
 
                 // writer runtime args

@@ -94,8 +94,39 @@ class Attention(LightweightModule):
         self.l1_kv_use_sharded = getattr(configuration, "l1_kv_use_sharded", False)
         self.l1_kv_min_expected_hit_ratio = getattr(configuration, "l1_kv_min_expected_hit_ratio", 0.0)
         self.use_adaptive_l1_kv_cache = getattr(configuration, "use_adaptive_l1_kv_cache", False)
-        if self.l1_kv_sink_size > 0:
+        # StreamingLLM-style attention sink default for the adaptive path: keep
+        # the first tile (32 tokens) of prefill K/V permanently in L1. Outside the
+        # ring's reach, so they stay valid for the entire decode session and let
+        # the model retain its "attention sink" tokens that anchor the softmax.
+        # User can override via configuration.l1_kv_sink_size.
+        if self.use_adaptive_l1_kv_cache and self.l1_kv_sink_size == 0:
+            self.l1_kv_sink_size = 32
+        if self.l1_kv_sink_size > 0 and not self.use_adaptive_l1_kv_cache:
             assert self.l1_kv_window_size > 0, "Pinned L1 sink tokens require a non-zero recent ring window"
+        # Adaptive L1 KV cores to AVOID — typically the same grid that hosts the
+        # 63-core "L-shape" model intermediate buffer (QKV / embedding path), so
+        # the KV-tier allocation doesn't push the L-shape's bottom_so_far up into
+        # program 49's CB region (causing the CB-clash we mitigate with
+        # runtime_pad_bytes). For Llama-8B on Blackhole p150, the L-shape spans
+        # cores (0..10, 0..4) plus (0..7, 5). Override via
+        # configuration.l1_kv_avoid_cores = [(x, y), ...] or set to [] to disable.
+        self.l1_kv_avoid_cores = getattr(
+            configuration,
+            "l1_kv_avoid_cores",
+            None,
+        )
+        if self.l1_kv_avoid_cores is None:
+            # Default: filter out the L-shape's footprint for the adaptive path.
+            # Avoiding overlap cores also REDUCES the L1 write dispatch overhead
+            # (fewer cores per tier → less coordination work), which is the
+            # dominant cost in the adaptive write path. A/B in /tmp/phase5_*
+            # showed disjoint (11 cores y=9, 32 tokens) at 9.19 tok/s vs overlap
+            # (27 cores y=0..8 x=8..10, 96 tokens) at 5.23 tok/s for the same
+            # runtime_pad — narrower cores beats more cache.
+            if self.use_adaptive_l1_kv_cache:
+                self.l1_kv_avoid_cores = [(x, y) for x in range(11) for y in range(5)] + [(x, 5) for x in range(8)]
+            else:
+                self.l1_kv_avoid_cores = []
         self.l1_kv_total_size = self.l1_kv_sink_size + self.l1_kv_window_size
         self.l1_kv_sink_size_tiles = math.ceil(self.l1_kv_sink_size / self.tile_size) if self.l1_kv_sink_size > 0 else 0
         self.l1_kv_window_size_tiles = (
@@ -411,8 +442,11 @@ class Attention(LightweightModule):
             for k_or_v in [cache_k, cache_v]
         ]
 
-        if self.l1_kv_total_size > 0 and not self.paged_attention_config:
+        if self.l1_kv_total_size > 0 and not self.paged_attention_config and not self.use_adaptive_l1_kv_cache:
             # Legacy fixed-window path: allocate exactly l1_kv_total_size tokens in L1 right now.
+            # Skipped when use_adaptive_l1_kv_cache is on — the adaptive path manages its own
+            # L1 layout via l1_kv_tiers + a sink prefix seeded from the DRAM cache after
+            # prefill, independently of l1_kv_total_size.
             # Layout is chosen once here — no later to_memory_config() copy needed.
             shape = (
                 self.batch_size_per_device_group,
@@ -560,6 +594,129 @@ class Attention(LightweightModule):
         self.l1_kv_adaptive_total_capacity = total
         logger.info(f"[L1 KV adaptive] Total L1 KV tokens across {len(self.l1_kv_tiers)} tiers: {total}")
 
+        # Sanity: sink_size must fit entirely in Tier 0 (the first tier in flat L1
+        # layout). The ring math relies on slots [0, sink_size) being untouched by
+        # decode-time ring writes; that requires Tier 0's tok_count >= sink_size.
+        if self.l1_kv_sink_size > 0 and self.l1_kv_tiers:
+            tier0_tok_count = self.l1_kv_tiers[0][3]
+            if tier0_tok_count < self.l1_kv_sink_size:
+                logger.warning(
+                    f"[L1 KV adaptive] sink_size={self.l1_kv_sink_size} > Tier 0 tok_count="
+                    f"{tier0_tok_count}; disabling sink for this run."
+                )
+                self.l1_kv_sink_size = 0
+
+    def seed_adaptive_l1_sinks(self, dram_k_cache, dram_v_cache):
+        """
+        Seed the L1 adaptive tier's first sink_size slots with prefill K/V[0..sink_size).
+
+        Approach: `ttnn.fill_cache` requires INTERLEAVED cache, but our adaptive
+        tier is HEIGHT_SHARDED. So we instead RE-CREATE Tier 0 with the sink
+        K/V baked into the host-side initial torch tensor:
+          1. Slice DRAM K/V[..., 0:sink, ...] on device, lift to host via to_torch.
+          2. Deallocate the existing Tier 0 K and V tensors.
+          3. Build new torch tensors that are zeros everywhere except the first
+             sink_size rows along the seq dim, which hold the prefill K/V.
+          4. Re-allocate Tier 0 K and V using the same memory_config / dtype /
+             layout as the original, with the seeded torch tensor as source.
+          5. Update self.l1_kv_tiers[0] with the new tensors.
+
+        The ring write path in `_build_adaptive_l1_write_pos` already skips slots
+        [0, sink_size) when sink_size > 0, so the seeded sink K/V remains pinned
+        for the duration of decode.
+
+        One host sync per layer at warmup (acceptable one-time cost).
+        """
+        if self.l1_kv_sink_size <= 0 or not self.l1_kv_tiers:
+            return
+        k_tier0, v_tier0, token_start, tok_count = self.l1_kv_tiers[0]
+        if token_start != 0:
+            logger.warning(
+                f"[L1 KV adaptive] sink seed: Tier 0 token_start={token_start} (expected 0); "
+                f"sink would land in the wrong tier — skipping seed."
+            )
+            return
+        sink = self.l1_kv_sink_size
+        try:
+            # Slice DRAM K/V[..., 0:sink, ...] on device. The slice is small
+            # (one tile-row deep) so the host transfer is cheap.
+            k_starts = [0] * len(dram_k_cache.shape)
+            v_starts = [0] * len(dram_v_cache.shape)
+            k_ends = list(dram_k_cache.shape)
+            v_ends = list(dram_v_cache.shape)
+            k_ends[2] = sink
+            v_ends[2] = sink
+            k_slice = ttnn.slice(dram_k_cache, k_starts, k_ends)
+            v_slice = ttnn.slice(dram_v_cache, v_starts, v_ends)
+            k_sink_torch = ttnn.to_torch(k_slice)  # shape [B*mesh?, K, sink, D]
+            v_sink_torch = ttnn.to_torch(v_slice)
+            ttnn.deallocate(k_slice)
+            ttnn.deallocate(v_slice)
+
+            # Capture the original memory_config and dtype before deallocation.
+            tier_memcfg_k = k_tier0.memory_config()
+            tier_memcfg_v = v_tier0.memory_config()
+            tier_dtype = self.kv_cache_dtype
+            tier_layout = self.model_config["ATTN_W_LAYOUT_TILE"]
+
+            # Drop the existing zero-initialised tier tensors so we can recreate
+            # them at the same allocator address (top-down allocator places this
+            # tier deterministically once others have settled — but for safety
+            # we DON'T rely on identical addresses; the L1 layout is recomputed
+            # whenever a buffer is allocated).
+            ttnn.deallocate(k_tier0)
+            ttnn.deallocate(v_tier0)
+
+            # Build the seeded torch tensors. The ReplicateTensorToMesh mapper
+            # broadcasts a single batch tensor across all mesh devices, so we
+            # build a [B_per_device, K, tok_count, D]-shaped torch tensor and
+            # let the mapper handle replication.
+            shape = (
+                self.batch_size_per_device_group,
+                self.n_local_kv_heads,
+                tok_count,
+                self.head_dim,
+            )
+            zeros_k = torch.zeros(shape)
+            zeros_v = torch.zeros(shape)
+            # k_sink_torch shape may include a mesh dim (e.g. [B*mesh, K, sink, D]);
+            # since ReplicateTensorToMesh writes the same tensor on every device,
+            # all mesh slices are identical and we can just use the first.
+            if k_sink_torch.dim() == 4 and k_sink_torch.shape[0] == shape[0]:
+                zeros_k[:, :, :sink, :] = k_sink_torch
+                zeros_v[:, :, :sink, :] = v_sink_torch
+            elif k_sink_torch.dim() == 4:
+                # The mesh dim got concatenated into batch dim; take the first slice.
+                zeros_k[:, :, :sink, :] = k_sink_torch[: shape[0]]
+                zeros_v[:, :, :sink, :] = v_sink_torch[: shape[0]]
+            else:
+                logger.warning(
+                    f"[L1 KV adaptive] Unexpected DRAM cache shape {k_sink_torch.shape} for sink seed; skipping."
+                )
+                return
+
+            new_k = ttnn.as_tensor(
+                zeros_k,
+                dtype=tier_dtype,
+                layout=tier_layout,
+                device=self.mesh_device,
+                memory_config=tier_memcfg_k,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            new_v = ttnn.as_tensor(
+                zeros_v,
+                dtype=tier_dtype,
+                layout=tier_layout,
+                device=self.mesh_device,
+                memory_config=tier_memcfg_v,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            self.l1_kv_tiers[0] = (new_k, new_v, token_start, tok_count)
+            logger.info(f"[L1 KV adaptive] Seeded {sink} sink slots from DRAM K/V into Tier 0.")
+        except RuntimeError as e:
+            logger.warning(f"[L1 KV adaptive] sink seed failed: {e}. Continuing without sinks.")
+            self.l1_kv_sink_size = 0
+
     def _build_adaptive_l1_memcfg_tiers(
         self,
         headroom_map: dict,
@@ -571,7 +728,7 @@ class Attention(LightweightModule):
         # Reducing this lets KV grow but pushes those intermediates lower, where
         # they collide with whichever CB top is next-highest. Diagnostic
         # `[L1 per-core query]` log lines identify the offending buffer.
-        runtime_pad_bytes: int = 580 * 1024,
+        runtime_pad_bytes: int = 1024 * 1024,
     ) -> list:
         """
         Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
@@ -627,9 +784,18 @@ class Attention(LightweightModule):
         DHt = self.head_dim // self.tile_size
         bytes_per_tile_row = per_tile_bytes * DHt * num_layers * 2
 
-        # Build per-core tile-row capacity (floor, ignore safety margin)
+        # Build per-core tile-row capacity (floor, ignore safety margin).
+        # Cores listed in self.l1_kv_avoid_cores are excluded entirely — these
+        # are typically the model's "L-shape" intermediate buffer footprint
+        # (QKV / embedding path), where placing KV tiers would push the
+        # L-shape's allocator address up into program 49's CB region.
+        avoid = set(self.l1_kv_avoid_cores) if self.l1_kv_avoid_cores else set()
         tier_cores: dict = defaultdict(list)  # tile_rows -> [(x,y), ...]
+        skipped_for_avoidance = 0
         for (x, y), usable in headroom_map.items():
+            if (x, y) in avoid:
+                skipped_for_avoidance += 1
+                continue
             net = usable - safety_margin_bytes
             if net <= 0:
                 continue
@@ -637,6 +803,11 @@ class Attention(LightweightModule):
             if tile_rows < 1:
                 continue  # less than 1 tile-row: skip
             tier_cores[tile_rows].append((x, y))
+        if skipped_for_avoidance > 0:
+            logger.info(
+                f"[L1 KV adaptive] Skipped {skipped_for_avoidance} cores in l1_kv_avoid_cores "
+                f"(model-intermediate footprint)."
+            )
 
         if not tier_cores:
             return []
@@ -976,6 +1147,19 @@ class Attention(LightweightModule):
         """
         if not self.l1_kv_tiers:
             return
+
+        # Single-tier fast path: with one tier (token_start=0, tok_count=T_total),
+        # flat_l1_pos_tensor IS the in-tier offset and is already in [0, T_total).
+        # No per-tier compute required — pass it directly to paged_update_cache.
+        # Eliminates 8 ttnn ops per layer (subtract/ge/lt/and/where/typecast/
+        # to_layout/slice), which is the dominant per-step overhead in the
+        # adaptive write path.
+        if len(self.l1_kv_tiers) == 1:
+            k_tensor, v_tensor, token_start, _ = self.l1_kv_tiers[0]
+            if token_start == 0:
+                ttnn.experimental.paged_update_cache(k_tensor, k_heads_l1, update_idxs_tensor=flat_l1_pos_tensor)
+                ttnn.experimental.paged_update_cache(v_tensor, v_heads_l1, update_idxs_tensor=flat_l1_pos_tensor)
+                return
 
         # Promote flat_pos to TILE/FP32 once — ttnn elementwise ops require
         # TILE_LAYOUT and floating-point math. The per-tier computation reuses

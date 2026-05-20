@@ -125,6 +125,9 @@ void kernel_main() {
     // populate the L1 ring). Read by find_tier to gate L1 reads on this lower
     // bound.
     const uint32_t l1_decode_start_pos_arg = (num_l1_tiers > 0) ? get_arg_val<uint32_t>(arg_idx++) : 0u;
+    // sink_tile_count: number of L1 tiles holding pinned prefill K/V[0, sink_size).
+    // 0 means no sink (pure ring). Always fresh — seeded by Python at warmup.
+    const uint32_t l1_sink_tile_count_arg = (num_l1_tiers > 0) ? get_arg_val<uint32_t>(arg_idx++) : 0u;
 
     // idle core
     if (q_addr == 0) {
@@ -472,6 +475,7 @@ void kernel_main() {
                         cur_pos,
                         total_l1_tiles,
                         l1_decode_start_pos_arg,
+                        l1_sink_tile_count_arg,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k0_reader,
@@ -518,6 +522,7 @@ void kernel_main() {
                         cur_pos,
                         total_l1_tiles,
                         l1_decode_start_pos_arg,
+                        l1_sink_tile_count_arg,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -566,6 +571,7 @@ void kernel_main() {
                         cur_pos,
                         total_l1_tiles,
                         l1_decode_start_pos_arg,
+                        l1_sink_tile_count_arg,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -616,6 +622,7 @@ void kernel_main() {
                         cur_pos,
                         total_l1_tiles,
                         l1_decode_start_pos_arg,
+                        l1_sink_tile_count_arg,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,
@@ -668,6 +675,7 @@ void kernel_main() {
                         cur_pos,
                         total_l1_tiles,
                         l1_decode_start_pos_arg,
+                        l1_sink_tile_count_arg,
                         l1_k0_reader,
                         l1_v0_reader,
                         l1_k1_reader,

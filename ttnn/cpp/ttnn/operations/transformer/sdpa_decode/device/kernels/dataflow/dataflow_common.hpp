@@ -670,6 +670,10 @@ void read_kv_mask_chunks_n_tier(
     uint32_t cur_pos_tokens,
     uint32_t total_l1_tiles,
     uint32_t decode_start_pos_tokens,
+    // Attention-sink support. The first `sink_tile_count` L1 tiles hold prefill
+    // K/V[0, sink_size) which are pinned (never overwritten by the decode-time
+    // ring write). The ring covers L1 tiles [sink_tile_count, total_l1_tiles).
+    uint32_t sink_tile_count,
     const L1K0& l1_k0_rd,
     const L1V0& l1_v0_rd,
     const L1K1& l1_k1_rd,
@@ -680,36 +684,45 @@ void read_kv_mask_chunks_n_tier(
     const L1V3& l1_v3_rd,
     const L1K4& l1_k4_rd,
     const L1V4& l1_v4_rd) {
-    // Compute the fresh-tile window on the sequence axis. Only tiles whose 32
-    // tokens are ALL within the ring's currently-live range are read from L1;
-    // tiles that straddle the ring boundary fall back to DRAM (an extra read
-    // for at most one tile per chunk, but correctness > tier hit-rate).
+    // Compute the fresh-tile window on the sequence axis. L1 has two regions:
+    //   * Sink tiles [0, sink_tile_count): hold prefill K/V[0, sink_size), pinned
+    //     by the model's prefill seeding hook. Always fresh once seeded.
+    //   * Ring tiles [sink_tile_count, total_l1_tiles): hold the most-recent
+    //     decode-written tokens; freshness gated by the ring window around cur_pos.
     constexpr uint32_t TILE_HEIGHT_LOCAL = 32;
-    const uint32_t total_l1_tokens = total_l1_tiles * TILE_HEIGHT_LOCAL;
+    const uint32_t ring_tile_count = (total_l1_tiles > sink_tile_count) ? (total_l1_tiles - sink_tile_count) : 0u;
+    const uint32_t ring_tokens = ring_tile_count * TILE_HEIGHT_LOCAL;
+    const uint32_t sink_tokens = sink_tile_count * TILE_HEIGHT_LOCAL;
     uint32_t fresh_lo_tile;
     uint32_t fresh_hi_tile;
-    if (cur_pos_tokens + 1u <= total_l1_tokens) {
-        // No ring wrap yet: fresh tile range is [0, floor((cur_pos+1)/TILE_HEIGHT)).
-        fresh_lo_tile = 0u;
+    if (cur_pos_tokens + 1u <= sink_tokens + ring_tokens) {
+        // No ring wrap yet: fresh ring range is [sink_tile_count, floor((cur_pos+1)/TILE_HEIGHT)).
+        fresh_lo_tile = sink_tile_count;
         fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
     } else {
-        // Wrap: fresh tokens are (cur_pos - T_total, cur_pos]; convert to fully-
-        // contained tile range, ceiling on lo, floor on hi.
-        uint32_t earliest_fresh_token = cur_pos_tokens + 1u - total_l1_tokens;
+        // Wrap: ring holds tokens (cur_pos - ring_tokens, cur_pos]; convert to
+        // fully-contained tile range, ceiling on lo, floor on hi.
+        uint32_t earliest_fresh_token = cur_pos_tokens + 1u - ring_tokens;
         fresh_lo_tile = (earliest_fresh_token + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
         fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
     }
-    // Clamp fresh_lo_tile to the first tile that is entirely decode-written.
-    // L1 is only populated by decode-time writes; prefill K/V never touches L1,
-    // so any tile that contains a prefill position must fall back to DRAM.
+    // Clamp ring fresh_lo to the first tile that is entirely decode-written.
+    // Ring slots are only populated by decode-time writes; prefill K/V beyond
+    // the sink region never touches L1.
     const uint32_t decode_start_pos_tile = (decode_start_pos_tokens + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
     if (fresh_lo_tile < decode_start_pos_tile) {
         fresh_lo_tile = decode_start_pos_tile;
     }
+    if (fresh_lo_tile < sink_tile_count) {
+        fresh_lo_tile = sink_tile_count;  // ring's first valid tile is at sink_tile_count
+    }
 
-    // Hit-ratio heuristic: count fresh tiles vs total tiles to read.
+    // Hit-ratio heuristic: count fresh L1 tiles (sink + ring) vs total tiles to read.
     uint32_t seq_tiles = k_chunk_end * Sk_chunk_t;
-    uint32_t hot_tiles = (fresh_hi_tile > fresh_lo_tile) ? (fresh_hi_tile - fresh_lo_tile) : 0u;
+    uint32_t ring_hot = (fresh_hi_tile > fresh_lo_tile) ? (fresh_hi_tile - fresh_lo_tile) : 0u;
+    // Sink tiles that fall within the requested seq range:
+    uint32_t sink_hot = (sink_tile_count < seq_tiles) ? sink_tile_count : seq_tiles;
+    uint32_t hot_tiles = ring_hot + sink_hot;
     uint32_t expected_hit_ratio_mille = seq_tiles == 0 ? 0 : (hot_tiles * 1000) / seq_tiles;
     bool enable_l1_reads =
         hot_tiles > 0 && total_l1_tiles > 0 && expected_hit_ratio_mille >= l1_min_expected_hit_ratio_mille;
@@ -724,19 +737,27 @@ void read_kv_mask_chunks_n_tier(
         barrier_count = 0;
 
         // Helper lambda: given global sequence tile gst, return (tier_idx, flat_tile)
-        // for an L1 read, or {0xFFFFFFFF, _} to mean DRAM. The fresh-window check
-        // gates L1 entirely for stale or future tiles; flat_tile is gst mapped through
-        // the ring (gst % total_l1_tiles) and then dispatched to whichever tier owns
-        // it in the flat L1 layout.
+        // for an L1 read, or {0xFFFFFFFF, _} to mean DRAM. Three cases:
+        //   1. Sink tile (gst < sink_tile_count): always fresh (seeded at prefill).
+        //      Maps directly to L1 tile `gst` (sink region at start of flat layout).
+        //   2. Ring tile (fresh_lo_tile <= gst < fresh_hi_tile): in ring window.
+        //      Maps to sink_tile_count + ((gst - sink_tile_count) % ring_tile_count).
+        //   3. Otherwise: DRAM fallback.
         auto find_tier = [&](uint32_t gst, uint32_t& out_flat_tile) -> uint32_t {
             out_flat_tile = 0u;
             if (!enable_l1_reads) {
                 return 0xFFFFFFFFu;
             }
-            if (gst < fresh_lo_tile || gst >= fresh_hi_tile) {
+            uint32_t flat_tile;
+            if (gst < sink_tile_count) {
+                // Sink tile — direct map.
+                flat_tile = gst;
+            } else if (gst >= fresh_lo_tile && gst < fresh_hi_tile && ring_tile_count > 0) {
+                // Ring tile — modular ring map within the ring region.
+                flat_tile = sink_tile_count + ((gst - sink_tile_count) % ring_tile_count);
+            } else {
                 return 0xFFFFFFFFu;
             }
-            uint32_t flat_tile = (total_l1_tiles == 0) ? gst : (gst % total_l1_tiles);
             out_flat_tile = flat_tile;
             if constexpr (num_tiers >= 1) {
                 if (flat_tile >= tier_start_tiles[0] && flat_tile < tier_start_tiles[0] + tier_size_tiles[0]) {

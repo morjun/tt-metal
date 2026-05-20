@@ -686,6 +686,17 @@ class Generator:
                         min_viable_tokens=self.l1_kv_min_viable_tokens,
                     )
 
+        # Seed the L1 attention-sink slots from DRAM K/V. The DRAM cache already
+        # holds the prefill K/V, so we slice [0, sink_size) and fill_cache into the
+        # adaptive Tier 0's first slots. The ring write path skips these slots
+        # for the remainder of decode, keeping the sink K/V pinned.
+        for model_i in self.model:
+            for layer in model_i.layers:
+                if hasattr(layer, "attention") and getattr(layer.attention, "l1_kv_sink_size", 0) > 0:
+                    dram_k = layer.attention.layer_past[0]
+                    dram_v = layer.attention.layer_past[1]
+                    layer.attention.seed_adaptive_l1_sinks(dram_k, dram_v)
+
         self.l1_kv_needs_alloc = False
         logger.info("[L1 KV] Adaptive L1 KV cache allocation complete.")
 
