@@ -571,7 +571,7 @@ class Attention(LightweightModule):
         # Reducing this lets KV grow but pushes those intermediates lower, where
         # they collide with whichever CB top is next-highest. Diagnostic
         # `[L1 per-core query]` log lines identify the offending buffer.
-        runtime_pad_bytes: int = 1024 * 1024,
+        runtime_pad_bytes: int = 580 * 1024,
     ) -> list:
         """
         Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
@@ -678,52 +678,127 @@ class Attention(LightweightModule):
         if not initial:
             return []
 
-        # Greedy fit by token-efficiency: keep the most token-dense tiers first.
-        # Within budget, lower-ranked tiers may shrink their tile_rows.
-        ranked = sorted(initial, key=lambda t: -(t[2] / t[3]))  # desc by tok_count/byte
+        # Shrink-all policy: rather than dropping tiers when budget is tight,
+        # give every tier at least 1 tile-row, then grow each tier toward its
+        # original size in token-efficiency order (most efficient first). This
+        # preserves coverage on every core class — dropping a tier loses more
+        # capacity than the algo-space slack it saves, especially when tier
+        # core grids are disjoint.
+        #
+        # Precondition: algo_budget must accommodate N_tiers × bytes_per_tile_row
+        # (one tile-row per tier). If not, runtime_pad_bytes is still too high —
+        # surface explicitly so the user can tune it.
 
-        accepted = []  # (tile_rows, cores, tok_count, cumulative)
-        used = 0
-        for tile_rows, cores_sorted, tok_count, cumulative in ranked:
-            remaining = algo_budget - used
-            if cumulative <= remaining:
-                accepted.append((tile_rows, cores_sorted, tok_count, cumulative))
-                used += cumulative
-                continue
-            # Try shrinking tile_rows until it fits (or hits 0).
-            max_fit_T = remaining // bytes_per_tile_row
-            shrunk_T = min(tile_rows, max_fit_T)
-            while shrunk_T > 0:
-                shrunk_tok = _tok_count_for(shrunk_T, len(cores_sorted))
-                if shrunk_tok == 0:
-                    shrunk_T -= 1
-                    continue
-                shrunk_cum = bytes_per_tile_row * shrunk_T
-                if shrunk_cum <= remaining:
-                    accepted.append((shrunk_T, cores_sorted, shrunk_tok, shrunk_cum))
-                    used += shrunk_cum
-                    logger.info(
-                        f"[L1 KV adaptive] Cumulative cap: shrunk tier "
-                        f"({len(cores_sorted)} cores) {tile_rows} → {shrunk_T} tile-rows "
-                        f"to fit (saved {(tile_rows - shrunk_T) * bytes_per_tile_row} B)."
-                    )
-                    break
-                shrunk_T -= 1
-            else:
-                logger.info(
-                    f"[L1 KV adaptive] Cumulative cap: dropped tier "
-                    f"({len(cores_sorted)} cores × {tile_rows} tile-rows) — "
-                    f"no shrunk T fits in remaining {remaining} B."
-                )
+        # Filter tiers whose minimum (T=1) yields 0 tokens — those are unviable
+        # at any size and skipped entirely.
+        viable = [
+            (tile_rows, cores_sorted, tok_count, cumulative)
+            for (tile_rows, cores_sorted, tok_count, cumulative) in initial
+            if _tok_count_for(1, len(cores_sorted)) > 0
+        ]
+        if not viable:
+            return []
 
-        if algo_budget > 0:
-            logger.info(
-                f"[L1 KV adaptive] Cumulative algo-space: {used} / {algo_budget} B used "
-                f"({100*used/algo_budget:.1f}%); bank={bank_allocatable_bytes}, "
-                f"runtime_pad={runtime_pad_bytes}, safety={safety_margin_bytes}."
+        min_total = bytes_per_tile_row * len(viable)
+        if algo_budget < min_total:
+            logger.warning(
+                f"[L1 KV adaptive] algo_budget={algo_budget} B is below the minimum "
+                f"needed for shrink-all ({len(viable)} tiers × {bytes_per_tile_row} B = "
+                f"{min_total} B). Lower runtime_pad_bytes by ≥ {min_total - algo_budget} B "
+                f"or accept that some tiers will be dropped."
             )
+            # Fall back to greedy drop policy when shrink-all isn't feasible:
+            # accept tiers in efficiency order until budget exhausted.
+            ranked = sorted(viable, key=lambda t: -(t[2] / t[3]))
+            accepted_fallback = []
+            used = 0
+            for tile_rows, cores_sorted, tok_count, cumulative in ranked:
+                remaining = algo_budget - used
+                if cumulative <= remaining:
+                    accepted_fallback.append((tile_rows, cores_sorted, tok_count, cumulative))
+                    used += cumulative
+                elif bytes_per_tile_row <= remaining:
+                    shrunk_T = remaining // bytes_per_tile_row
+                    shrunk_T = min(tile_rows, shrunk_T)
+                    shrunk_tok = _tok_count_for(shrunk_T, len(cores_sorted))
+                    while shrunk_T > 0 and shrunk_tok == 0:
+                        shrunk_T -= 1
+                        shrunk_tok = _tok_count_for(shrunk_T, len(cores_sorted))
+                    if shrunk_T > 0:
+                        shrunk_cum = bytes_per_tile_row * shrunk_T
+                        accepted_fallback.append((shrunk_T, cores_sorted, shrunk_tok, shrunk_cum))
+                        used += shrunk_cum
+                        logger.info(
+                            f"[L1 KV adaptive] Shrink-all fallback: tier "
+                            f"({len(cores_sorted)} cores) {tile_rows} → {shrunk_T} tile-rows."
+                        )
+                else:
+                    logger.info(
+                        f"[L1 KV adaptive] Shrink-all fallback: dropped tier "
+                        f"({len(cores_sorted)} cores × {tile_rows} tile-rows) — "
+                        f"no room in {remaining} B."
+                    )
+            logger.info(
+                f"[L1 KV adaptive] Cumulative algo-space (fallback): {used}/{algo_budget} B "
+                f"({100*used/algo_budget:.1f}%)."
+            )
+            accepted = accepted_fallback
         else:
-            logger.warning(f"[L1 KV adaptive] NO BUDGET!")
+            # Seed: every viable tier starts at T=1.
+            current = {}  # cores_sorted (immutable key) -> [tile_rows, tok_count, cumulative]
+            ranked = sorted(viable, key=lambda t: -(t[2] / t[3]))
+            order = []  # preserve efficiency ranking for the grow loop
+            used = 0
+            for tile_rows, cores_sorted, _full_tok, _full_cum in ranked:
+                cores_key = tuple(cores_sorted)
+                t0_tok = _tok_count_for(1, len(cores_sorted))
+                t0_cum = bytes_per_tile_row * 1
+                current[cores_key] = {
+                    "tile_rows": 1,
+                    "tok_count": t0_tok,
+                    "cumulative": t0_cum,
+                    "ceiling_tile_rows": tile_rows,
+                    "cores": cores_sorted,
+                }
+                used += t0_cum
+                order.append(cores_key)
+
+            # Grow loop: each pass tries to bump one tile-row to the most-efficient
+            # tier that has not yet hit its ceiling. Stop when no further growth fits.
+            grown = True
+            while grown:
+                grown = False
+                for cores_key in order:
+                    entry = current[cores_key]
+                    if entry["tile_rows"] >= entry["ceiling_tile_rows"]:
+                        continue
+                    new_T = entry["tile_rows"] + 1
+                    new_tok = _tok_count_for(new_T, len(entry["cores"]))
+                    if new_tok == 0 or new_tok <= entry["tok_count"]:
+                        # Alignment step prevents this size — skip
+                        continue
+                    delta_cum = bytes_per_tile_row * (new_T - entry["tile_rows"])
+                    if used + delta_cum > algo_budget:
+                        continue
+                    entry["tile_rows"] = new_T
+                    entry["tok_count"] = new_tok
+                    entry["cumulative"] = bytes_per_tile_row * new_T
+                    used += delta_cum
+                    grown = True
+                    # Restart the inner loop so the next bump again prefers the
+                    # highest-efficiency tier that's still under ceiling.
+                    break
+
+            accepted = [
+                (entry["tile_rows"], entry["cores"], entry["tok_count"], entry["cumulative"])
+                for entry in current.values()
+            ]
+            logger.info(
+                f"[L1 KV adaptive] Shrink-all: {len(accepted)} tiers seeded at T=1, "
+                f"used {used}/{algo_budget} B ({100*used/algo_budget:.1f}%); "
+                f"bank={bank_allocatable_bytes}, runtime_pad={runtime_pad_bytes}, "
+                f"safety={safety_margin_bytes}."
+            )
 
         # Re-sort accepted tiers from smallest tile_rows to largest, so the token
         # cursor in _allocate_adaptive_l1_kv_tiers grows monotonically (preserves
@@ -878,29 +953,72 @@ class Attention(LightweightModule):
 
     def _write_adaptive_l1_tiers(self, k_heads_l1, v_heads_l1, flat_l1_pos_tensor):
         """
-        Dispatch the ring-buffer write to the tier whose token range contains
-        the flat write position.
+        Dispatch the ring-buffer write to every tier WITHOUT a host sync.
 
-        flat_l1_pos_tensor is a scalar int32 ttnn tensor with value in [0, T).
-        We read it to host to pick the correct tier; this is a host sync and
-        must not be called inside a trace.
+        For each tier i with (token_start, tok_count), we compute an update_idxs
+        tensor on device that holds either:
+          * (flat_pos - token_start) when flat_pos is inside this tier's range, or
+          * -1 (= UINT32_MAX when reinterpreted as uint32_t) otherwise.
+
+        The paged_update_cache writer/reader kernels honor the -1 sentinel as
+        "skip this write" — see
+        ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/
+        dataflow/{writer,reader}_update_cache_interleaved_start_id.cpp.
+        So only the tier whose range contains flat_pos actually writes; the
+        others issue a no-op. This removes the per-layer host sync that was the
+        dominant per-token overhead.
+
+        flat_l1_pos_tensor is a scalar int32 ttnn tensor (row-major) with value
+        in [0, T_total). Trace-compatible (no host transfer).
 
         l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
           t[0]: K tensor  t[1]: V tensor  t[2]: token_start  t[3]: tok_count
         """
         if not self.l1_kv_tiers:
             return
-        pos_val = int(ttnn.to_torch(flat_l1_pos_tensor).view(-1)[0])
+
+        # Promote flat_pos to TILE/FP32 once — ttnn elementwise ops require
+        # TILE_LAYOUT and floating-point math. The per-tier computation reuses
+        # this single promoted tensor.
+        pos_tile_fp32 = ttnn.to_layout(flat_l1_pos_tensor, ttnn.TILE_LAYOUT)
+        pos_tile_fp32 = ttnn.typecast(pos_tile_fp32, ttnn.float32)
+
+        orig_shape = flat_l1_pos_tensor.shape
         for k_tensor, v_tensor, token_start, tok_count in self.l1_kv_tiers:
-            # token_start = t[2], tok_count = t[3]
-            if token_start <= pos_val < token_start + tok_count:
-                offset = pos_val - token_start
-                offset_tensor = self._make_l1_index_tensor(torch.full_like(ttnn.to_torch(flat_l1_pos_tensor), offset))
-                ttnn.experimental.paged_update_cache(k_tensor, k_heads_l1, update_idxs_tensor=offset_tensor)
-                ttnn.experimental.paged_update_cache(v_tensor, v_heads_l1, update_idxs_tensor=offset_tensor)
-                ttnn.deallocate(offset_tensor)
-                return
-        logger.warning(f"[L1 KV adaptive] Ring write pos {pos_val} not covered by any tier — skipping.")
+            # offset_i = flat_pos - token_start (may be negative or out-of-range)
+            off = ttnn.subtract(pos_tile_fp32, float(token_start))
+            # in_range = (off >= 0) && (off < tok_count)
+            ge = ttnn.ge(off, 0.0)
+            lt = ttnn.lt(off, float(tok_count))
+            in_range = ttnn.logical_and(ge, lt)
+            # offset_or_skip: real offset when in range, sentinel -1 otherwise.
+            # The kernel reads update_idxs as uint32_t and checks against
+            # (uint32_t)-1 == 0xFFFFFFFF, which an int32 -1 satisfies.
+            offset_or_skip_fp = ttnn.where(in_range, off, -1.0)
+            # Convert back to int32 ROW_MAJOR — paged_update_cache validate() requires it.
+            offset_int = ttnn.typecast(offset_or_skip_fp, ttnn.int32)
+            offset_int_rm = ttnn.to_layout(offset_int, ttnn.ROW_MAJOR_LAYOUT)
+            # Strip tile padding back to the original (post-slice) flat_pos shape.
+            padded_shape = offset_int_rm.shape
+            slice_ends = list(padded_shape)
+            for i in range(len(orig_shape)):
+                slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
+            slice_starts = [0] * len(padded_shape)
+            offset_final = ttnn.slice(offset_int_rm, slice_starts, slice_ends)
+
+            ttnn.experimental.paged_update_cache(k_tensor, k_heads_l1, update_idxs_tensor=offset_final)
+            ttnn.experimental.paged_update_cache(v_tensor, v_heads_l1, update_idxs_tensor=offset_final)
+
+            ttnn.deallocate(off)
+            ttnn.deallocate(ge)
+            ttnn.deallocate(lt)
+            ttnn.deallocate(in_range)
+            ttnn.deallocate(offset_or_skip_fp)
+            ttnn.deallocate(offset_int)
+            ttnn.deallocate(offset_int_rm)
+            ttnn.deallocate(offset_final)
+
+        ttnn.deallocate(pos_tile_fp32)
 
     def _make_l1_index_tensor(self, positions: torch.Tensor):
         return ttnn.from_torch(
