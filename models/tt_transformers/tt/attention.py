@@ -109,6 +109,12 @@ class Attention(LightweightModule):
         #   t[3] tok_count   — number of tokens this tier holds
         self.l1_kv_tiers: list = []
         self.l1_kv_adaptive_total_capacity: int = 0  # sum of all tier tok_counts; set after allocation
+        # decode_start_pos: cur_pos at the first decode step that writes to L1 tiers.
+        # Used as the lower bound by the SDPA decode kernel when deciding whether a
+        # sequence position is in L1. Positions < decode_start_pos came from prefill
+        # and are never written to the L1 ring. Captured on first ring write.
+        self._l1_kv_decode_start_pos: int = 0
+        self._l1_kv_decode_start_pos_captured: bool = False
 
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
         self.compute_kernel_config_hifi2_fp16 = configuration.compute_kernel_config_hifi2_fp16
@@ -841,6 +847,14 @@ class Attention(LightweightModule):
         ring_cap = T - self.l1_kv_sink_size
         if ring_cap <= 0:
             return None
+        # On the first decode step that writes to the L1 ring, capture cur_pos as
+        # decode_start_pos. The SDPA decode kernel uses this lower bound to avoid
+        # reading L1 for positions that were generated during prefill (and thus
+        # never written to L1). One host sync per attention layer at warmup —
+        # acceptable cost, runs exactly once.
+        if not self._l1_kv_decode_start_pos_captured:
+            self._l1_kv_decode_start_pos = int(ttnn.to_torch(current_pos).view(-1)[0])
+            self._l1_kv_decode_start_pos_captured = True
         orig_shape = current_pos.shape
         l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
         l1_pos = ttnn.typecast(l1_pos, ttnn.float32)
@@ -1145,6 +1159,12 @@ class Attention(LightweightModule):
                 sdpa_kwargs["l1_v_tensors"] = vs
                 sdpa_kwargs["l1_tier_token_starts"] = [m[0] for m in tier_meta]
                 sdpa_kwargs["l1_tier_token_counts"] = [m[1] for m in tier_meta]
+                # decode_start_pos = cur_pos at the first decode step. Captured once
+                # in _build_adaptive_l1_write_pos before this kwargs block runs (the
+                # write happens earlier in forward_decode). If still uncaptured here
+                # we pass 0 — the kernel then treats every ring slot as fresh, which
+                # only matches reality when decode_start_pos truly was 0 (no prefill).
+                sdpa_kwargs["l1_decode_start_pos"] = self._l1_kv_decode_start_pos
         elif self.l1_kv_cache is not None:
             sdpa_l1_k, sdpa_l1_v, _, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
             sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k

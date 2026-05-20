@@ -50,7 +50,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     std::vector<std::optional<const Tensor>> l1_k_tiers,
     std::vector<std::optional<const Tensor>> l1_v_tiers,
     std::vector<uint32_t> l1_tier_token_starts,
-    std::vector<uint32_t> l1_tier_token_counts) {
+    std::vector<uint32_t> l1_tier_token_counts,
+    uint32_t l1_decode_start_pos) {
     // If tiers were provided, use them; otherwise fall back to the scalar l1_k/v_tensor.
 
     if (l1_k_tiers.empty() && l1_k_tensor.has_value() && l1_v_tensor.has_value()) {
@@ -1094,6 +1095,11 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             reader_rt_args.push_back(tier_init[ti].start_tile);
             reader_rt_args.push_back(tier_init[ti].size_tiles);
         }
+        // Append decode_start_pos when any tier is active. The kernel only reads
+        // this arg under `num_l1_tiers > 0`, so we must omit it for the no-L1 path.
+        if (num_active_l1_tiers > 0) {
+            reader_rt_args.push_back(l1_decode_start_pos);
+        }
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
@@ -1164,7 +1170,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
          l1_sink_size,
          l1_min_expected_hit_ratio,
          l1_tier_token_starts,
-         l1_tier_token_counts](
+         l1_tier_token_counts,
+         l1_decode_start_pos](
             const void* operation,
             Program& program,
             const std::vector<Tensor>& input_tensors,
@@ -1264,6 +1271,10 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                     reader_args[arg_idx++] = tr.v_addr;
                     reader_args[arg_idx++] = tr.start_tile;
                     reader_args[arg_idx++] = tr.size_tiles;
+                }
+                // decode_start_pos: present only when at least one tier is active.
+                if (!tier_rt.empty()) {
+                    reader_args[arg_idx++] = l1_decode_start_pos;
                 }
 
                 // writer runtime args

@@ -394,7 +394,8 @@ operation::ProgramWithCallbacks ScaledDotProductAttentionDecode::create_program(
         l1_k_tiers,
         l1_v_tiers,
         this->l1_tier_token_starts,
-        this->l1_tier_token_counts);
+        this->l1_tier_token_counts,
+        this->l1_decode_start_pos);
 }
 
 operation::Hash ScaledDotProductAttentionDecode::compute_program_hash(

@@ -38,6 +38,7 @@ tt::tt_metal::operation::ProgramWithCallbacks sdpa_decode_multi_core(
     std::vector<std::optional<const Tensor>> l1_k_tiers = {},
     std::vector<std::optional<const Tensor>> l1_v_tiers = {},
     std::vector<uint32_t> l1_tier_token_starts = {},
-    std::vector<uint32_t> l1_tier_token_counts = {});
+    std::vector<uint32_t> l1_tier_token_counts = {},
+    uint32_t l1_decode_start_pos = 0);
 
 }  // namespace ttnn::operations::transformer::detail

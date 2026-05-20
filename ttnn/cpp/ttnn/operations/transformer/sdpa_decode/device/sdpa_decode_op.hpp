@@ -28,6 +28,7 @@ struct ScaledDotProductAttentionDecode {
     const float l1_min_expected_hit_ratio;
     const std::vector<uint32_t> l1_tier_token_starts;  // absolute token start per tier
     const std::vector<uint32_t> l1_tier_token_counts;  // token count per tier
+    const uint32_t l1_decode_start_pos;                // cur_pos at the first decode step (lower bound for L1 reads)
 
     const std::optional<bool> use_mla;
     const std::optional<uint32_t> head_dim_v;
