@@ -470,6 +470,7 @@ class ModelArgs:
         l1_kv_safety_margin=64 * 1024,  # bytes reserved between CB top and KV bottom
         l1_kv_min_viable_tokens=64,  # skip cores that can't fit at least this many tokens
         use_adaptive_l1_kv_cache=False,  # enable N-tier adaptive L1 KV cache
+        l1_kv_only_mode=False,  # StreamingLLM-style L1-only attention; needs use_adaptive_l1_kv_cache
         l1_kv_headroom_json=None,  # path to offline headroom JSON; if None, use live scan
     ):
         self.l1_kv_window_size = l1_kv_window_size
@@ -479,6 +480,7 @@ class ModelArgs:
         self.l1_kv_safety_margin = l1_kv_safety_margin
         self.l1_kv_min_viable_tokens = l1_kv_min_viable_tokens
         self.use_adaptive_l1_kv_cache = use_adaptive_l1_kv_cache
+        self.l1_kv_only_mode = l1_kv_only_mode
         self.l1_kv_headroom_json = l1_kv_headroom_json  # None → live scan; str → offline JSON path
         if subdevice:
             self.num_devices = 1

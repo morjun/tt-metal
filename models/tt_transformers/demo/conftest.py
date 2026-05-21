@@ -132,6 +132,16 @@ def pytest_addoption(parser):
         help="Enable the adaptive N-tier L1 KV cache (measures per-core headroom after decode compile and allocates tiers)",
     )
     parser.addoption(
+        "--l1_kv_only_mode",
+        action="store_true",
+        default=False,
+        help=(
+            "StreamingLLM-style L1-only inference: SDPA decode attends only to L1-cached positions "
+            "(sink + ring), skipping DRAM. Requires --use_adaptive_l1_kv_cache. Quality is close to "
+            "full attention thanks to attention sinks; perf benefit scales with SDPA time savings."
+        ),
+    )
+    parser.addoption(
         "--l1_kv_headroom_json",
         action="store",
         default=None,

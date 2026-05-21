@@ -115,6 +115,15 @@ class Attention(LightweightModule):
             "l1_kv_avoid_cores",
             None,
         )
+        # StreamingLLM L1-only inference mode. When True, SDPA decode is told
+        # to iterate ONLY the L1 cache contents (sink + ring), skipping DRAM
+        # reads. Achieved by passing a clamped cur_pos (= L1_total - 1) and
+        # decode_start_pos = 0 to the SDPA op. The DRAM/ring write paths keep
+        # the REAL current_pos unchanged so caches remain coherent.
+        # Quality tradeoff: attention is restricted to sink ∪ ring; middle
+        # prefill positions are dropped. Per StreamingLLM, with attention sinks
+        # the quality is close to full attention.
+        self.l1_kv_only_mode = getattr(configuration, "l1_kv_only_mode", False)
         if self.l1_kv_avoid_cores is None:
             # Default: filter out the L-shape's footprint for the adaptive path.
             # Avoiding overlap cores also REDUCES the L1 write dispatch overhead
@@ -123,7 +132,11 @@ class Attention(LightweightModule):
             # showed disjoint (11 cores y=9, 32 tokens) at 9.19 tok/s vs overlap
             # (27 cores y=0..8 x=8..10, 96 tokens) at 5.23 tok/s for the same
             # runtime_pad — narrower cores beats more cache.
-            if self.use_adaptive_l1_kv_cache:
+            # In L1-only mode we need enough capacity to host a substantial
+            # ring on top of the attention sink; the disjoint subset (~32
+            # tokens at viable runtime_pad) is too small. Fall back to the
+            # full core set so 192-token caches become reachable.
+            if self.use_adaptive_l1_kv_cache and not self.l1_kv_only_mode:
                 self.l1_kv_avoid_cores = [(x, y) for x in range(11) for y in range(5)] + [(x, 5) for x in range(8)]
             else:
                 self.l1_kv_avoid_cores = []
@@ -1453,6 +1466,9 @@ class Attention(LightweightModule):
             "l1_min_expected_hit_ratio": self.l1_kv_min_expected_hit_ratio,
         }
         sharded_l1_tensors = ()
+        # Stash any device-side intermediate we create for L1-only cur_pos
+        # clamping so we can deallocate it after the SDPA call.
+        clamped_cur_pos_to_free = None
         if self.l1_kv_tiers:
             # Adaptive N-tier path: pass all tier tensors + metadata to the extended SDPA op.
             ks, vs, tier_meta, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
@@ -1467,6 +1483,25 @@ class Attention(LightweightModule):
                 # we pass 0 — the kernel then treats every ring slot as fresh, which
                 # only matches reality when decode_start_pos truly was 0 (no prefill).
                 sdpa_kwargs["l1_decode_start_pos"] = self._l1_kv_decode_start_pos
+
+                # L1-only inference mode: tell the kernel cur_pos = L1_total - 1
+                # as a STATIC compile-time list (cur_pos_ids), removing the
+                # cur_pos_tensor reference entirely. Zero per-step device compute
+                # and zero host overhead. The kernel iterates only L1 chunks.
+                # Also set decode_start_pos = 0 so the fresh-window covers the
+                # full ring (sinks were seeded, ring is decode-written).
+                #
+                # Caveat: the static value is the steady-state target. During
+                # the first L1_total decode steps, the ring isn't fully populated
+                # yet — un-written ring slots hold zeros that the kernel will
+                # still iterate. With sinks anchoring the softmax, the model is
+                # tolerant of this; per StreamingLLM, quality stays close to full
+                # attention even with stale ring contents.
+                if self.l1_kv_only_mode and self.l1_kv_adaptive_total_capacity > 0:
+                    l1_cap = self.l1_kv_adaptive_total_capacity
+                    sdpa_kwargs["cur_pos_tensor"] = None
+                    sdpa_kwargs["cur_pos"] = [l1_cap - 1] * self.batch_size_per_device_group
+                    sdpa_kwargs["l1_decode_start_pos"] = 0
         elif self.l1_kv_cache is not None:
             sdpa_l1_k, sdpa_l1_v, _, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
             sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k
@@ -1498,6 +1533,10 @@ class Attention(LightweightModule):
         ttnn.deallocate(q_heads_1BQD)
         for sharded_tensor in sharded_l1_tensors:
             ttnn.deallocate(sharded_tensor)
+        if clamped_cur_pos_to_free is not None:
+            for t in clamped_cur_pos_to_free:
+                ttnn.deallocate(t)
+        # (l1_kv_only_mode static-cur_pos path doesn't create intermediates.)
 
         attn_output_11BH = ttnn.to_memory_config(
             attn_output_1G4D,

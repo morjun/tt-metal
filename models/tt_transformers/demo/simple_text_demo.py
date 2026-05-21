@@ -343,6 +343,7 @@ def prepare_generator_args(
     l1_kv_safety_margin=64 * 1024,
     l1_kv_min_viable_tokens=64,
     use_adaptive_l1_kv_cache=False,
+    l1_kv_only_mode=False,
     l1_kv_headroom_json=None,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
@@ -380,6 +381,7 @@ def prepare_generator_args(
             l1_kv_safety_margin=l1_kv_safety_margin,
             l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
             use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
+            l1_kv_only_mode=l1_kv_only_mode,
             l1_kv_headroom_json=l1_kv_headroom_json,
         )
         model_args.append(model_args_i)
@@ -938,6 +940,7 @@ def test_demo_text(
     l1_kv_safety_margin = request.config.getoption("--l1_kv_safety_margin")
     l1_kv_min_viable_tokens = request.config.getoption("--l1_kv_min_viable_tokens")
     use_adaptive_l1_kv_cache = request.config.getoption("--use_adaptive_l1_kv_cache")
+    l1_kv_only_mode = request.config.getoption("--l1_kv_only_mode")
     l1_kv_headroom_json = request.config.getoption("--l1_kv_headroom_json")
     l1_memory_view_path = request.config.getoption("--l1_memory_view_path")
 
@@ -1040,6 +1043,7 @@ def test_demo_text(
         l1_kv_safety_margin=l1_kv_safety_margin,
         l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
         use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
+        l1_kv_only_mode=l1_kv_only_mode,
         l1_kv_headroom_json=l1_kv_headroom_json,
     )
 
