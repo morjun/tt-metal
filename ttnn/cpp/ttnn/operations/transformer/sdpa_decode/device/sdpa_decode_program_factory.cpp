@@ -51,7 +51,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
     std::vector<std::optional<const Tensor>> l1_v_tiers,
     std::vector<uint32_t> l1_tier_token_starts,
     std::vector<uint32_t> l1_tier_token_counts,
-    uint32_t l1_decode_start_pos) {
+    uint32_t l1_decode_start_pos,
+    bool l1_only_mode) {
     // If tiers were provided, use them; otherwise fall back to the scalar l1_k/v_tensor.
 
     if (l1_k_tiers.empty() && l1_k_tensor.has_value() && l1_v_tensor.has_value()) {
@@ -1095,21 +1096,28 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             reader_rt_args.push_back(tier_init[ti].start_tile);
             reader_rt_args.push_back(tier_init[ti].size_tiles);
         }
-        // Append decode_start_pos and sink_tile_count when any tier is active.
-        // The kernel only reads these args under `num_l1_tiers > 0`, so we must
-        // omit them for the no-L1 path.
+        // Append decode_start_pos, sink_tile_count and l1_only_mode when any
+        // tier is active. The kernel only reads these args under
+        // `num_l1_tiers > 0`, so we must omit them for the no-L1 path.
         if (num_active_l1_tiers > 0) {
             reader_rt_args.push_back(l1_decode_start_pos);
-            // l1_sink_size is in TOKENS; convert to tiles (sink_size must be a
-            // multiple of TILE_HEIGHT — enforced model-side by aligning the
-            // sink seed to a tile boundary).
             uint32_t sink_tile_count = l1_sink_size / TILE_HEIGHT;
             reader_rt_args.push_back(sink_tile_count);
+            // l1_only_mode: 1 if the kernel should clamp cur_pos to
+            // (total_l1_tokens - 1) so iteration stays inside L1 (no DRAM
+            // reads). 0 = hybrid mode (kernel falls back to DRAM for stale tiles).
+            reader_rt_args.push_back(l1_only_mode ? 1u : 0u);
         }
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         reader_rt_args.insert(reader_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
-        // writer runtime args
+        // writer runtime args. Two extra slots carry the L1-only clamp inputs
+        // so the writer's get_dynamic_Sk_chunk_t / mask path stays aligned
+        // with the reader/compute chunk count when l1_only_mode is on.
+        uint32_t writer_total_l1_tokens = 0;
+        for (const auto& tr : tier_init) {
+            writer_total_l1_tokens += tr.size_tiles * TILE_HEIGHT;
+        }
         std::vector<uint32_t> writer_rt_args = {
             out_addr,
             worker_id_for_reduce,
@@ -1120,15 +1128,31 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
             cur_batch,
             core_num_in_reduce,
             core_num_in_output,
-            cur_pos};
+            cur_pos,
+            writer_total_l1_tokens,
+            l1_only_mode ? 1u : 0u};
         writer_rt_args.insert(writer_rt_args.end(), reduce_core_physical_xs.begin(), reduce_core_physical_xs.end());
         writer_rt_args.insert(writer_rt_args.end(), reduce_core_physical_ys.begin(), reduce_core_physical_ys.end());
         writer_rt_args.insert(writer_rt_args.end(), output_core_physical_xs.begin(), output_core_physical_xs.end());
         writer_rt_args.insert(writer_rt_args.end(), output_core_physical_ys.begin(), output_core_physical_ys.end());
 
-        // compute runtime args
+        // compute runtime args. The last two slots carry total_l1_tokens and
+        // l1_only_mode so the compute kernel can clamp cur_pos identically to
+        // the reader — keeping chunk-loop alignment in L1-only mode.
+        uint32_t total_l1_tokens_for_compute = 0;
+        for (const auto& tr : tier_init) {
+            total_l1_tokens_for_compute += tr.size_tiles * TILE_HEIGHT;
+        }
         std::vector<uint32_t> compute_rt_args = {
-            do_reduce, do_output, cur_head, cur_batch, core_num_in_reduce, core_num_in_output, cur_pos};
+            do_reduce,
+            do_output,
+            cur_head,
+            cur_batch,
+            core_num_in_reduce,
+            core_num_in_output,
+            cur_pos,
+            total_l1_tokens_for_compute,
+            l1_only_mode ? 1u : 0u};
 
         SetRuntimeArgs(program, reader_kernels_id, core, reader_rt_args);
         SetRuntimeArgs(program, writer_kernels_id, core, writer_rt_args);
@@ -1140,15 +1164,21 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
         for (uint32_t i = 0; i < core_group_idle.size(); ++i) {
             CoreCoord core = core_group_idle[i];
             log_debug(tt::LogOp, "Setting core {} to idle", core);
-            // reader runtime args: 16 fixed args + 0 tier args for idle cores (q_addr=0 causes early exit)
-            std::vector<uint32_t> reader_rt_args(16 + num_active_l1_tiers * 4, 0);
+            // reader runtime args: 16 fixed + 4*N_tiers tier-slots + 3 extra
+            // (decode_start_pos, sink_tile_count, l1_only_mode) when any tier
+            // is active. Idle cores never reach those reads (q_addr==0 early
+            // exits), but the kernel's get_arg_addr() table must be sized
+            // identically across all cores or runtime asserts will fire.
+            uint32_t reader_idle_size = 16 + num_active_l1_tiers * 4 + (num_active_l1_tiers > 0 ? 3 : 0);
+            std::vector<uint32_t> reader_rt_args(reader_idle_size, 0);
 
-            // writer runtime args
-            std::vector<uint32_t> writer_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            // writer runtime args (12 slots: 10 existing + 2 new for L1-only clamp).
+            std::vector<uint32_t> writer_rt_args = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
             SetRuntimeArgs(program, reader_kernels_id, core, reader_rt_args);
             SetRuntimeArgs(program, writer_kernels_id, core, writer_rt_args);
-            SetRuntimeArgs(program, compute_kernels_id, core, {65, 0, 0, 0, 0, 0, 0});
+            // 9 slots: 7 existing + 2 new (total_l1_tokens_for_clamp, l1_only_mode).
+            SetRuntimeArgs(program, compute_kernels_id, core, {65, 0, 0, 0, 0, 0, 0, 0, 0});
         }
     }
 
@@ -1177,7 +1207,8 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
          l1_min_expected_hit_ratio,
          l1_tier_token_starts,
          l1_tier_token_counts,
-         l1_decode_start_pos](
+         l1_decode_start_pos,
+         l1_only_mode](
             const void* operation,
             Program& program,
             const std::vector<Tensor>& input_tensors,
@@ -1278,11 +1309,12 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                     reader_args[arg_idx++] = tr.start_tile;
                     reader_args[arg_idx++] = tr.size_tiles;
                 }
-                // decode_start_pos + sink_tile_count: present only when at least
-                // one tier is active.
+                // decode_start_pos + sink_tile_count + l1_only_mode: present
+                // only when at least one tier is active.
                 if (!tier_rt.empty()) {
                     reader_args[arg_idx++] = l1_decode_start_pos;
                     reader_args[arg_idx++] = l1_sink_size / TILE_HEIGHT;
+                    reader_args[arg_idx++] = l1_only_mode ? 1u : 0u;
                 }
 
                 // writer runtime args
@@ -1297,6 +1329,15 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 writer_args[arg_idx++] = core_num_in_reduce;
                 writer_args[arg_idx++] = core_num_in_output;
                 writer_args[arg_idx++] = cur_pos;
+                // Mirror reader/compute clamp args for the writer.
+                {
+                    uint32_t writer_total_l1_tokens_cb = 0;
+                    for (const auto& tr : tier_rt) {
+                        writer_total_l1_tokens_cb += tr.size_tiles * TILE_HEIGHT;
+                    }
+                    writer_args[arg_idx++] = writer_total_l1_tokens_cb;
+                    writer_args[arg_idx++] = l1_only_mode ? 1u : 0u;
+                }
 
                 // compute runtime args
                 arg_idx = 0;
@@ -1307,6 +1348,14 @@ operation::ProgramWithCallbacks sdpa_decode_multi_core(
                 compute_args[arg_idx++] = core_num_in_reduce;
                 compute_args[arg_idx++] = core_num_in_output;
                 compute_args[arg_idx++] = cur_pos;
+                // Mirror reader's total_l1_tokens + l1_only_mode so compute
+                // kernel can clamp cur_pos identically.
+                uint32_t total_l1_tokens_for_compute = 0;
+                for (const auto& tr : tier_rt) {
+                    total_l1_tokens_for_compute += tr.size_tiles * TILE_HEIGHT;
+                }
+                compute_args[arg_idx++] = total_l1_tokens_for_compute;
+                compute_args[arg_idx++] = l1_only_mode ? 1u : 0u;
             }
             if (use_cur_pos_tensor and cur_pos_tensor.value().is_sharded()) {
                 UpdateDynamicCircularBufferAddress(program, cb_in8_id, *cur_pos_tensor.value().buffer());

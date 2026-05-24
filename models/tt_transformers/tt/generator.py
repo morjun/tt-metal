@@ -697,6 +697,15 @@ class Generator:
                     dram_v = layer.attention.layer_past[1]
                     layer.attention.seed_adaptive_l1_sinks(dram_k, dram_v)
 
+        # Propagate adaptive total capacity back to ModelArgs so model.prepare_inputs_decode
+        # can pre-compute the L1 ring write position ONCE per step (otherwise each of the
+        # 32 attention layers would recompute the same value, costing 9 ttnn ops/layer).
+        for model_i in self.model:
+            for layer in model_i.layers:
+                if hasattr(layer, "attention") and getattr(layer.attention, "l1_kv_adaptive_total_capacity", 0) > 0:
+                    model_i.args.l1_kv_adaptive_total_capacity = layer.attention.l1_kv_adaptive_total_capacity
+                    break
+
         self.l1_kv_needs_alloc = False
         logger.info("[L1 KV] Adaptive L1 KV cache allocation complete.")
 

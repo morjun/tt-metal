@@ -741,7 +741,7 @@ class Attention(LightweightModule):
         # Reducing this lets KV grow but pushes those intermediates lower, where
         # they collide with whichever CB top is next-highest. Diagnostic
         # `[L1 per-core query]` log lines identify the offending buffer.
-        runtime_pad_bytes: int = 1024 * 1024,
+        runtime_pad_bytes: int = 576 * 1024,
     ) -> list:
         """
         Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
@@ -1405,31 +1405,56 @@ class Attention(LightweightModule):
                 k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
                 v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
         elif self.l1_kv_tiers and not page_table and l1_write_enabled:
-            with l1_kv_perf.timed("decode.l1_clone_path"):
-                k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
-                v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
+            if self.l1_kv_only_mode:
+                # L1-only mode skips DRAM K/V write (below), so k_heads_1BKD has
+                # no other consumer. Pass it directly to the L1 ring write and
+                # let the post-SDPA deallocate at the same site as before. Saves
+                # 2 ttnn.mul ops per layer.
+                k_heads_l1 = k_heads_1BKD
+                v_heads_l1 = v_heads_1BKD
+            else:
+                with l1_kv_perf.timed("decode.l1_clone_path"):
+                    k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
+                    v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
         else:
             k_heads_l1 = None
             v_heads_l1 = None
         # k_heads, [seqlen, n_kv_heads, bsz, head_dim]
         # v_heads [seqlen, n_kv_heads, bsz, head_dim]
         # keys, [max_batch_size, n_kv_heads // configuration.num_devices, max_seq_len, head_dim]
-        with l1_kv_perf.timed("decode.dram_kv_write"):
-            ttnn.experimental.paged_update_cache(
-                keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
-            )
-            ttnn.experimental.paged_update_cache(
-                values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
-            )
+        # L1-only inference mode: when the SDPA decode kernel only reads from the
+        # L1 adaptive tiers (clamped cur_pos, no DRAM fallback), there's no
+        # benefit to maintaining the DRAM K/V cache. Skipping the two
+        # paged_update_cache writes per layer removes ~32 ms/token of pure
+        # overhead. The DRAM tensors stay populated from prefill but go stale —
+        # safe because the kernel never reads them in this mode.
+        skip_dram_kv_write = self.l1_kv_only_mode and self.l1_kv_tiers and not page_table and l1_write_enabled
+        if not skip_dram_kv_write:
+            with l1_kv_perf.timed("decode.dram_kv_write"):
+                ttnn.experimental.paged_update_cache(
+                    keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+                )
+                ttnn.experimental.paged_update_cache(
+                    values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+                )
 
         if self.l1_kv_tiers and not page_table and l1_write_enabled:
-            # Adaptive N-tier ring-buffer write.
-            # NOTE: _write_adaptive_l1_tiers does a host sync (to_torch) — not trace-compatible.
+            # Adaptive N-tier ring-buffer write. The model's prepare_inputs_decode
+            # now pre-computes the flat ring write position for every step (once,
+            # not 32×) and passes it in via l1_update_pos. Use it when available
+            # to skip 9 ttnn ops/layer of redundant compute. Fallback to the
+            # per-layer compute path for callers that don't pass it.
             with l1_kv_perf.timed("decode.adaptive_l1_kv_write"):
-                flat_pos = self._build_adaptive_l1_write_pos(current_pos)
+                if l1_update_pos is not None:
+                    flat_pos = l1_update_pos
+                    locally_built_flat_pos = False
+                else:
+                    flat_pos = self._build_adaptive_l1_write_pos(current_pos)
+                    locally_built_flat_pos = True
                 if flat_pos is not None:
                     self._write_adaptive_l1_tiers(k_heads_l1, v_heads_l1, flat_pos)
-                    ttnn.deallocate(flat_pos)
+                    if locally_built_flat_pos:
+                        ttnn.deallocate(flat_pos)
         elif self.l1_kv_cache is not None and not page_table and l1_write_enabled:
             l1_pos = l1_update_pos
             if l1_pos is None and self.l1_kv_window_size > 0:
@@ -1484,24 +1509,17 @@ class Attention(LightweightModule):
                 # only matches reality when decode_start_pos truly was 0 (no prefill).
                 sdpa_kwargs["l1_decode_start_pos"] = self._l1_kv_decode_start_pos
 
-                # L1-only inference mode: tell the kernel cur_pos = L1_total - 1
-                # as a STATIC compile-time list (cur_pos_ids), removing the
-                # cur_pos_tensor reference entirely. Zero per-step device compute
-                # and zero host overhead. The kernel iterates only L1 chunks.
-                # Also set decode_start_pos = 0 so the fresh-window covers the
-                # full ring (sinks were seeded, ring is decode-written).
-                #
-                # Caveat: the static value is the steady-state target. During
-                # the first L1_total decode steps, the ring isn't fully populated
-                # yet — un-written ring slots hold zeros that the kernel will
-                # still iterate. With sinks anchoring the softmax, the model is
-                # tolerant of this; per StreamingLLM, quality stays close to full
-                # attention even with stale ring contents.
+                # L1-only inference mode: keep the real cur_pos_tensor (same
+                # fast program-cache path as the hybrid mode), but flip a
+                # kernel-side flag so the SDPA decode kernel internally clamps
+                # cur_pos to (total_l1_tokens - 1) for its iteration logic.
+                # That way the kernel iterates only L1 chunks (no DRAM reads)
+                # without any Python clamping overhead. Also set
+                # decode_start_pos = 0 so the fresh-window covers the full ring
+                # (sinks were seeded, ring is decode-written).
                 if self.l1_kv_only_mode and self.l1_kv_adaptive_total_capacity > 0:
-                    l1_cap = self.l1_kv_adaptive_total_capacity
-                    sdpa_kwargs["cur_pos_tensor"] = None
-                    sdpa_kwargs["cur_pos"] = [l1_cap - 1] * self.batch_size_per_device_group
                     sdpa_kwargs["l1_decode_start_pos"] = 0
+                    sdpa_kwargs["l1_only_mode"] = True
         elif self.l1_kv_cache is not None:
             sdpa_l1_k, sdpa_l1_v, _, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
             sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k
@@ -1509,9 +1527,11 @@ class Attention(LightweightModule):
 
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
-        if k_heads_l1 is not None:
+        # In L1-only mode we aliased k_heads_l1 = k_heads_1BKD (no clone), so
+        # the previous deallocate above already freed them — don't double-free.
+        if k_heads_l1 is not None and k_heads_l1 is not k_heads_1BKD:
             ttnn.deallocate(k_heads_l1)
-        if v_heads_l1 is not None:
+        if v_heads_l1 is not None and v_heads_l1 is not v_heads_1BKD:
             ttnn.deallocate(v_heads_l1)
 
         # NOTE: Varying the batch size will result in slightly different outputs.

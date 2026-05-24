@@ -110,6 +110,12 @@ void MAIN {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
+    // L1-only mode mirror args (must match reader's plumbing). The program
+    // factory always writes these two slots after cur_pos when any L1 tier is
+    // active; we read them unconditionally because that allocation is paired
+    // 1:1 with the runtime arg vector.
+    const uint32_t total_l1_tokens_for_clamp = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_only_mode_arg = get_arg_val<uint32_t>(arg_idx++);
 
     // Idle core
     // get_arg_val<uint32_t>(0) can go from 0-63 for the core_num; for active cores 65 is out of range so 65 indicates
@@ -139,6 +145,11 @@ void MAIN {
             // cur_pos of -1 indicates that the user should be skipped
             return;
         }
+    }
+
+    // L1-only mode: clamp cur_pos so iteration matches the reader's clamp.
+    if (l1_only_mode_arg == 1u && total_l1_tokens_for_clamp > 0 && cur_pos + 1u > total_l1_tokens_for_clamp) {
+        cur_pos = total_l1_tokens_for_clamp - 1u;
     }
 
     // Get dynamic chunk size for K in tiles

@@ -51,6 +51,9 @@ void kernel_main() {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
+    // L1-only mode mirror args (must match reader/compute plumbing).
+    const uint32_t total_l1_tokens_for_clamp = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t l1_only_mode_arg = get_arg_val<uint32_t>(arg_idx++);
 
     // idle core
     if (out_addr == 0) {
@@ -76,6 +79,13 @@ void kernel_main() {
             // cur_pos of -1 indicates that the user should be skipped
             return;
         }
+    }
+
+    // L1-only mode: clamp identically to reader/compute so all three kernels
+    // iterate the same chunk count (CB push/pop alignment) and the mask logic
+    // matches what's read from L1.
+    if (l1_only_mode_arg == 1u && total_l1_tokens_for_clamp > 0 && cur_pos + 1u > total_l1_tokens_for_clamp) {
+        cur_pos = total_l1_tokens_for_clamp - 1u;
     }
 
     auto Sk_chunk_t_dynamic = get_dynamic_Sk_chunk_t<Sk_chunk_t, max_dynamic_chunk_size>(cur_pos);

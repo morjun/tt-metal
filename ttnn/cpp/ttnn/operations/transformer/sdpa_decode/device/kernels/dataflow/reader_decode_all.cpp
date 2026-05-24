@@ -128,6 +128,9 @@ void kernel_main() {
     // sink_tile_count: number of L1 tiles holding pinned prefill K/V[0, sink_size).
     // 0 means no sink (pure ring). Always fresh — seeded by Python at warmup.
     const uint32_t l1_sink_tile_count_arg = (num_l1_tiers > 0) ? get_arg_val<uint32_t>(arg_idx++) : 0u;
+    // l1_only_mode: when 1, clamp cur_pos to (total_l1_tokens - 1) so the chunk
+    // iteration covers only L1 contents (no DRAM fallback). 0 = hybrid mode.
+    const uint32_t l1_only_mode_arg = (num_l1_tiers > 0) ? get_arg_val<uint32_t>(arg_idx++) : 0u;
 
     // idle core
     if (q_addr == 0) {
@@ -161,6 +164,23 @@ void kernel_main() {
         if (cur_pos == UINT32_MAX) {
             // cur_pos of -1 indicates that the user should be skipped
             return;
+        }
+    }
+
+    // L1-only mode: clamp cur_pos to (total_l1_tokens - 1) so chunk iteration
+    // stays within L1's capacity. This keeps reader/compute on the same
+    // cur_pos_tensor program path as hybrid mode (preserving program-cache
+    // reuse) while skipping DRAM reads entirely.
+    if constexpr (num_l1_tiers > 0) {
+        if (l1_only_mode_arg == 1u) {
+            uint32_t total_l1_tiles_local = 0;
+            for (uint32_t ti = 0; ti < num_l1_tiers; ++ti) {
+                total_l1_tiles_local += tier_size_tiles[ti];
+            }
+            const uint32_t total_l1_tokens_local = total_l1_tiles_local * 32u;
+            if (total_l1_tokens_local > 0 && cur_pos + 1u > total_l1_tokens_local) {
+                cur_pos = total_l1_tokens_local - 1u;
+            }
         }
     }
 

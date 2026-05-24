@@ -76,7 +76,8 @@ void py_bind_sdpa_decode(py::module& module) {
                const std::vector<std::optional<const Tensor>>& l1_v_tensors,
                const std::vector<uint32_t>& l1_tier_token_starts,
                const std::vector<uint32_t>& l1_tier_token_counts,
-               uint32_t l1_decode_start_pos) {
+               uint32_t l1_decode_start_pos,
+               bool l1_only_mode) {
                 return self(
                     input_tensor_q,
                     input_tensor_k,
@@ -99,7 +100,8 @@ void py_bind_sdpa_decode(py::module& module) {
                     l1_v_tensors,
                     l1_tier_token_starts,
                     l1_tier_token_counts,
-                    l1_decode_start_pos);
+                    l1_decode_start_pos,
+                    l1_only_mode);
             },
             py::arg("input_tensor_q").noconvert(),
             py::arg("input_tensor_k").noconvert(),
@@ -123,7 +125,8 @@ void py_bind_sdpa_decode(py::module& module) {
             py::arg("l1_v_tensors").noconvert() = std::vector<std::optional<const Tensor>>(),
             py::arg("l1_tier_token_starts").noconvert() = std::vector<uint32_t>(),
             py::arg("l1_tier_token_counts").noconvert() = std::vector<uint32_t>(),
-            py::arg("l1_decode_start_pos").noconvert() = 0u});
+            py::arg("l1_decode_start_pos").noconvert() = 0u,
+            py::arg("l1_only_mode").noconvert() = false});
 
     using PagedOperationType = decltype(ttnn::transformer::paged_scaled_dot_product_attention_decode);
     ttnn::bind_registered_operation(

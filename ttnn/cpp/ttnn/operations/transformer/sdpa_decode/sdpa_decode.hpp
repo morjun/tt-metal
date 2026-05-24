@@ -36,7 +36,8 @@ struct ExecuteScaledDotProductAttentionDecode {
         const std::vector<std::optional<const Tensor>>& l1_v_tensors = {},
         const std::vector<uint32_t>& l1_tier_token_starts = {},
         const std::vector<uint32_t>& l1_tier_token_counts = {},
-        uint32_t l1_decode_start_pos = 0);
+        uint32_t l1_decode_start_pos = 0,
+        bool l1_only_mode = false);
 };
 
 struct ExecutePagedScaledDotProductAttentionDecode {

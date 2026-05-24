@@ -29,6 +29,7 @@ struct ScaledDotProductAttentionDecode {
     const std::vector<uint32_t> l1_tier_token_starts;  // absolute token start per tier
     const std::vector<uint32_t> l1_tier_token_counts;  // token count per tier
     const uint32_t l1_decode_start_pos;                // cur_pos at the first decode step (lower bound for L1 reads)
+    const bool l1_only_mode;  // StreamingLLM L1-only mode: kernel clamps cur_pos to total_l1_tokens-1
 
     const std::optional<bool> use_mla;
     const std::optional<uint32_t> head_dim_v;

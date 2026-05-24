@@ -53,7 +53,8 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     const std::vector<std::optional<const Tensor>>& l1_v_tensors,
     const std::vector<uint32_t>& l1_tier_token_starts,
     const std::vector<uint32_t>& l1_tier_token_counts,
-    uint32_t l1_decode_start_pos) {
+    uint32_t l1_decode_start_pos,
+    bool l1_only_mode) {
     [[maybe_unused]] auto arch =
         input_tensor_q.storage_type() == StorageType::DEVICE
             ? input_tensor_q.device()->arch()
@@ -108,7 +109,8 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
                    .l1_min_expected_hit_ratio = l1_min_expected_hit_ratio,
                    .l1_tier_token_starts = l1_tier_token_starts,
                    .l1_tier_token_counts = l1_tier_token_counts,
-                   .l1_decode_start_pos = l1_decode_start_pos},
+                   .l1_decode_start_pos = l1_decode_start_pos,
+                   .l1_only_mode = l1_only_mode},
                {input_tensor_q, input_tensor_k, input_tensor_v},
                optional_inputs,
                {})

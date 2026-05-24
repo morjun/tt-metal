@@ -302,10 +302,20 @@ class Transformer(LightweightModule):
 
         l1_update_pos_tt = None
         l1_write_enabled = True
-        total_l1_tokens = self.args.l1_kv_sink_size + self.args.l1_kv_window_size
-        if total_l1_tokens > 0:
-            sink_size = self.args.l1_kv_sink_size
+        # For adaptive L1 KV cache, the ring window is set after _post_compile_allocate_l1_kv;
+        # the total capacity is propagated back to ModelArgs as l1_kv_adaptive_total_capacity.
+        # When available, use it instead of the fixed-window field so we can pre-compute the
+        # flat ring write position here ONCE per step (instead of 32×/step inside each
+        # attention layer's _build_adaptive_l1_write_pos).
+        adaptive_total = getattr(self.args, "l1_kv_adaptive_total_capacity", 0) or 0
+        sink_size = self.args.l1_kv_sink_size
+        if adaptive_total > 0:
+            ring_size = max(0, adaptive_total - sink_size)
+            total_l1_tokens = adaptive_total
+        else:
             ring_size = self.args.l1_kv_window_size
+            total_l1_tokens = sink_size + ring_size
+        if total_l1_tokens > 0:
             l1_update_pos = current_pos.clone()
             if sink_size > 0:
                 if ring_size > 0:
