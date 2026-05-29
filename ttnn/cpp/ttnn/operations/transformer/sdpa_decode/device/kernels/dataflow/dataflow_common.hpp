@@ -695,16 +695,29 @@ void read_kv_mask_chunks_n_tier(
     const uint32_t sink_tokens = sink_tile_count * TILE_HEIGHT_LOCAL;
     uint32_t fresh_lo_tile;
     uint32_t fresh_hi_tile;
+    // fresh_hi uses CEIL (not floor) so the partial tile that contains cur_pos is
+    // included in the L1 fresh window. That boundary tile's positions <= cur_pos were
+    // decode-written to the ring; positions > cur_pos are unwritten but causally masked
+    // by SDPA, so reading the whole tile from L1 is correct. With floor, the boundary
+    // tile fell through to the DRAM fallback (`k_reader`/`v_reader`) — which is STALE in
+    // l1_only mode (decode skips DRAM writes), causing the model's most-recent tokens to
+    // read garbage and the output to degenerate into repetition. Ceiling here lets
+    // l1_only attend purely from L1 (no DRAM read), so DRAM writes can be skipped entirely.
+    const uint32_t cur_pos_hi_tile_ceil = (cur_pos_tokens + 1u + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
     if (cur_pos_tokens + 1u <= sink_tokens + ring_tokens) {
-        // No ring wrap yet: fresh ring range is [sink_tile_count, floor((cur_pos+1)/TILE_HEIGHT)).
+        // No ring wrap yet: fresh ring range is [sink_tile_count, ceil((cur_pos+1)/TILE_HEIGHT)).
         fresh_lo_tile = sink_tile_count;
-        fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
+        fresh_hi_tile = cur_pos_hi_tile_ceil;
     } else {
-        // Wrap: ring holds tokens (cur_pos - ring_tokens, cur_pos]; convert to
-        // fully-contained tile range, ceiling on lo, floor on hi.
+        // Wrap: ring holds tokens (cur_pos - ring_tokens, cur_pos]; ceil on lo (first
+        // fully-fresh tile), ceil on hi (include the boundary tile).
         uint32_t earliest_fresh_token = cur_pos_tokens + 1u - ring_tokens;
         fresh_lo_tile = (earliest_fresh_token + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
-        fresh_hi_tile = (cur_pos_tokens + 1u) / TILE_HEIGHT_LOCAL;
+        fresh_hi_tile = cur_pos_hi_tile_ceil;
+    }
+    // Never claim more fresh tiles than exist in L1.
+    if (fresh_hi_tile > total_l1_tiles) {
+        fresh_hi_tile = total_l1_tiles;
     }
     // Clamp ring fresh_lo to the first tile that is entirely decode-written.
     // Ring slots are only populated by decode-time writes; prefill K/V beyond

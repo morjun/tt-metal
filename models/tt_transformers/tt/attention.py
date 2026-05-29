@@ -658,15 +658,26 @@ class Attention(LightweightModule):
             )
             return
         sink = self.l1_kv_sink_size
+        # In l1_only mode the kernel attends ONLY to L1 (cur_pos clamped, decode_start_pos=0),
+        # so EVERY position in [0, cur_pos] must be L1-resident. The decode ring only writes
+        # positions >= prompt_len; prefill [sink, prompt_len) is otherwise never written to L1
+        # and would read as zeros → the model loses the prompt and degenerates. When the cache
+        # is a SINGLE tier large enough to hold the sequence (no ring wrap), seed the FULL
+        # prefill [0, tok_count) from DRAM instead of just the sink. This makes the
+        # decode_start_pos=0 assumption valid: [0, prompt_len) seeded, [prompt_len, cur_pos]
+        # decode-written, all in L1. Multi-tier sharded still seeds sink-only (full-prefill
+        # seeding across disjoint tiers is not yet implemented; its l1_only quality is limited).
+        seed_len = sink
+        if self.l1_kv_only_mode and len(self.l1_kv_tiers) == 1:
+            seed_len = min(tok_count, dram_k_cache.shape[2])
         try:
-            # Slice DRAM K/V[..., 0:sink, ...] on device. The slice is small
-            # (one tile-row deep) so the host transfer is cheap.
+            # Slice DRAM K/V[..., 0:seed_len, ...] on device, then move to host once.
             k_starts = [0] * len(dram_k_cache.shape)
             v_starts = [0] * len(dram_v_cache.shape)
             k_ends = list(dram_k_cache.shape)
             v_ends = list(dram_v_cache.shape)
-            k_ends[2] = sink
-            v_ends[2] = sink
+            k_ends[2] = seed_len
+            v_ends[2] = seed_len
             k_slice = ttnn.slice(dram_k_cache, k_starts, k_ends)
             v_slice = ttnn.slice(dram_v_cache, v_starts, v_ends)
             k_sink_torch = ttnn.to_torch(k_slice)  # shape [B*mesh?, K, sink, D]
@@ -704,12 +715,12 @@ class Attention(LightweightModule):
             # since ReplicateTensorToMesh writes the same tensor on every device,
             # all mesh slices are identical and we can just use the first.
             if k_sink_torch.dim() == 4 and k_sink_torch.shape[0] == shape[0]:
-                zeros_k[:, :, :sink, :] = k_sink_torch
-                zeros_v[:, :, :sink, :] = v_sink_torch
+                zeros_k[:, :, :seed_len, :] = k_sink_torch
+                zeros_v[:, :, :seed_len, :] = v_sink_torch
             elif k_sink_torch.dim() == 4:
                 # The mesh dim got concatenated into batch dim; take the first slice.
-                zeros_k[:, :, :sink, :] = k_sink_torch[: shape[0]]
-                zeros_v[:, :, :sink, :] = v_sink_torch[: shape[0]]
+                zeros_k[:, :, :seed_len, :] = k_sink_torch[: shape[0]]
+                zeros_v[:, :, :seed_len, :] = v_sink_torch[: shape[0]]
             else:
                 logger.warning(
                     f"[L1 KV adaptive] Unexpected DRAM cache shape {k_sink_torch.shape} for sink seed; skipping."
@@ -733,7 +744,10 @@ class Attention(LightweightModule):
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
             )
             self.l1_kv_tiers[0] = (new_k, new_v, token_start, tok_count)
-            logger.info(f"[L1 KV adaptive] Seeded {sink} sink slots from DRAM K/V into Tier 0.")
+            logger.info(
+                f"[L1 KV adaptive] Seeded {seed_len} slots from DRAM K/V into Tier 0 "
+                f"({'full-prefill (l1_only)' if seed_len > sink else 'sink'})."
+            )
         except RuntimeError as e:
             logger.warning(f"[L1 KV adaptive] sink seed failed: {e}. Continuing without sinks.")
             self.l1_kv_sink_size = 0
