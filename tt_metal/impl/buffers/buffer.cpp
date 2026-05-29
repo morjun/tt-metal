@@ -253,6 +253,7 @@ Buffer::Buffer(
     const std::optional<bool> bottom_up,
     const std::optional<SubDeviceId> sub_device_id,
     const bool owns_data,
+    uint32_t allocator_id,
     Private) :
     device_(device),
     size_(size),
@@ -263,7 +264,8 @@ Buffer::Buffer(
     owns_data_(owns_data),
     page_size_(page_size),
     shard_spec_(sharding_args.shard_spec()),
-    buffer_distribution_spec_(sharding_args.buffer_distribution_spec()) {
+    buffer_distribution_spec_(sharding_args.buffer_distribution_spec()),
+    allocator_id_(allocator_id) {
     TT_FATAL(this->device_ != nullptr, "Device needs to not be null.");
     if (this->sub_device_id_.has_value()) {
         validate_sub_device_id(this->sub_device_id_, this->device_, buffer_type, shard_spec_);
@@ -283,11 +285,21 @@ std::shared_ptr<Buffer> Buffer::create(
     const BufferType buffer_type,
     const BufferShardingArgs& sharding_args,
     const std::optional<bool> bottom_up,
-    const std::optional<SubDeviceId> sub_device_id) {
+    const std::optional<SubDeviceId> sub_device_id,
+    uint32_t allocator_id) {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
 
     auto buffer = std::make_shared<Buffer>(
-        device, size, page_size, buffer_type, sharding_args, bottom_up, sub_device_id, true /* owns data */, Private());
+        device,
+        size,
+        page_size,
+        buffer_type,
+        sharding_args,
+        bottom_up,
+        sub_device_id,
+        true /* owns data */,
+        allocator_id,
+        Private());
 
     if (buffer->size_ == 0) {
         buffer->allocation_status_ = AllocationStatus::ALLOCATED;
@@ -319,7 +331,8 @@ std::shared_ptr<Buffer> Buffer::create(
     const BufferType buffer_type,
     const BufferShardingArgs& sharding_args,
     const std::optional<bool> bottom_up,
-    const std::optional<SubDeviceId> sub_device_id) {
+    const std::optional<SubDeviceId> sub_device_id,
+    uint32_t allocator_id) {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     auto buffer = std::make_shared<Buffer>(
         device,
@@ -330,6 +343,7 @@ std::shared_ptr<Buffer> Buffer::create(
         bottom_up,
         sub_device_id,
         false /* owns data */,
+        allocator_id,
         Private());
 
     buffer->address_ = address;
@@ -367,7 +381,8 @@ std::shared_ptr<Buffer> Buffer::view(const BufferRegion& region) {
         buffer_type_,
         BufferShardingArgs(buffer_distribution_spec_, shard_spec_, buffer_layout_),
         bottom_up_,
-        sub_device_id_);
+        sub_device_id_,
+        allocator_id_);
 
     std::shared_ptr<const BufferPageMapping> new_page_mapping;
     if (is_sharded(buffer_layout_)) {

@@ -343,13 +343,16 @@ void tensor_mem_config_module(py::module& m_tensor) {
     auto pyMemoryConfig = static_cast<py::class_<MemoryConfig>>(m_tensor.attr("MemoryConfig"));
     pyMemoryConfig
         .def(
-            py::init<>(
-                [](TensorMemoryLayout memory_layout, BufferType buffer_type, std::optional<ShardSpec> shard_spec) {
-                    return MemoryConfig{memory_layout, buffer_type, std::move(shard_spec)};
-                }),
+            py::init<>([](TensorMemoryLayout memory_layout,
+                          BufferType buffer_type,
+                          std::optional<ShardSpec> shard_spec,
+                          uint32_t allocator_id) {
+                return MemoryConfig{memory_layout, buffer_type, std::move(shard_spec), allocator_id};
+            }),
             py::arg("memory_layout") = TensorMemoryLayout::INTERLEAVED,
             py::arg("buffer_type") = BufferType::DRAM,
             py::arg("shard_spec") = std::nullopt,
+            py::arg("allocator_id") = 0,
             R"doc(
                 Create MemoryConfig class.
                 If interleaved is set to True, tensor data will be interleaved across multiple DRAM banks on TT Accelerator device.
@@ -399,6 +402,7 @@ void tensor_mem_config_module(py::module& m_tensor) {
         .def_property_readonly("memory_layout", &MemoryConfig::memory_layout, "Memory layout of tensor data.")
         .def_property_readonly("shard_spec", &MemoryConfig::shard_spec, "Memory layout of tensor data.")
         .def_property_readonly("nd_shard_spec", &MemoryConfig::nd_shard_spec, "ND shard spec of tensor data.")
+        .def_property_readonly("allocator_id", &MemoryConfig::allocator_id, "Allocator ID of tensor data.")
         .def(py::self == py::self)
         .def(py::self != py::self);
 

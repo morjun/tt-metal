@@ -165,3 +165,4 @@ l1_kv512_artifacts_v2/
 l1_1_layer/
 research_codes/documents/l1_kv_cache_cache/results
 .claude/scheduled_tasks.lock
+tt_metal/pre-compiled/*

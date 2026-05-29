@@ -378,8 +378,7 @@ This is the **WO (attention output projection)** matmul: K=N=4096 (tile_size=32 
 activations and are distributed across all 13 chip columns, because SDPA decode scatters
 its per-head outputs across the full P150 width.
 
-**Note**: `use_l1_weight_sharding` (`models/tt_transformers/tt/mlp.py`) is an experimental
-feature that is **not currently active** and does not account for this program.
+**Note**: The experimental `use_l1_weight_sharding` feature has been entirely removed from the codebase.
 
 ---
 
@@ -512,7 +511,7 @@ e.g. 10×12+8 within the 13×10 grid.
 - `l1_cb_artifacts_noCacheFull_260414/cumulative_core_map.json` — max CB usage across all programs per core
 - `models/tt_transformers/tt/model_config.py` — `find_grid`, `find_grid_k_n`, `find_prefill_grid`, core grid configs, `lm_head_core_grid`
 - `models/tt_transformers/tt/attention.py` — L1 KV cache tensor layout (`ttnn.L1_MEMORY_CONFIG`, interleaved)
-- `models/tt_transformers/tt/mlp.py` — `use_l1_weight_sharding` experimental feature (inactive; not the source of the 13×9 program)
+- `models/tt_transformers/tt/mlp.py` — Experimental `use_l1_weight_sharding` feature (entirely removed from the codebase)
 - `ttnn/cpp/ttnn/operations/experimental/paged_cache/device/paged_update_cache_program_factory.cpp` — y=0 hotspot (`paged_update_cache`)
 - `ttnn/.../matmul_op_multi_core_reuse_mcast_dram_sharded_program_factory.cpp` — DRAM reader assignment, wide-bbox log (lines 295–306)
 

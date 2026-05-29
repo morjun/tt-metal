@@ -40,6 +40,15 @@ public:
 
     DeviceAddr max_size_bytes() const { return max_size_bytes_; }
 
+    // Expose alignment + min-allocation size so callers (e.g. BankManager's
+    // multi-allocator address-selection path) compute aligned sizes that
+    // match what allocate_at_address will internally round up to. Without
+    // this, a caller using a smaller alignment can pick an address near the
+    // top of a free block that allocate_at_address then rejects because the
+    // internally-rounded size overruns the block.
+    DeviceAddr alignment() const { return alignment_; }
+    DeviceAddr min_allocation_size() const { return min_allocation_size_; }
+
     std::optional<DeviceAddr> lowest_occupied_address() const {
         if (not this->lowest_occupied_address_.has_value()) {
             return this->lowest_occupied_address_;

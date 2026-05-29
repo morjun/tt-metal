@@ -741,7 +741,7 @@ class Attention(LightweightModule):
         # Reducing this lets KV grow but pushes those intermediates lower, where
         # they collide with whichever CB top is next-highest. Diagnostic
         # `[L1 per-core query]` log lines identify the offending buffer.
-        runtime_pad_bytes: int = 576 * 1024,
+        runtime_pad_bytes: int = 32768,
     ) -> list:
         """
         Build one HEIGHT_SHARDED MemoryConfig per headroom tier.
@@ -989,8 +989,15 @@ class Attention(LightweightModule):
         # the existing contract that earlier tiers cover lower token indices).
         accepted.sort(key=lambda t: t[0])
 
+        # Each tier gets its OWN L1 allocator (allocator_id = tier_index + 1) so it
+        # stacks within its own cores' physical gap, independent of the other tiers.
+        # A single shared KV allocator stacked all tiers' cumulative depth onto one
+        # address line, dropping disjoint-core tier buffers below their cores' CB floor.
+        # MUST equal kNumL1KvTierAllocators provisioned in
+        # tt_metal/impl/allocator/l1_banking_allocator.cpp (allocator ids 1..K exist).
+        MAX_KV_TIER_ALLOCATORS = 8
         result = []
-        for tile_rows, cores_sorted, tok_count, _ in accepted:
+        for tier_index, (tile_rows, cores_sorted, tok_count, _) in enumerate(accepted):
             # shard_shape: each core holds tile_rows tile-rows × head_dim columns
             shard_shape = [
                 tile_rows * self.tile_size,  # shard height in elements
@@ -1002,10 +1009,22 @@ class Attention(LightweightModule):
                 shard_shape,
                 ttnn.ShardOrientation.ROW_MAJOR,
             )
+            alloc_id = tier_index + 1
+            if alloc_id > MAX_KV_TIER_ALLOCATORS:
+                # Clamp to a provisioned id — get_allocator_from_id FATALs on id >=
+                # num_allocators. Sharing an address line reintroduces clash risk for
+                # this overflow tier; bump kNumL1KvTierAllocators if this ever fires.
+                logger.warning(
+                    f"[L1 KV adaptive] tier_index={tier_index} exceeds "
+                    f"MAX_KV_TIER_ALLOCATORS={MAX_KV_TIER_ALLOCATORS}; reusing "
+                    f"allocator_id={MAX_KV_TIER_ALLOCATORS} (shares an address line — clash risk)."
+                )
+                alloc_id = MAX_KV_TIER_ALLOCATORS
             memcfg = ttnn.MemoryConfig(
                 ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
                 ttnn.BufferType.L1,
                 shard_spec,
+                allocator_id=alloc_id,
             )
             result.append((memcfg, tile_rows, cores_sorted, tok_count))
 

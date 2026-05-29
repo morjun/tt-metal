@@ -93,7 +93,7 @@ def main():
             dtype=ttnn.bfloat8_b,
             state_dict=None,
             num_layers=args.num_layers,
-            use_l1_weight_sharding=False,
+            use_adaptive_l1_kv_cache=True,
             l1_kv_window_size=args.l1_kv_window_size,
         )
 

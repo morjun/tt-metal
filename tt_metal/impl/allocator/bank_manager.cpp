@@ -228,20 +228,24 @@ void BankManager::invalidate_allocated_ranges_cache_for_dependent_allocators(
     }
 }
 
-const std::vector<std::pair<DeviceAddr, DeviceAddr>>& BankManager::compute_merged_allocated_ranges(
-    BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::compute_merged_allocated_ranges(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id, const CoreRangeSet& buffer_cores) {
     TT_FATAL(
         allocator_id.get() < allocator_dependencies_.num_allocators(),
         "Invalid allocator ID {} (num_allocators={})",
         allocator_id.get(),
         allocator_dependencies_.num_allocators());
 
-    // Return cached value if available
-    if (allocated_ranges_cache_[allocator_id.get()].has_value()) {
+    // Core-aware filtering is only meaningful for L1 (where buffers occupy a
+    // specific subset of physical cores). For DRAM/TRACE/L1_SMALL and for L1
+    // interleaved requests (empty ``buffer_cores`` sentinel = touches every
+    // bank), fall back to the cached "include every dependent allocation" path.
+    const bool core_aware = (buffer_type_ == BufferType::L1) && (!buffer_cores.ranges().empty());
+
+    if (!core_aware && allocated_ranges_cache_[allocator_id.get()].has_value()) {
         return allocated_ranges_cache_[allocator_id.get()].value();
     }
 
-    // Collect allocated address ranges per dependent allocator (single pass)
     const auto& dependent_allocators = allocator_dependencies_.dependencies[allocator_id.get()];
     std::vector<std::pair<DeviceAddr, DeviceAddr>> all_allocated_ranges;
     for (const auto dep_allocator_id : dependent_allocators) {
@@ -249,19 +253,37 @@ const std::vector<std::pair<DeviceAddr, DeviceAddr>>& BankManager::compute_merge
         TT_FATAL(dep_alloc, "Allocator not initialized!");
         const auto allocated_addresses = dep_alloc->allocated_addresses();
         all_allocated_ranges.reserve(all_allocated_ranges.size() + allocated_addresses.size());
+
+        if (!core_aware) {
+            // Non-L1 or interleaved L1 request: include every range.
+            for (const auto& [addr, end_addr] : allocated_addresses) {
+                if (end_addr > addr) {
+                    all_allocated_ranges.emplace_back(addr, end_addr);
+                }
+            }
+            continue;
+        }
+
+        // L1 sharded request: only include dependent allocations whose recorded
+        // cores intersect ``buffer_cores``. Allocations recorded with the empty
+        // sentinel (interleaved/all-cores) always conflict.
+        const auto& dep_cores_map = l1_buffer_cores_[dep_allocator_id.get()];
         for (const auto& [addr, end_addr] : allocated_addresses) {
-            if (end_addr > addr) {
+            if (end_addr <= addr) {
+                continue;
+            }
+            auto it = dep_cores_map.find(addr);
+            const bool is_interleaved_sentinel = (it == dep_cores_map.end()) || it->second.ranges().empty();
+            if (is_interleaved_sentinel || it->second.intersects(buffer_cores)) {
                 all_allocated_ranges.emplace_back(addr, end_addr);
             }
         }
     }
 
-    // Sort allocated ranges across all dependent allocators by start address
     std::sort(all_allocated_ranges.begin(), all_allocated_ranges.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
     });
 
-    // Coalesce overlaps across all dependent allocators
     std::vector<std::pair<DeviceAddr, DeviceAddr>> coalesced_ranges;
     coalesced_ranges.reserve(all_allocated_ranges.size());
     for (const auto& r : all_allocated_ranges) {
@@ -272,12 +294,17 @@ const std::vector<std::pair<DeviceAddr, DeviceAddr>>& BankManager::compute_merge
         }
     }
 
-    allocated_ranges_cache_[allocator_id.get()] = std::move(coalesced_ranges);
-    return allocated_ranges_cache_[allocator_id.get()].value();
+    if (!core_aware) {
+        allocated_ranges_cache_[allocator_id.get()] = coalesced_ranges;
+    }
+    return coalesced_ranges;
 }
 
 std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::compute_available_addresses(
-    BankManager::AllocatorDependencies::AllocatorID allocator_id, DeviceAddr size_per_bank, DeviceAddr address_limit) {
+    BankManager::AllocatorDependencies::AllocatorID allocator_id,
+    DeviceAddr size_per_bank,
+    DeviceAddr address_limit,
+    const CoreRangeSet& buffer_cores) {
     auto* alloc = this->get_allocator_from_id(allocator_id);
     TT_FATAL(alloc, "Allocator not initialized!");
 
@@ -306,8 +333,11 @@ std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::compute_available_ad
         return a.first < b.first;
     });
 
-    // Allocated ranges from dependent allocators; ranges are merged
-    const auto& allocated_ranges_in_dependent_allocators = this->compute_merged_allocated_ranges(allocator_id);
+    // Allocated ranges from dependent allocators that physically conflict with
+    // ``buffer_cores`` (for L1 sharded requests, only allocations on overlapping
+    // cores are considered; otherwise every dependent allocation is included).
+    const auto allocated_ranges_in_dependent_allocators =
+        this->compute_merged_allocated_ranges(allocator_id, buffer_cores);
 
     // Helper for subtracting allocated ranges from available ranges
     // Ranges consist of half-open intervals throughout: [start, end)
@@ -439,18 +469,31 @@ uint64_t BankManager::allocate_buffer(
         return address.value();
     }
 
-    // Get available address ranges after subtracting dependencies
-    // The pair represents (start, end) of the available address range(s)
+    // Get available address ranges after subtracting dependencies. Pass
+    // ``buffer_cores`` so the subtraction is core-aware for L1 sharded buffers
+    // — disjoint-core allocations in dependent allocators don't artificially
+    // reserve address space on cores they don't actually occupy.
     std::vector<std::pair<DeviceAddr, DeviceAddr>> available_ranges =
-        this->compute_available_addresses(allocator_id, size_per_bank, address_limit);
+        this->compute_available_addresses(allocator_id, size_per_bank, address_limit, buffer_cores);
 
-    // Choose an address from the allowed ranges respecting alignment and direction
-    // Addresses should already be aligned to alignment_bytes_
+    // Choose an address from the allowed ranges respecting alignment and direction.
+    // The size and alignment must match what the underlying allocator will use
+    // when it sees this address via allocate_at_address — otherwise a chosen
+    // address near a block boundary can be rejected after the allocator rounds
+    // the request size up to its own (typically larger) alignment.
+    // For L1 on Blackhole this matters: BankManager.alignment_bytes_ is the L1
+    // alignment (16 B) but FreeListOpt is initialized with DRAM alignment (64 B)
+    // and min_allocation_size_ = DRAM alignment, so a 4 B semaphore must be
+    // sized/placed at 64 B granularity rather than 16 B.
+    DeviceAddr alloc_alignment = alloc->alignment();
+    DeviceAddr alloc_min_size = alloc->min_allocation_size();
+    DeviceAddr effective_size = std::max<DeviceAddr>(size_per_bank, alloc_min_size);
+    DeviceAddr aligned_size = ((effective_size + alloc_alignment - 1) / alloc_alignment) * alloc_alignment;
     std::optional<DeviceAddr> chosen;
     if (bottom_up) {
         for (const auto& r : available_ranges) {
             DeviceAddr s = r.first;
-            if (s + size_per_bank <= r.second) {
+            if (s + aligned_size <= r.second) {
                 chosen = s;
                 break;
             }
@@ -458,7 +501,7 @@ uint64_t BankManager::allocate_buffer(
     } else {
         for (ssize_t i = static_cast<ssize_t>(available_ranges.size()) - 1; i >= 0; --i) {
             const auto& r = available_ranges[static_cast<size_t>(i)];
-            DeviceAddr s = r.second - size_per_bank;
+            DeviceAddr s = r.second - aligned_size;
             if (s >= r.first) {
                 chosen = s;
                 break;
@@ -475,10 +518,10 @@ uint64_t BankManager::allocate_buffer(
         num_banks,
         size_per_bank);
     TT_FATAL(
-        chosen.value() % alignment_bytes_ == 0,
+        chosen.value() % alloc_alignment == 0,
         "Chosen address {} is not aligned to {} B",
         chosen.value(),
-        alignment_bytes_);
+        alloc_alignment);
 
     auto address = alloc->allocate_at_address(chosen.value(), size_per_bank);
     TT_FATAL(address.has_value(), "Allocator failed to place at chosen address {}", chosen.value());
@@ -634,7 +677,9 @@ MemoryBlockTable BankManager::get_memory_block_table(
 
 void BankManager::shrink_size(
     DeviceAddr shrink_size, bool bottom_up, BankManager::AllocatorDependencies::AllocatorID allocator_id) {
-    TT_FATAL(allocator_dependencies_.num_allocators() == 1, "Expected single allocator!");
+    // Operates on the chosen allocator's address window (default AllocatorID{0}); the old
+    // num_allocators()==1 guard predates multi-allocator L1 and would crash on any L1
+    // shrink once KV-tier allocators exist.
     auto* alloc = this->get_allocator_from_id(allocator_id);
     if (alloc) {
         alloc->shrink_size(shrink_size, bottom_up);
@@ -642,7 +687,7 @@ void BankManager::shrink_size(
 }
 
 void BankManager::reset_size(BankManager::AllocatorDependencies::AllocatorID allocator_id) {
-    TT_FATAL(allocator_dependencies_.num_allocators() == 1, "Expected single allocator!");
+    // See shrink_size: operate on the chosen allocator; the single-allocator guard is stale.
     auto* alloc = this->get_allocator_from_id(allocator_id);
     if (alloc) {
         alloc->reset_size();

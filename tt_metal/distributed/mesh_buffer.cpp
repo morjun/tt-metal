@@ -100,7 +100,8 @@ std::shared_ptr<MeshBuffer> MeshBuffer::create(
             device_local_config.buffer_type,
             device_local_config.sharding_args,
             device_local_config.bottom_up,
-            device_local_config.sub_device_id);
+            device_local_config.sub_device_id,
+            device_local_config.allocator_id);
 
         mesh_buffer = std::shared_ptr<MeshBuffer>(new MeshBuffer(
             mesh_buffer_config, device_local_config, device_local_size, mesh_device, std::move(backing_buffer)));
@@ -124,7 +125,8 @@ void MeshBuffer::initialize_device_buffers() {
             device_local_config_.buffer_type,
             device_local_config_.sharding_args,
             device_local_config_.bottom_up,
-            /*sub_device_id=*/std::nullopt);  // TODO: sub_device_id is unsupported
+            /*sub_device_id=*/std::nullopt,
+            device_local_config_.allocator_id);  // TODO: sub_device_id is unsupported
         return buffer;
     };
 

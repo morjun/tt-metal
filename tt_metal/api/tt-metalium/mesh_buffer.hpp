@@ -34,6 +34,9 @@ struct DeviceLocalBufferConfig {
 
     // Optional: Specify the worker sub device this buffer will be allocated on
     std::optional<SubDeviceId> sub_device_id = std::nullopt;
+
+    // Optional: Specify the allocator ID (e.g. 1 for L1 KV Cache sub-allocator)
+    uint32_t allocator_id = 0;
 };
 
 // Specifies MeshBuffer that is replicated across the virtual mesh.

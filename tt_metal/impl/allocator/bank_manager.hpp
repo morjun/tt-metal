@@ -88,6 +88,13 @@ public:
     BankManager& operator=(BankManager&& that) noexcept;
     uint32_t num_banks() const;
 
+    // Enumerate all allocator IDs managed by this BankManager (0..num_allocators-1).
+    // Used by callers (e.g. Allocator's lowest-occupied queries) that must aggregate
+    // across every allocator rather than a hardcoded subset.
+    ttsl::SmallVector<AllocatorDependencies::AllocatorID> allocator_ids() const {
+        return allocator_dependencies_.allocator_ids();
+    }
+
     DeviceAddr bank_size() const;
 
     int64_t bank_offset(uint32_t bank_id) const;
@@ -218,14 +225,24 @@ private:
     // Invalidate caches stored on allocators that depend on the given allocator
     void invalidate_allocated_ranges_cache_for_dependent_allocators(AllocatorDependencies::AllocatorID allocator_id);
 
-    // Compute and cache the merged allocated ranges of all dependent allocators for the given allocator
-    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& compute_merged_allocated_ranges(
-        AllocatorDependencies::AllocatorID allocator_id);
+    // Compute the merged allocated ranges of all dependent allocators that physically
+    // conflict with a buffer occupying ``buffer_cores``.
+    // - For L1 with a non-empty ``buffer_cores`` (sharded request), only dependent
+    //   L1 allocations whose cores intersect ``buffer_cores`` (or are recorded with
+    //   the empty-set "interleaved/all-cores" sentinel) are included. This computes
+    //   fresh each call because the result varies with ``buffer_cores``.
+    // - For non-L1, or for L1 with empty ``buffer_cores`` (interleaved request),
+    //   all dependent allocations are included and the per-allocator cache is used.
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> compute_merged_allocated_ranges(
+        AllocatorDependencies::AllocatorID allocator_id, const CoreRangeSet& buffer_cores);
 
     // Compute available address ranges for the given allocator and request, after subtracting merged neighbor
-    // allocations
+    // allocations that physically conflict with ``buffer_cores``.
     std::vector<std::pair<DeviceAddr, DeviceAddr>> compute_available_addresses(
-        AllocatorDependencies::AllocatorID allocator_id, DeviceAddr size_per_bank, DeviceAddr address_limit);
+        AllocatorDependencies::AllocatorID allocator_id,
+        DeviceAddr size_per_bank,
+        DeviceAddr address_limit,
+        const CoreRangeSet& buffer_cores);
 };
 
 }  // namespace tt_metal

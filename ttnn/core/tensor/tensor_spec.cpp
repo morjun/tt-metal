@@ -198,7 +198,9 @@ TensorSpec TensorSpec::sharded(NdShardSpec nd_shard_spec, ShardShapeAlignment sh
         }
     }
     TensorLayout new_layout(
-        data_type(), page_config(), MemoryConfig(memory_config().buffer_type(), std::move(nd_shard_spec)));
+        data_type(),
+        page_config(),
+        MemoryConfig(memory_config().buffer_type(), std::move(nd_shard_spec), memory_config().allocator_id()));
     return TensorSpec(logical_shape(), std::move(new_layout));
 }
 
@@ -248,7 +250,8 @@ MemoryConfig TensorSpec::populate_nd_shard_spec_from_legacy() const {
         mem_config.buffer_type(),
         mem_config.shard_spec(),
         std::move(nd_shard_spec),
-        mem_config.created_with_nd_shard_spec());
+        mem_config.created_with_nd_shard_spec(),
+        mem_config.allocator_id());
 }
 
 std::optional<MemoryConfig> TensorSpec::populate_legacy_shard_spec_from_nd() const {
@@ -319,7 +322,8 @@ std::optional<MemoryConfig> TensorSpec::populate_legacy_shard_spec_from_nd() con
             mem_config.buffer_type(),
             std::move(shard_spec),
             mem_config.nd_shard_spec(),
-            mem_config.created_with_nd_shard_spec());
+            mem_config.created_with_nd_shard_spec(),
+            mem_config.allocator_id());
     }
 
     // Block sharding requires a contiguous grid of cores
@@ -345,7 +349,8 @@ std::optional<MemoryConfig> TensorSpec::populate_legacy_shard_spec_from_nd() con
         mem_config.buffer_type(),
         std::move(shard_spec),
         mem_config.nd_shard_spec(),
-        mem_config.created_with_nd_shard_spec());
+        mem_config.created_with_nd_shard_spec(),
+        mem_config.allocator_id());
 }
 
 }  // namespace tt::tt_metal

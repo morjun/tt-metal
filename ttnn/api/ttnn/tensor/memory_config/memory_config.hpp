@@ -27,8 +27,10 @@ public:
     explicit MemoryConfig(
         TensorMemoryLayout memory_layout,
         BufferType buffer_type = BufferType::DRAM,
-        std::optional<ShardSpec> shard_spec = std::nullopt);
-    explicit MemoryConfig(BufferType buffer_type, std::optional<NdShardSpec> nd_shard_spec = std::nullopt);
+        std::optional<ShardSpec> shard_spec = std::nullopt,
+        uint32_t allocator_id = 0);
+    explicit MemoryConfig(
+        BufferType buffer_type, std::optional<NdShardSpec> nd_shard_spec = std::nullopt, uint32_t allocator_id = 0);
     MemoryConfig(const MemoryConfig& other) = default;
     MemoryConfig& operator=(const MemoryConfig& other) = default;
     MemoryConfig(MemoryConfig&& other) noexcept = default;
@@ -39,9 +41,16 @@ public:
     const std::optional<ShardSpec>& shard_spec() const { return shard_spec_; }
     const std::optional<NdShardSpec>& nd_shard_spec() const { return nd_shard_spec_; }
     bool created_with_nd_shard_spec() const { return created_with_nd_shard_spec_; }
+    uint32_t allocator_id() const { return allocator_id_; }
 
     MemoryConfig with_shard_spec(std::optional<ShardSpec> shard_spec) const {
-        return MemoryConfig(memory_layout_, buffer_type_, std::move(shard_spec));
+        return MemoryConfig(
+            memory_layout_,
+            buffer_type_,
+            std::move(shard_spec),
+            nd_shard_spec_,
+            created_with_nd_shard_spec_,
+            allocator_id_);
     }
 
     bool is_sharded() const;
@@ -49,10 +58,10 @@ public:
     bool is_dram() const;
 
     static constexpr auto attribute_names = std::forward_as_tuple(
-        "memory_layout", "buffer_type", "shard_spec", "nd_shard_spec", "created_with_nd_shard_spec");
+        "memory_layout", "buffer_type", "shard_spec", "nd_shard_spec", "created_with_nd_shard_spec", "allocator_id");
     auto attribute_values() const {
         return std::forward_as_tuple(
-            memory_layout_, buffer_type_, shard_spec_, nd_shard_spec_, created_with_nd_shard_spec_);
+            memory_layout_, buffer_type_, shard_spec_, nd_shard_spec_, created_with_nd_shard_spec_, allocator_id_);
     }
 
     static MemoryConfig create_with_prepopulated_shard_specs(
@@ -60,7 +69,8 @@ public:
         BufferType buffer_type,
         std::optional<ShardSpec> shard_spec,
         std::optional<NdShardSpec> nd_shard_spec,
-        bool created_with_nd_shard_spec);
+        bool created_with_nd_shard_spec,
+        uint32_t allocator_id = 0);
 
     friend std::ostream& operator<<(std::ostream& os, const MemoryConfig& config);
 
@@ -70,13 +80,15 @@ private:
         BufferType buffer_type,
         std::optional<ShardSpec> shard_spec,
         std::optional<NdShardSpec> nd_shard_spec,
-        bool created_with_nd_shard_spec);
+        bool created_with_nd_shard_spec,
+        uint32_t allocator_id);
 
     TensorMemoryLayout memory_layout_ = TensorMemoryLayout::INTERLEAVED;  // Interleave the data across multiple banks
     BufferType buffer_type_ = BufferType::DRAM;                           // Can be either DRAM or L1
     std::optional<ShardSpec> shard_spec_ = std::nullopt;
     std::optional<NdShardSpec> nd_shard_spec_ = std::nullopt;
     bool created_with_nd_shard_spec_ = false;
+    uint32_t allocator_id_ = 0;
 };
 
 std::ostream& operator<<(std::ostream& os, const MemoryConfig& config);

@@ -190,6 +190,45 @@ void Allocator::init_compute_and_storage_l1_bank_manager() {
     uint64_t allocatable_l1_size =
         static_cast<uint64_t>(config_->worker_l1_size) - config_->l1_unreserved_base - config_->l1_small_size;
     // Assuming top down allocation for L1 buffers so the allocatable memory space is the top l1_bank_size bytes of L1
+    //
+    // Multi-allocator setup for L1:
+    //   AllocatorID{0}        — default: model intermediates, interleaved buffers, etc.
+    //   AllocatorID{1..K}     — one dedicated allocator per adaptive KV-cache TIER
+    //                           (selected via MemoryConfig::allocator_id).
+    //
+    // Each allocator shares the same physical address space but tracks an independent
+    // free list. A single shared KV allocator stacked all tiers' cumulative depth onto
+    // one address line, so disjoint-core tiers pushed each other's buffers below their
+    // cores' CB-region floor (program.cpp CB-clash assert). Giving each tier its own
+    // allocator lets it stack within its own cores' physical gap, independent of the
+    // others. The dependency graph is a CLIQUE (every allocator depends on every other);
+    // the core-aware dependency subtraction in BankManager only subtracts ranges from
+    // allocators whose buffers physically overlap the requesting buffer's cores, so the
+    // tier<->tier edges are no-ops for disjoint tiers but keep the allocator correct if
+    // that disjointness invariant is ever violated. The model<->tier edges are
+    // load-bearing: they stop KV on disjoint cores from inflating AllocatorID{0}'s
+    // counter, which would push model intermediates (e.g. the 63-core L-shape QKV
+    // buffer) above program CB regions.
+    // See research_codes/documents/l1_kv_cache_cache/perf_walkthrough_l1_vs_dram.md §3.
+    //
+    // K (kNumL1KvTierAllocators) must be >= the maximum number of adaptive KV tiers the
+    // model can produce. The headroom map has up to 5 distinct gap classes; 8 leaves
+    // headroom for a lowered safety margin / other models. MUST stay in sync with
+    // MAX_KV_TIER_ALLOCATORS in models/tt_transformers/tt/attention.py.
+    using AllocID = BankManager::AllocatorDependencies::AllocatorID;
+    constexpr uint32_t kNumL1KvTierAllocators = 8;
+    constexpr uint32_t kNumL1Allocators = 1 + kNumL1KvTierAllocators;  // id 0 = model, 1..K = KV tiers
+    std::unordered_map<AllocID, ttsl::SmallVector<AllocID>> l1_deps_map;
+    for (uint32_t i = 0; i < kNumL1Allocators; ++i) {
+        ttsl::SmallVector<AllocID> neighbors;
+        for (uint32_t j = 0; j < kNumL1Allocators; ++j) {
+            if (j != i) {
+                neighbors.push_back(AllocID{j});
+            }
+        }
+        l1_deps_map.emplace(AllocID{i}, std::move(neighbors));
+    }
+    BankManager::AllocatorDependencies l1_deps(l1_deps_map);
     l1_manager_ = std::make_unique<BankManager>(
         BufferType::L1,
         bank_id_to_bank_offset,
@@ -197,7 +236,8 @@ void Allocator::init_compute_and_storage_l1_bank_manager() {
         interleaved_address_limit,
         config_->l1_alignment,
         config_->l1_unreserved_base,
-        config_->disable_interleaved);
+        config_->disable_interleaved,
+        l1_deps);
     log_debug(
         tt::LogMetal,
         "Configured partition params: mem_mailbox_base:0x{:X}, storage_core_bank_size:0x{:X}, worker_l1_size:0x{:X}, "

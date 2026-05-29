@@ -130,14 +130,19 @@ DeviceAddr Allocator::allocate_buffer(Buffer* buffer) {
         // else: interleaved — leave buffer_cores empty (treated as all-cores).
     }
     using AllocID = BankManager::AllocatorDependencies::AllocatorID;
-    constexpr AllocID kDefaultAllocId{0};
     switch (buffer_type) {
         case BufferType::DRAM:
             address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
             break;
         case BufferType::L1:
             address = l1_manager_->allocate_buffer(
-                size, page_size, bottom_up, config_->compute_grid, num_cores, kDefaultAllocId, buffer_cores);
+                size,
+                page_size,
+                bottom_up,
+                config_->compute_grid,
+                num_cores,
+                AllocID{buffer->allocator_id()},
+                buffer_cores);
             break;
         case BufferType::L1_SMALL: {
             TT_FATAL(num_cores.has_value(), "L1_SMALL only supports sharded allocations, see validate_num_banks");
@@ -162,7 +167,10 @@ void Allocator::deallocate_buffer(Buffer* buffer) {
     auto buffer_type = buffer->buffer_type();
     switch (buffer_type) {
         case BufferType::DRAM: dram_manager_->deallocate_buffer(address); break;
-        case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
+        case BufferType::L1:
+            l1_manager_->deallocate_buffer(
+                address, BankManager::AllocatorDependencies::AllocatorID{buffer->allocator_id()});
+            break;
         case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
         case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
         default: {
@@ -331,16 +339,30 @@ void Allocator::dump_memory_blocks(const BufferType& buffer_type, std::ostream& 
 
 std::optional<DeviceAddr> Allocator::get_lowest_occupied_l1_address(uint32_t bank_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    // l1_manager always sits below l1_small_manager in the address space, so there is no need to check l1_small_manager
-    return l1_manager_->lowest_occupied_address(bank_id);
+    // Aggregate across ALL L1 allocators (model + every KV-tier allocator). Querying a
+    // hardcoded subset would miss tiers >= 2 and under-report occupancy.
+    std::optional<DeviceAddr> result = std::nullopt;
+    for (const auto allocator_id : l1_manager_->allocator_ids()) {
+        auto addr = l1_manager_->lowest_occupied_address(bank_id, allocator_id);
+        if (addr.has_value()) {
+            result = result.has_value() ? std::min(*result, *addr) : addr;
+        }
+    }
+    return result;
 }
 
 std::optional<DeviceAddr> Allocator::lowest_occupied_l1_address_for_cores(const CoreRangeSet& target_cores) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    // L1 small region sits above the main L1 region address-wise, so the absolute
-    // lowest among the two is whatever the main L1 manager reports first; only
-    // fall back to L1 small if the main L1 has no candidates touching the target.
-    auto main_addr = l1_manager_->lowest_occupied_address_for_cores(target_cores);
+    // Aggregate across ALL L1 allocators (model + every KV-tier allocator). The CB-clash
+    // validate in program.cpp flows through this query; missing a tier here could let a
+    // tier buffer overlap a CB region without tripping the assert.
+    std::optional<DeviceAddr> main_addr = std::nullopt;
+    for (const auto allocator_id : l1_manager_->allocator_ids()) {
+        auto addr = l1_manager_->lowest_occupied_address_for_cores(target_cores, allocator_id);
+        if (addr.has_value()) {
+            main_addr = main_addr.has_value() ? std::min(*main_addr, *addr) : addr;
+        }
+    }
     if (main_addr.has_value()) {
         return main_addr;
     }
@@ -434,7 +456,9 @@ AllocatorState Allocator::extract_state() const {
         }
 
         if (manager) {
-            auto buffer_type_state = manager->extract_state(BankManager::AllocatorDependencies::AllocatorID{0});
+            auto buffer_type_state = (buffer_type == BufferType::L1)
+                                         ? manager->extract_merged_state()
+                                         : manager->extract_state(BankManager::AllocatorDependencies::AllocatorID{0});
             states_per_buffer_type[buffer_type] = std::move(buffer_type_state);
         }
     }
@@ -466,6 +490,14 @@ void Allocator::override_state(const AllocatorState& state) {
         }
 
         if (manager) {
+            // NOTE: single-allocator restore. For L1 with multiple allocators (model +
+            // KV tiers) this collapses the merged state onto AllocatorID{0}. That is
+            // conservative (over-reserves, never under-reserves, so it cannot cause a
+            // missed CB clash) and is not exercised by the single-device trace decode
+            // path — the only caller is unit-mesh aggregation
+            // (unit_mesh_utils.cpp::synchronize_parent_allocator_with_submeshes). Must be
+            // generalized to per-allocator restore before unit-mesh aggregation is used
+            // with N>1 L1 allocators.
             manager->override_state(type_state, BankManager::AllocatorDependencies::AllocatorID{0});
         }
     }

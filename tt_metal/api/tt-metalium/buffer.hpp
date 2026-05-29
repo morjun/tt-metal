@@ -190,7 +190,8 @@ public:
         BufferType buffer_type,
         const BufferShardingArgs& sharding_args = std::nullopt,
         std::optional<bool> bottom_up = std::nullopt,
-        std::optional<SubDeviceId> sub_device_id = std::nullopt);
+        std::optional<SubDeviceId> sub_device_id = std::nullopt,
+        uint32_t allocator_id = 0);
     static std::shared_ptr<Buffer> create(
         IDevice* device,
         DeviceAddr address,
@@ -199,7 +200,8 @@ public:
         BufferType buffer_type,
         const BufferShardingArgs& sharding_args = std::nullopt,
         std::optional<bool> bottom_up = std::nullopt,
-        std::optional<SubDeviceId> sub_device_id = std::nullopt);
+        std::optional<SubDeviceId> sub_device_id = std::nullopt,
+        uint32_t allocator_id = 0);
 
     // Creates a view of the region of the buffer.
     // The view is a new buffer (unless the region is the entire buffer) that shares the same underlying device memory.
@@ -262,6 +264,7 @@ public:
     BufferRegion root_buffer_region() const { return BufferRegion(root_buffer_offset_, size_); }
 
     std::optional<SubDeviceId> sub_device_id() const { return sub_device_id_; }
+    uint32_t allocator_id() const { return allocator_id_; }
 
     size_t unique_id() const { return unique_id_; }
 
@@ -277,6 +280,7 @@ public:
         std::optional<bool> bottom_up,
         std::optional<SubDeviceId> sub_device_id,
         bool owns_data,
+        uint32_t allocator_id,
         Private);
 
 private:
@@ -324,6 +328,7 @@ private:
     DeviceAddr root_buffer_offset_ = 0;
 
     size_t unique_id_ = 0;
+    uint32_t allocator_id_ = 0;
     static std::atomic<size_t> next_unique_id;
 };
 

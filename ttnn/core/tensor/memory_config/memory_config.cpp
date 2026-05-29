@@ -12,35 +12,50 @@
 namespace tt::tt_metal {
 
 MemoryConfig::MemoryConfig(
-    TensorMemoryLayout memory_layout, BufferType buffer_type, std::optional<ShardSpec> shard_spec) :
-    memory_layout_(memory_layout), buffer_type_(buffer_type), shard_spec_(std::move(shard_spec)) {}
+    TensorMemoryLayout memory_layout,
+    BufferType buffer_type,
+    std::optional<ShardSpec> shard_spec,
+    uint32_t allocator_id) :
+    memory_layout_(memory_layout),
+    buffer_type_(buffer_type),
+    shard_spec_(std::move(shard_spec)),
+    allocator_id_(allocator_id) {}
 
-MemoryConfig::MemoryConfig(BufferType buffer_type, std::optional<NdShardSpec> nd_shard_spec) :
+MemoryConfig::MemoryConfig(BufferType buffer_type, std::optional<NdShardSpec> nd_shard_spec, uint32_t allocator_id) :
     memory_layout_(nd_shard_spec.has_value() ? TensorMemoryLayout::BLOCK_SHARDED : TensorMemoryLayout::INTERLEAVED),
     buffer_type_(buffer_type),
     nd_shard_spec_(std::move(nd_shard_spec)),
-    created_with_nd_shard_spec_(nd_shard_spec_.has_value()) {}
+    created_with_nd_shard_spec_(nd_shard_spec_.has_value()),
+    allocator_id_(allocator_id) {}
 
 MemoryConfig::MemoryConfig(
     TensorMemoryLayout memory_layout,
     BufferType buffer_type,
     std::optional<ShardSpec> shard_spec,
     std::optional<NdShardSpec> nd_shard_spec,
-    bool created_with_nd_shard_spec) :
+    bool created_with_nd_shard_spec,
+    uint32_t allocator_id) :
     memory_layout_(memory_layout),
     buffer_type_(buffer_type),
     shard_spec_(std::move(shard_spec)),
     nd_shard_spec_(std::move(nd_shard_spec)),
-    created_with_nd_shard_spec_(created_with_nd_shard_spec) {}
+    created_with_nd_shard_spec_(created_with_nd_shard_spec),
+    allocator_id_(allocator_id) {}
 
 MemoryConfig MemoryConfig::create_with_prepopulated_shard_specs(
     TensorMemoryLayout memory_layout,
     BufferType buffer_type,
     std::optional<ShardSpec> shard_spec,
     std::optional<NdShardSpec> nd_shard_spec,
-    bool created_with_nd_shard_spec) {
+    bool created_with_nd_shard_spec,
+    uint32_t allocator_id) {
     return MemoryConfig(
-        memory_layout, buffer_type, std::move(shard_spec), std::move(nd_shard_spec), created_with_nd_shard_spec);
+        memory_layout,
+        buffer_type,
+        std::move(shard_spec),
+        std::move(nd_shard_spec),
+        created_with_nd_shard_spec,
+        allocator_id);
 }
 
 bool MemoryConfig::is_sharded() const {
@@ -76,6 +91,7 @@ nlohmann::json ttsl::json::to_json_t<tt::tt_metal::MemoryConfig>::operator()(
     json_object["memory_layout"] = config.memory_layout();
     json_object["buffer_type"] = config.buffer_type();
     json_object["created_with_nd_shard_spec"] = config.created_with_nd_shard_spec();
+    json_object["allocator_id"] = config.allocator_id();
     if (config.created_with_nd_shard_spec()) {
         if (config.nd_shard_spec().has_value()) {
             json_object["nd_shard_spec"] = ttsl::json::to_json(config.nd_shard_spec().value());
@@ -93,14 +109,18 @@ tt::tt_metal::MemoryConfig ttsl::json::from_json_t<tt::tt_metal::MemoryConfig>::
     auto memory_layout = json_object["memory_layout"].get<tt::tt_metal::TensorMemoryLayout>();
     auto buffer_type = json_object["buffer_type"].get<tt::tt_metal::BufferType>();
     auto created_with_nd_shard_spec = json_object["created_with_nd_shard_spec"].get<bool>();
+    uint32_t allocator_id = 0;
+    if (json_object.contains("allocator_id")) {
+        allocator_id = json_object["allocator_id"].get<uint32_t>();
+    }
     if (created_with_nd_shard_spec) {
         auto nd_shard_spec = ttsl::json::from_json<tt::tt_metal::NdShardSpec>(json_object["nd_shard_spec"]);
-        return tt::tt_metal::MemoryConfig(buffer_type, std::move(nd_shard_spec));
+        return tt::tt_metal::MemoryConfig(buffer_type, std::move(nd_shard_spec), allocator_id);
     } else {
         std::optional<tt::tt_metal::ShardSpec> shard_spec;
         if (json_object.contains("shard_spec")) {
             shard_spec = ttsl::json::from_json<tt::tt_metal::ShardSpec>(json_object["shard_spec"]);
         }
-        return tt::tt_metal::MemoryConfig(memory_layout, buffer_type, std::move(shard_spec));
+        return tt::tt_metal::MemoryConfig(memory_layout, buffer_type, std::move(shard_spec), allocator_id);
     }
 }
