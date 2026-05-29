@@ -345,6 +345,7 @@ def prepare_generator_args(
     use_adaptive_l1_kv_cache=False,
     l1_kv_only_mode=False,
     l1_kv_headroom_json=None,
+    l1_kv_interleaved_adaptive=False,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -383,6 +384,7 @@ def prepare_generator_args(
             use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
             l1_kv_only_mode=l1_kv_only_mode,
             l1_kv_headroom_json=l1_kv_headroom_json,
+            l1_kv_interleaved_adaptive=l1_kv_interleaved_adaptive,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -942,6 +944,7 @@ def test_demo_text(
     use_adaptive_l1_kv_cache = request.config.getoption("--use_adaptive_l1_kv_cache")
     l1_kv_only_mode = request.config.getoption("--l1_kv_only_mode")
     l1_kv_headroom_json = request.config.getoption("--l1_kv_headroom_json")
+    l1_kv_interleaved_adaptive = request.config.getoption("--l1_kv_interleaved_adaptive")
     l1_memory_view_path = request.config.getoption("--l1_memory_view_path")
 
     if stress_test and token_accuracy:
@@ -1045,6 +1048,7 @@ def test_demo_text(
         use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
         l1_kv_only_mode=l1_kv_only_mode,
         l1_kv_headroom_json=l1_kv_headroom_json,
+        l1_kv_interleaved_adaptive=l1_kv_interleaved_adaptive,
     )
 
     # Skip ci-eval tests on P100 devices

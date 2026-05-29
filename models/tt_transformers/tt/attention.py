@@ -94,6 +94,14 @@ class Attention(LightweightModule):
         self.l1_kv_use_sharded = getattr(configuration, "l1_kv_use_sharded", False)
         self.l1_kv_min_expected_hit_ratio = getattr(configuration, "l1_kv_min_expected_hit_ratio", 0.0)
         self.use_adaptive_l1_kv_cache = getattr(configuration, "use_adaptive_l1_kv_cache", False)
+        # Interleaved-adaptive layout (option 2): instead of N HEIGHT_SHARDED tiers on
+        # disjoint low-CB cores, store the adaptive KV in ONE INTERLEAVED L1 buffer that
+        # spans all banks (like the non-adaptive path) — uniform thin band that coexists
+        # with the model's interleaved buffers, reaching higher capacity than sharding and
+        # avoiding sharded source-core read serialization. Reuses the same adaptive
+        # machinery (sink/ring/l1_only, n-tier SDPA reader); the reader's TensorAccessor
+        # handles interleaved tiers transparently. Capacity = l1_kv_total_size (sink+window).
+        self.l1_kv_interleaved_adaptive = getattr(configuration, "l1_kv_interleaved_adaptive", False)
         # StreamingLLM-style attention sink default for the adaptive path: keep
         # the first tile (32 tokens) of prefill K/V permanently in L1. Outside the
         # ring's reach, so they stay valid for the entire decode session and let
@@ -780,6 +788,31 @@ class Attention(LightweightModule):
             tile_rows_per_core = floor((H - safety_margin) / bytes_per_tile_row)
         """
         from collections import defaultdict
+
+        # ── Interleaved-adaptive layout (option 2) ────────────────────────────
+        # Single INTERLEAVED L1 tier spanning all banks, sized to l1_kv_total_size
+        # (sink + window). No per-core sharding gate — the interleaved buffer is
+        # uniform across banks, so it coexists with the model's interleaved buffers
+        # in the thin top band (the same reason the non-adaptive interleaved path
+        # reaches ~400 tokens). allocator_id=0 (default) matches that proven path.
+        # The n-tier SDPA reader handles it as interleaved tier 0 via TensorAccessor.
+        if self.l1_kv_interleaved_adaptive:
+            cap_tokens = self.l1_kv_total_size
+            if cap_tokens <= 0:
+                logger.warning(
+                    "[L1 KV interleaved-adaptive] l1_kv_total_size (sink+window) is 0; "
+                    "set --l1_kv_window_size to enable. Disabling L1 KV cache."
+                )
+                return []
+            cap_tiles = math.ceil(cap_tokens / self.tile_size)
+            cap_tokens = cap_tiles * self.tile_size  # round up to a whole tile
+            memcfg = ttnn.L1_MEMORY_CONFIG  # interleaved across all banks, allocator_id=0
+            all_cores = [(x, y) for y in range(self.grid_size.y) for x in range(self.grid_size.x)]
+            logger.info(
+                f"[L1 KV interleaved-adaptive] Single interleaved tier: {cap_tokens} tokens "
+                f"({cap_tiles} tile-rows), spanning all banks."
+            )
+            return [(memcfg, cap_tiles, all_cores, cap_tokens)]
 
         # Per-tile bytes including dtype-specific storage overhead. For bfloat8_b
         # tt-metal stores 1024 mantissa bytes + 64 shared-exponent bytes per 32×32 tile,

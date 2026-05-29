@@ -691,6 +691,7 @@ def create_tt_model(
     use_adaptive_l1_kv_cache=False,
     l1_kv_only_mode=False,
     l1_kv_headroom_json=None,
+    l1_kv_interleaved_adaptive=False,
 ):
     from models.tt_transformers.tt.model import Transformer
     from models.tt_transformers.tt.model_config import ModelArgs
@@ -711,6 +712,7 @@ def create_tt_model(
         use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
         l1_kv_only_mode=l1_kv_only_mode,
         l1_kv_headroom_json=l1_kv_headroom_json,
+        l1_kv_interleaved_adaptive=l1_kv_interleaved_adaptive,
     )
     if num_layers is not None:
         tt_model_args.n_layers = num_layers

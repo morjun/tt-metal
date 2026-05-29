@@ -472,6 +472,7 @@ class ModelArgs:
         use_adaptive_l1_kv_cache=False,  # enable N-tier adaptive L1 KV cache
         l1_kv_only_mode=False,  # StreamingLLM-style L1-only attention; needs use_adaptive_l1_kv_cache
         l1_kv_headroom_json=None,  # path to offline headroom JSON; if None, use live scan
+        l1_kv_interleaved_adaptive=False,  # adaptive cache uses 1 interleaved tier (vs N sharded tiers)
     ):
         self.l1_kv_window_size = l1_kv_window_size
         self.l1_kv_sink_size = l1_kv_sink_size
@@ -482,6 +483,7 @@ class ModelArgs:
         self.use_adaptive_l1_kv_cache = use_adaptive_l1_kv_cache
         self.l1_kv_only_mode = l1_kv_only_mode
         self.l1_kv_headroom_json = l1_kv_headroom_json  # None → live scan; str → offline JSON path
+        self.l1_kv_interleaved_adaptive = l1_kv_interleaved_adaptive
         if subdevice:
             self.num_devices = 1
         else:

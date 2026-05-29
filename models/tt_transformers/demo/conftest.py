@@ -142,6 +142,17 @@ def pytest_addoption(parser):
         ),
     )
     parser.addoption(
+        "--l1_kv_interleaved_adaptive",
+        action="store_true",
+        default=False,
+        help=(
+            "Adaptive L1 KV cache stores ONE interleaved buffer (spanning all banks) instead of "
+            "N HEIGHT_SHARDED tiers. Higher capacity (coexists with the model's interleaved buffers) "
+            "and avoids sharded source-core read serialization. Capacity = l1_kv_window_size + l1_kv_sink_size. "
+            "Requires --use_adaptive_l1_kv_cache."
+        ),
+    )
+    parser.addoption(
         "--l1_kv_headroom_json",
         action="store",
         default=None,
