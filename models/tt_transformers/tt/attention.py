@@ -650,106 +650,104 @@ class Attention(LightweightModule):
         """
         if self.l1_kv_sink_size <= 0 or not self.l1_kv_tiers:
             return
-        k_tier0, v_tier0, token_start, tok_count = self.l1_kv_tiers[0]
-        if token_start != 0:
-            logger.warning(
-                f"[L1 KV adaptive] sink seed: Tier 0 token_start={token_start} (expected 0); "
-                f"sink would land in the wrong tier — skipping seed."
-            )
-            return
         sink = self.l1_kv_sink_size
+        dram_seq = dram_k_cache.shape[2]
+        tier_dtype = self.kv_cache_dtype
+        tier_layout = self.model_config["ATTN_W_LAYOUT_TILE"]
+
         # In l1_only mode the kernel attends ONLY to L1 (cur_pos clamped, decode_start_pos=0),
         # so EVERY position in [0, cur_pos] must be L1-resident. The decode ring only writes
         # positions >= prompt_len; prefill [sink, prompt_len) is otherwise never written to L1
-        # and would read as zeros → the model loses the prompt and degenerates. When the cache
-        # is a SINGLE tier large enough to hold the sequence (no ring wrap), seed the FULL
-        # prefill [0, tok_count) from DRAM instead of just the sink. This makes the
-        # decode_start_pos=0 assumption valid: [0, prompt_len) seeded, [prompt_len, cur_pos]
-        # decode-written, all in L1. Multi-tier sharded still seeds sink-only (full-prefill
-        # seeding across disjoint tiers is not yet implemented; its l1_only quality is limited).
-        seed_len = sink
-        if self.l1_kv_only_mode and len(self.l1_kv_tiers) == 1:
-            seed_len = min(tok_count, dram_k_cache.shape[2])
-        try:
-            # Slice DRAM K/V[..., 0:seed_len, ...] on device, then move to host once.
-            k_starts = [0] * len(dram_k_cache.shape)
-            v_starts = [0] * len(dram_v_cache.shape)
-            k_ends = list(dram_k_cache.shape)
-            v_ends = list(dram_v_cache.shape)
-            k_ends[2] = seed_len
-            v_ends[2] = seed_len
-            k_slice = ttnn.slice(dram_k_cache, k_starts, k_ends)
-            v_slice = ttnn.slice(dram_v_cache, v_starts, v_ends)
-            k_sink_torch = ttnn.to_torch(k_slice)  # shape [B*mesh?, K, sink, D]
-            v_sink_torch = ttnn.to_torch(v_slice)
-            ttnn.deallocate(k_slice)
-            ttnn.deallocate(v_slice)
+        # and would read as zeros → the model loses the prompt. So seed the FULL prefill from
+        # DRAM. The flat ring layout maps global position p → flat slot p (no wrap when
+        # capacity >= seq), and flat slots are partitioned contiguously across tiers
+        # (tier i covers [token_start_i, token_start_i + tok_count_i)). So tier i's local
+        # slots [0, tok_count_i) hold DRAM[token_start_i : token_start_i + tok_count_i] —
+        # seed each tier from its own DRAM range. Non-l1-only only needs the attention sink
+        # (tier 0 [0, sink)) pinned; the rest is read from DRAM.
+        full = self.l1_kv_only_mode
 
-            # Capture the original memory_config and dtype before deallocation.
-            tier_memcfg_k = k_tier0.memory_config()
-            tier_memcfg_v = v_tier0.memory_config()
-            tier_dtype = self.kv_cache_dtype
-            tier_layout = self.model_config["ATTN_W_LAYOUT_TILE"]
-
-            # Drop the existing zero-initialised tier tensors so we can recreate
-            # them at the same allocator address (top-down allocator places this
-            # tier deterministically once others have settled — but for safety
-            # we DON'T rely on identical addresses; the L1 layout is recomputed
-            # whenever a buffer is allocated).
-            ttnn.deallocate(k_tier0)
-            ttnn.deallocate(v_tier0)
-
-            # Build the seeded torch tensors. The ReplicateTensorToMesh mapper
-            # broadcasts a single batch tensor across all mesh devices, so we
-            # build a [B_per_device, K, tok_count, D]-shaped torch tensor and
-            # let the mapper handle replication.
-            shape = (
-                self.batch_size_per_device_group,
-                self.n_local_kv_heads,
-                tok_count,
-                self.head_dim,
-            )
-            zeros_k = torch.zeros(shape)
-            zeros_v = torch.zeros(shape)
-            # k_sink_torch shape may include a mesh dim (e.g. [B*mesh, K, sink, D]);
-            # since ReplicateTensorToMesh writes the same tensor on every device,
-            # all mesh slices are identical and we can just use the first.
-            if k_sink_torch.dim() == 4 and k_sink_torch.shape[0] == shape[0]:
-                zeros_k[:, :, :seed_len, :] = k_sink_torch
-                zeros_v[:, :, :seed_len, :] = v_sink_torch
-            elif k_sink_torch.dim() == 4:
-                # The mesh dim got concatenated into batch dim; take the first slice.
-                zeros_k[:, :, :seed_len, :] = k_sink_torch[: shape[0]]
-                zeros_v[:, :, :seed_len, :] = v_sink_torch[: shape[0]]
-            else:
-                logger.warning(
-                    f"[L1 KV adaptive] Unexpected DRAM cache shape {k_sink_torch.shape} for sink seed; skipping."
-                )
+        # Build the per-tier seed plan: (tier_index, dram_lo, seed_len).
+        plan = []
+        if full:
+            for i, (_k, _v, ts, tc) in enumerate(self.l1_kv_tiers):
+                n = min(tc, max(0, dram_seq - ts))  # clamp to DRAM bounds; ts/tc are tile-aligned
+                if n > 0:
+                    plan.append((i, ts, n))
+        else:
+            ts0 = self.l1_kv_tiers[0][2]
+            if ts0 != 0:
+                logger.warning(f"[L1 KV adaptive] sink seed: Tier 0 token_start={ts0} (expected 0); skipping seed.")
                 return
+            plan.append((0, 0, min(sink, self.l1_kv_tiers[0][3])))
 
-            new_k = ttnn.as_tensor(
-                zeros_k,
-                dtype=tier_dtype,
-                layout=tier_layout,
-                device=self.mesh_device,
-                memory_config=tier_memcfg_k,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-            )
-            new_v = ttnn.as_tensor(
-                zeros_v,
-                dtype=tier_dtype,
-                layout=tier_layout,
-                device=self.mesh_device,
-                memory_config=tier_memcfg_v,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-            )
-            self.l1_kv_tiers[0] = (new_k, new_v, token_start, tok_count)
+        seeded_total = 0
+        try:
+            for i, dram_lo, seed_len in plan:
+                _k_t, _v_t, ts, tc = self.l1_kv_tiers[i]
+                # Slice DRAM K/V[..., dram_lo:dram_lo+seed_len, ...] (tile-aligned), to host.
+                k_starts = [0] * len(dram_k_cache.shape)
+                v_starts = [0] * len(dram_v_cache.shape)
+                k_starts[2] = dram_lo
+                v_starts[2] = dram_lo
+                k_ends = list(dram_k_cache.shape)
+                v_ends = list(dram_v_cache.shape)
+                k_ends[2] = dram_lo + seed_len
+                v_ends[2] = dram_lo + seed_len
+                k_slice = ttnn.slice(dram_k_cache, k_starts, k_ends)
+                v_slice = ttnn.slice(dram_v_cache, v_starts, v_ends)
+                k_seed_torch = ttnn.to_torch(k_slice)  # [B*mesh?, K, seed_len, D]
+                v_seed_torch = ttnn.to_torch(v_slice)
+                ttnn.deallocate(k_slice)
+                ttnn.deallocate(v_slice)
+
+                # Capture memcfg before dropping the old (zero-init) tier tensors.
+                memcfg_k = _k_t.memory_config()
+                memcfg_v = _v_t.memory_config()
+                ttnn.deallocate(_k_t)
+                ttnn.deallocate(_v_t)
+
+                shape = (self.batch_size_per_device_group, self.n_local_kv_heads, tc, self.head_dim)
+                zeros_k = torch.zeros(shape)
+                zeros_v = torch.zeros(shape)
+                # ReplicateTensorToMesh broadcasts one batch tensor to every device, so all
+                # mesh slices are identical; take the first batch slice if a mesh dim folded in.
+                if k_seed_torch.dim() == 4 and k_seed_torch.shape[0] == shape[0]:
+                    zeros_k[:, :, :seed_len, :] = k_seed_torch
+                    zeros_v[:, :, :seed_len, :] = v_seed_torch
+                elif k_seed_torch.dim() == 4:
+                    zeros_k[:, :, :seed_len, :] = k_seed_torch[: shape[0]]
+                    zeros_v[:, :, :seed_len, :] = v_seed_torch[: shape[0]]
+                else:
+                    logger.warning(
+                        f"[L1 KV adaptive] Unexpected DRAM cache shape {k_seed_torch.shape} for seed; skipping tier {i}."
+                    )
+                    continue
+
+                new_k = ttnn.as_tensor(
+                    zeros_k,
+                    dtype=tier_dtype,
+                    layout=tier_layout,
+                    device=self.mesh_device,
+                    memory_config=memcfg_k,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+                new_v = ttnn.as_tensor(
+                    zeros_v,
+                    dtype=tier_dtype,
+                    layout=tier_layout,
+                    device=self.mesh_device,
+                    memory_config=memcfg_v,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+                self.l1_kv_tiers[i] = (new_k, new_v, ts, tc)
+                seeded_total += seed_len
             logger.info(
-                f"[L1 KV adaptive] Seeded {seed_len} slots from DRAM K/V into Tier 0 "
-                f"({'full-prefill (l1_only)' if seed_len > sink else 'sink'})."
+                f"[L1 KV adaptive] Seeded {seeded_total} tokens across {len(plan)} tier(s) "
+                f"({'full-prefill (l1_only)' if full else 'sink'})."
             )
         except RuntimeError as e:
-            logger.warning(f"[L1 KV adaptive] sink seed failed: {e}. Continuing without sinks.")
+            logger.warning(f"[L1 KV adaptive] seed failed: {e}. Continuing without sinks.")
             self.l1_kv_sink_size = 0
 
     def _build_adaptive_l1_memcfg_tiers(
