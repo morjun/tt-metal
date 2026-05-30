@@ -463,27 +463,27 @@ class ModelArgs:
         optimizations=None,
         cache_hf=False,  # Set to False to reduce memory usage by not caching HF model
         subdevice=None,
-        l1_kv_window_size=0,  # 0 = disabled; set to e.g. 256 for L1 KV cache window
+        l1_kv_mode="dram",  # dram | interleaved | sharded | hybrid (see attention.py)
+        l1_kv_window_size=0,  # interleaved/hybrid capacity (tokens); 0 = disabled
         l1_kv_sink_size=0,
-        l1_kv_use_sharded=False,
         l1_kv_min_expected_hit_ratio=0.0,
         l1_kv_safety_margin=64 * 1024,  # bytes reserved between CB top and KV bottom
         l1_kv_min_viable_tokens=64,  # skip cores that can't fit at least this many tokens
-        use_adaptive_l1_kv_cache=False,  # enable N-tier adaptive L1 KV cache
-        l1_kv_only_mode=False,  # StreamingLLM-style L1-only attention; needs use_adaptive_l1_kv_cache
+        l1_kv_only_mode=False,  # StreamingLLM-style L1-only attention (skips DRAM reads/writes)
         l1_kv_headroom_json=None,  # path to offline headroom JSON; if None, use live scan
-        l1_kv_interleaved_adaptive=False,  # adaptive cache uses 1 interleaved tier (vs N sharded tiers)
     ):
+        self.l1_kv_mode = l1_kv_mode
         self.l1_kv_window_size = l1_kv_window_size
         self.l1_kv_sink_size = l1_kv_sink_size
-        self.l1_kv_use_sharded = l1_kv_use_sharded
         self.l1_kv_min_expected_hit_ratio = l1_kv_min_expected_hit_ratio
         self.l1_kv_safety_margin = l1_kv_safety_margin
         self.l1_kv_min_viable_tokens = l1_kv_min_viable_tokens
-        self.use_adaptive_l1_kv_cache = use_adaptive_l1_kv_cache
         self.l1_kv_only_mode = l1_kv_only_mode
         self.l1_kv_headroom_json = l1_kv_headroom_json  # None → live scan; str → offline JSON path
-        self.l1_kv_interleaved_adaptive = l1_kv_interleaved_adaptive
+        # Internal routing flag: any non-DRAM mode allocates the L1 KV cache via the
+        # tier path (allocate_l1_kv_cache, post-compile). Kept for model.py/generator.py
+        # which gate the post-compile allocation + ring-write hoist on this.
+        self.use_adaptive_l1_kv_cache = l1_kv_mode in ("interleaved", "sharded", "hybrid")
         if subdevice:
             self.num_devices = 1
         else:

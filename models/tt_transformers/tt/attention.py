@@ -91,17 +91,20 @@ class Attention(LightweightModule):
         self.grid_size = configuration.max_grid_size
         self.l1_kv_window_size = getattr(configuration, "l1_kv_window_size", 0)
         self.l1_kv_sink_size = getattr(configuration, "l1_kv_sink_size", 0)
-        self.l1_kv_use_sharded = getattr(configuration, "l1_kv_use_sharded", False)
         self.l1_kv_min_expected_hit_ratio = getattr(configuration, "l1_kv_min_expected_hit_ratio", 0.0)
-        self.use_adaptive_l1_kv_cache = getattr(configuration, "use_adaptive_l1_kv_cache", False)
-        # Interleaved-adaptive layout (option 2): instead of N HEIGHT_SHARDED tiers on
-        # disjoint low-CB cores, store the adaptive KV in ONE INTERLEAVED L1 buffer that
-        # spans all banks (like the non-adaptive path) — uniform thin band that coexists
-        # with the model's interleaved buffers, reaching higher capacity than sharding and
-        # avoiding sharded source-core read serialization. Reuses the same adaptive
-        # machinery (sink/ring/l1_only, n-tier SDPA reader); the reader's TensorAccessor
-        # handles interleaved tiers transparently. Capacity = l1_kv_total_size (sink+window).
-        self.l1_kv_interleaved_adaptive = getattr(configuration, "l1_kv_interleaved_adaptive", False)
+        # L1 KV cache layout mode (single source of truth):
+        #   "dram"        — no L1 KV cache (baseline); KV lives in DRAM.
+        #   "interleaved" — one interleaved L1 buffer across all banks, sized by
+        #                   l1_kv_total_size (sink + window). Highest capacity, parallel reads.
+        #   "sharded"     — N HEIGHT_SHARDED tiers auto-sized per-core from the headroom map.
+        #   "hybrid"      — sharded tiers + an interleaved tier (not yet implemented).
+        # All non-dram modes allocate via the tier path (l1_kv_tiers) post-compile and share
+        # the same ring/sink/l1_only machinery + n-tier SDPA reader (TensorAccessor handles
+        # both interleaved and sharded tiers transparently).
+        self.l1_kv_mode = getattr(configuration, "l1_kv_mode", "dram")
+        # use_adaptive_l1_kv_cache = "L1 KV active" (any non-dram mode); drives the
+        # post-compile allocation hook and the forward-path L1 routing.
+        self.use_adaptive_l1_kv_cache = self.l1_kv_mode in ("interleaved", "sharded", "hybrid")
         # StreamingLLM-style attention sink default for the adaptive path: keep
         # the first tile (32 tokens) of prefill K/V permanently in L1. Outside the
         # ring's reach, so they stay valid for the entire decode session and let
@@ -463,56 +466,11 @@ class Attention(LightweightModule):
             for k_or_v in [cache_k, cache_v]
         ]
 
-        if self.l1_kv_total_size > 0 and not self.paged_attention_config and not self.use_adaptive_l1_kv_cache:
-            # Legacy fixed-window path: allocate exactly l1_kv_total_size tokens in L1 right now.
-            # Skipped when use_adaptive_l1_kv_cache is on — the adaptive path manages its own
-            # L1 layout via l1_kv_tiers + a sink prefix seeded from the DRAM cache after
-            # prefill, independently of l1_kv_total_size.
-            # Layout is chosen once here — no later to_memory_config() copy needed.
-            shape = (
-                self.batch_size_per_device_group,
-                self.n_local_kv_heads,
-                self.l1_kv_total_size,
-                self.head_dim,
-            )
-            if self.l1_kv_use_sharded:
-                l1_memcfg = self._create_l1_kv_sharded_memcfg(shape)  # HEIGHT_SHARDED
-                if l1_memcfg is None:
-                    logger.warning(
-                        "[L1 KV] Could not build HEIGHT_SHARDED config; "
-                        "falling back to L1_MEMORY_CONFIG (interleaved)."
-                    )
-                    l1_memcfg = ttnn.L1_MEMORY_CONFIG
-            else:
-                l1_memcfg = ttnn.L1_MEMORY_CONFIG  # plain interleaved
-
-            l1_cache_k = torch.zeros(shape)
-            l1_cache_v = torch.zeros_like(l1_cache_k)
-            self.l1_kv_cache = [
-                ttnn.as_tensor(
-                    k_or_v,
-                    dtype=self.kv_cache_dtype,
-                    layout=self.model_config["ATTN_W_LAYOUT_TILE"],
-                    device=self.mesh_device,
-                    memory_config=l1_memcfg,  # chosen once; no re-sharding at read time
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-                )
-                for k_or_v in [l1_cache_k, l1_cache_v]
-            ]
-            self.l1_kv_sharded_memcfg = l1_memcfg if self.l1_kv_use_sharded else None
-            layout_str = "HEIGHT_SHARDED" if self.l1_kv_use_sharded else "L1_MEMORY_CONFIG"
-            logger.info(
-                f"[L1 KV] Fixed-window cache allocated (layer head_dim={self.head_dim}): "
-                f"{self.l1_kv_total_size} tokens, {layout_str}."
-            )
-        elif self.use_adaptive_l1_kv_cache and not self.paged_attention_config:
-            # Adaptive N-tier path: defer until after decode compile so we can
-            # measure per-core headroom. allocate_l1_kv_cache() will be called by the generator.
-            self.l1_kv_cache = None
-            self.l1_kv_sharded_memcfg = None
-        else:
-            self.l1_kv_cache = None
-            self.l1_kv_sharded_memcfg = None
+        # All L1 KV modes (interleaved/sharded/hybrid) allocate via the tier path
+        # (allocate_l1_kv_cache) AFTER decode compile, so CB regions are frozen and the
+        # cache lands above every program's CB top. There is no init-time L1 KV allocation;
+        # l1_kv_cache stays None (retained only as the "no fixed-window cache" sentinel).
+        self.l1_kv_cache = None
 
     def allocate_l1_kv_cache(
         self,
@@ -531,9 +489,7 @@ class Attention(LightweightModule):
         if self.paged_attention_config:
             return
         if not self.use_adaptive_l1_kv_cache:
-            return  # fixed-window path already allocated in init_kv_cache
-        if self.l1_kv_cache is not None:
-            return  # already allocated
+            return  # dram mode: no L1 KV cache
         self._allocate_adaptive_l1_kv_tiers(headroom_map, safety_margin_bytes)
 
     def _allocate_adaptive_l1_kv_tiers(
@@ -801,18 +757,18 @@ class Attention(LightweightModule):
         """
         from collections import defaultdict
 
-        # ── Interleaved-adaptive layout (option 2) ────────────────────────────
+        # ── INTERLEAVED mode ──────────────────────────────────────────────────
         # Single INTERLEAVED L1 tier spanning all banks, sized to l1_kv_total_size
         # (sink + window). No per-core sharding gate — the interleaved buffer is
         # uniform across banks, so it coexists with the model's interleaved buffers
-        # in the thin top band (the same reason the non-adaptive interleaved path
-        # reaches ~400 tokens). allocator_id=0 (default) matches that proven path.
-        # The n-tier SDPA reader handles it as interleaved tier 0 via TensorAccessor.
-        if self.l1_kv_interleaved_adaptive:
+        # in the thin top band (the same reason interleaved reaches high capacity).
+        # allocator_id=0 (default). The n-tier SDPA reader handles it as interleaved
+        # tier 0 via TensorAccessor.
+        if self.l1_kv_mode == "interleaved":
             cap_tokens = self.l1_kv_total_size
             if cap_tokens <= 0:
                 logger.warning(
-                    "[L1 KV interleaved-adaptive] l1_kv_total_size (sink+window) is 0; "
+                    "[L1 KV interleaved] l1_kv_total_size (sink+window) is 0; "
                     "set --l1_kv_window_size to enable. Disabling L1 KV cache."
                 )
                 return []
@@ -821,11 +777,19 @@ class Attention(LightweightModule):
             memcfg = ttnn.L1_MEMORY_CONFIG  # interleaved across all banks, allocator_id=0
             all_cores = [(x, y) for y in range(self.grid_size.y) for x in range(self.grid_size.x)]
             logger.info(
-                f"[L1 KV interleaved-adaptive] Single interleaved tier: {cap_tokens} tokens "
+                f"[L1 KV interleaved] Single interleaved tier: {cap_tokens} tokens "
                 f"({cap_tiles} tile-rows), spanning all banks."
             )
             return [(memcfg, cap_tiles, all_cores, cap_tokens)]
 
+        # ── HYBRID mode (not yet implemented) ─────────────────────────────────
+        if self.l1_kv_mode == "hybrid":
+            raise NotImplementedError(
+                "l1_kv_mode='hybrid' (sharded tiers + interleaved tier) is not yet implemented. "
+                "Use 'interleaved' or 'sharded'."
+            )
+
+        # ── SHARDED mode: N HEIGHT_SHARDED tiers, auto-sized per-core ─────────
         # Per-tile bytes including dtype-specific storage overhead. For bfloat8_b
         # tt-metal stores 1024 mantissa bytes + 64 shared-exponent bytes per 32×32 tile,
         # i.e. +6.25% over the naive mantissa-only count. Ignoring this overhead causes
@@ -1112,21 +1076,6 @@ class Attention(LightweightModule):
             )
         return ttnn.CoreRangeSet(ranges)
 
-    def _create_l1_kv_sharded_memcfg(self, shape):
-        if self.l1_kv_total_size <= 0:
-            return None
-        total_rows = max(1, shape[0] * shape[1] * math.ceil(shape[2] / self.tile_size))
-        max_cores = max(1, min(self.grid_size.x * self.grid_size.y, total_rows))
-        grid_x = min(self.grid_size.x, max_cores)
-        grid_y = max(1, min(self.grid_size.y, math.ceil(max_cores / grid_x)))
-        return ttnn.create_sharded_memory_config_(
-            shape,
-            ttnn.CoreGrid(x=grid_x, y=grid_y),
-            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
-            ttnn.ShardOrientation.ROW_MAJOR,
-            tile_layout=True,
-        )
-
     def _get_sdpa_l1_cache_tensors(self):
         # l1_kv_tiers: list of (k_tensor, v_tensor, token_start, tok_count)
         #   t[0]: K tensor  t[1]: V tensor  t[2]: token_start  t[3]: tok_count
@@ -1135,12 +1084,7 @@ class Attention(LightweightModule):
             vs = [t[1] for t in self.l1_kv_tiers]  # t[1]: V tensor
             meta = [(t[2], t[3]) for t in self.l1_kv_tiers]  # t[2]: token_start, t[3]: tok_count
             return ks, vs, meta, ()
-        # Fixed-window path
-        if self.l1_kv_cache is None:
-            return None, None, None, ()
-        # Tensor is already in the chosen layout (L1_MEMORY_CONFIG or HEIGHT_SHARDED),
-        # decided at allocation time — no to_memory_config() copy needed here.
-        return self.l1_kv_cache[0], self.l1_kv_cache[1], None, ()
+        return None, None, None, ()
 
     def _build_l1_update_pos(self, current_pos):
         """Returns current_pos if any L1 KV write is needed this step, else None."""
@@ -1289,76 +1233,6 @@ class Attention(LightweightModule):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
 
-    def _prefill_slice(self, tensor, start_idx, end_idx):
-        if start_idx == 0 and end_idx == tensor.shape[2]:
-            return tensor
-        starts = [0] * len(tensor.shape)
-        ends = list(tensor.shape)
-        starts[2] = start_idx
-        ends[2] = end_idx
-        return ttnn.slice(tensor, starts, ends)
-
-    def _prefill_write_l1_cache(self, k_fill_l1, v_fill_l1, seq_len, batch_idx):
-        if self.l1_kv_cache is None or self.l1_kv_total_size <= 0:
-            return
-
-        if k_fill_l1.is_sharded():
-            k_fill_interleaved = ttnn.sharded_to_interleaved(k_fill_l1, ttnn.DRAM_MEMORY_CONFIG)
-        else:
-            k_fill_interleaved = k_fill_l1
-        if v_fill_l1.is_sharded():
-            v_fill_interleaved = ttnn.sharded_to_interleaved(v_fill_l1, ttnn.DRAM_MEMORY_CONFIG)
-        else:
-            v_fill_interleaved = v_fill_l1
-
-        k_fill_cache = ttnn.typecast(k_fill_interleaved, dtype=self.kv_cache_dtype)
-        v_fill_cache = ttnn.typecast(v_fill_interleaved, dtype=self.kv_cache_dtype)
-
-        if seq_len <= self.l1_kv_total_size:
-            fill_k = self._prefill_slice(k_fill_cache, 0, seq_len)
-            fill_v = self._prefill_slice(v_fill_cache, 0, seq_len)
-            ttnn.fill_cache(self.l1_kv_cache[0], fill_k, batch_idx)
-            ttnn.fill_cache(self.l1_kv_cache[1], fill_v, batch_idx)
-            if fill_k is not k_fill_cache:
-                ttnn.deallocate(fill_k)
-            if fill_v is not v_fill_cache:
-                ttnn.deallocate(fill_v)
-            ttnn.deallocate(k_fill_cache)
-            ttnn.deallocate(v_fill_cache)
-            if k_fill_interleaved is not k_fill_l1:
-                ttnn.deallocate(k_fill_interleaved)
-            if v_fill_interleaved is not v_fill_l1:
-                ttnn.deallocate(v_fill_interleaved)
-            return
-
-        # For long prompts, the existing fill op cannot directly populate a wrapped ring layout.
-        # We still initialize the pinned sink rows so decode can immediately use them.
-        if self.l1_kv_sink_size > 0:
-            sink_k = self._prefill_slice(k_fill_cache, 0, self.l1_kv_sink_size)
-            sink_v = self._prefill_slice(v_fill_cache, 0, self.l1_kv_sink_size)
-            if sink_k.dtype != self.kv_cache_dtype:
-                sink_k_cache = ttnn.typecast(sink_k, dtype=self.kv_cache_dtype)
-                if sink_k is not k_fill_cache:
-                    ttnn.deallocate(sink_k)
-                sink_k = sink_k_cache
-            if sink_v.dtype != self.kv_cache_dtype:
-                sink_v_cache = ttnn.typecast(sink_v, dtype=self.kv_cache_dtype)
-                if sink_v is not v_fill_cache:
-                    ttnn.deallocate(sink_v)
-                sink_v = sink_v_cache
-            ttnn.fill_cache(self.l1_kv_cache[0], sink_k, batch_idx)
-            ttnn.fill_cache(self.l1_kv_cache[1], sink_v, batch_idx)
-            if sink_k is not k_fill_cache:
-                ttnn.deallocate(sink_k)
-            if sink_v is not v_fill_cache:
-                ttnn.deallocate(sink_v)
-        ttnn.deallocate(k_fill_cache)
-        ttnn.deallocate(v_fill_cache)
-        if k_fill_interleaved is not k_fill_l1:
-            ttnn.deallocate(k_fill_interleaved)
-        if v_fill_interleaved is not v_fill_l1:
-            ttnn.deallocate(v_fill_interleaved)
-
     def forward_decode(
         self, x, current_pos, rot_mats=None, page_table=None, l1_update_pos=None, l1_write_enabled=True, kv_cache=None
     ):
@@ -1464,11 +1338,7 @@ class Attention(LightweightModule):
             keys = self.layer_past[0]
             values = self.layer_past[1]
 
-        if self.l1_kv_cache is not None and not page_table and l1_write_enabled:
-            with l1_kv_perf.timed("decode.l1_clone_path"):
-                k_heads_l1 = ttnn.mul(k_heads_1BKD, 1.0)
-                v_heads_l1 = ttnn.mul(v_heads_1BKD, 1.0)
-        elif self.l1_kv_tiers and not page_table and l1_write_enabled:
+        if self.l1_kv_tiers and not page_table and l1_write_enabled:
             if self.l1_kv_only_mode:
                 # L1-only mode skips DRAM K/V write (below), so k_heads_1BKD has
                 # no other consumer. Pass it directly to the L1 ring write and
@@ -1486,12 +1356,12 @@ class Attention(LightweightModule):
         # k_heads, [seqlen, n_kv_heads, bsz, head_dim]
         # v_heads [seqlen, n_kv_heads, bsz, head_dim]
         # keys, [max_batch_size, n_kv_heads // configuration.num_devices, max_seq_len, head_dim]
-        # L1-only inference mode: when the SDPA decode kernel only reads from the
-        # L1 adaptive tiers (clamped cur_pos, no DRAM fallback), there's no
-        # benefit to maintaining the DRAM K/V cache. Skipping the two
-        # paged_update_cache writes per layer removes ~32 ms/token of pure
-        # overhead. The DRAM tensors stay populated from prefill but go stale —
-        # safe because the kernel never reads them in this mode.
+        # L1-only inference mode: the SDPA decode kernel attends only to the L1 tiers
+        # (clamped cur_pos; the boundary tile reads L1 via the ceil fresh-window fix, and
+        # the full prefill is seeded into L1), so the DRAM K/V cache is never read during
+        # decode. Skipping the two paged_update_cache writes per layer removes their
+        # dispatch overhead. The DRAM tensors stay populated from prefill but go stale —
+        # safe because decode never reads them in this mode.
         skip_dram_kv_write = self.l1_kv_only_mode and self.l1_kv_tiers and not page_table and l1_write_enabled
         if not skip_dram_kv_write:
             with l1_kv_perf.timed("decode.dram_kv_write"):
@@ -1519,30 +1389,6 @@ class Attention(LightweightModule):
                     self._write_adaptive_l1_tiers(k_heads_l1, v_heads_l1, flat_pos)
                     if locally_built_flat_pos:
                         ttnn.deallocate(flat_pos)
-        elif self.l1_kv_cache is not None and not page_table and l1_write_enabled:
-            l1_pos = l1_update_pos
-            if l1_pos is None and self.l1_kv_window_size > 0:
-                with l1_kv_perf.timed("decode.l1_index_path"):
-                    orig_shape = current_pos.shape
-                    l1_pos = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
-                    l1_pos = ttnn.typecast(l1_pos, ttnn.float32)
-                    l1_pos = ttnn.remainder(l1_pos, float(self.l1_kv_window_size))
-                    if self.l1_kv_sink_size > 0:
-                        l1_pos = ttnn.add(l1_pos, self.l1_kv_sink_size)
-                    l1_pos = ttnn.typecast(l1_pos, ttnn.int32)
-                    l1_pos = ttnn.to_layout(l1_pos, ttnn.ROW_MAJOR_LAYOUT)
-                    padded_shape = l1_pos.shape
-                    slice_starts = [0] * len(padded_shape)
-                    slice_ends = list(padded_shape)
-                    for i in range(len(orig_shape)):
-                        slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
-                    l1_pos = ttnn.slice(l1_pos, slice_starts, slice_ends)
-            if l1_pos is not None:
-                with l1_kv_perf.timed("decode.l1_kv_write"):
-                    ttnn.experimental.paged_update_cache(self.l1_kv_cache[0], k_heads_l1, update_idxs_tensor=l1_pos)
-                    ttnn.experimental.paged_update_cache(self.l1_kv_cache[1], v_heads_l1, update_idxs_tensor=l1_pos)
-                if l1_pos is not l1_update_pos:
-                    ttnn.deallocate(l1_pos)
 
         sdpa_kwargs = {
             "cur_pos_tensor": current_pos,
@@ -1584,10 +1430,6 @@ class Attention(LightweightModule):
                 if self.l1_kv_only_mode and self.l1_kv_adaptive_total_capacity > 0:
                     sdpa_kwargs["l1_decode_start_pos"] = 0
                     sdpa_kwargs["l1_only_mode"] = True
-        elif self.l1_kv_cache is not None:
-            sdpa_l1_k, sdpa_l1_v, _, sharded_l1_tensors = self._get_sdpa_l1_cache_tensors()
-            sdpa_kwargs["l1_k_tensor"] = sdpa_l1_k
-            sdpa_kwargs["l1_v_tensor"] = sdpa_l1_v
 
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
@@ -1893,9 +1735,9 @@ class Attention(LightweightModule):
             ttnn.experimental.paged_fill_cache(keys_BKSD, k_fill_sliced, fill_page_table, batch_idx=user_id)
             ttnn.experimental.paged_fill_cache(values_BKSD, v_fill_sliced, fill_page_table, batch_idx=user_id)
         else:
-            with l1_kv_perf.timed("prefill.l1_clone_path"):
-                k_fill_l1 = ttnn.mul(k_fill, 1.0)
-                v_fill_l1 = ttnn.mul(v_fill, 1.0)
+            # Write prefill K/V into the DRAM cache (layer_past). For L1 KV modes the
+            # adaptive path seeds L1 from this DRAM cache post-prefill (seed_adaptive_l1_sinks);
+            # there is no direct prefill-to-L1 write.
             ttnn.fill_cache(
                 keys_BKSD,
                 k_fill,
@@ -1906,13 +1748,6 @@ class Attention(LightweightModule):
                 v_fill,
                 user_id % self.batch_size_per_device_group,
             )
-            if self.l1_kv_cache is not None and (chunk_start_idx is None or chunk_start_idx == 0):
-                with l1_kv_perf.timed("prefill.l1_fill_cache"):
-                    self._prefill_write_l1_cache(
-                        k_fill_l1, v_fill_l1, valid_seq_len, user_id % self.batch_size_per_device_group
-                    )
-            ttnn.deallocate(k_fill_l1)
-            ttnn.deallocate(v_fill_l1)
         if seq_len >= self.min_kv_prefill_shard_seqlen and not self.TG and not page_table:
             ttnn.deallocate(k_fill)
             ttnn.deallocate(v_fill)

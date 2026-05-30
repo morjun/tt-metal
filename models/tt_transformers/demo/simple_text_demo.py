@@ -336,16 +336,14 @@ def prepare_generator_args(
     page_params,
     paged_attention,
     num_layers,
+    l1_kv_mode="dram",
     l1_kv_window_size=0,
     l1_kv_sink_size=0,
-    l1_kv_use_sharded=False,
     l1_kv_min_expected_hit_ratio=0.0,
     l1_kv_safety_margin=64 * 1024,
     l1_kv_min_viable_tokens=64,
-    use_adaptive_l1_kv_cache=False,
     l1_kv_only_mode=False,
     l1_kv_headroom_json=None,
-    l1_kv_interleaved_adaptive=False,
 ):
     submesh_devices = create_submeshes(mesh_device, data_parallel)
     state_dict = None
@@ -375,16 +373,14 @@ def prepare_generator_args(
             dtype=ttnn.bfloat8_b,
             state_dict=state_dict,
             num_layers=num_layers,
+            l1_kv_mode=l1_kv_mode,
             l1_kv_window_size=l1_kv_window_size,
             l1_kv_sink_size=l1_kv_sink_size,
-            l1_kv_use_sharded=l1_kv_use_sharded,
             l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
             l1_kv_safety_margin=l1_kv_safety_margin,
             l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
-            use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
             l1_kv_only_mode=l1_kv_only_mode,
             l1_kv_headroom_json=l1_kv_headroom_json,
-            l1_kv_interleaved_adaptive=l1_kv_interleaved_adaptive,
         )
         model_args.append(model_args_i)
         model.append(model_i)
@@ -935,16 +931,14 @@ def test_demo_text(
     enable_trace = False  # FORECE DISABLE FOR DPRINT DEBUGGING
     num_layers = request.config.getoption("--num_layers") or num_layers
     mode = request.config.getoption("--mode") or mode
+    l1_kv_mode = request.config.getoption("--l1_kv_mode")
     l1_kv_window_size = request.config.getoption("--l1_kv_window_size")
     l1_kv_sink_size = request.config.getoption("--l1_kv_sink_size")
-    l1_kv_use_sharded = request.config.getoption("--l1_kv_use_sharded")
     l1_kv_min_expected_hit_ratio = request.config.getoption("--l1_kv_min_expected_hit_ratio")
     l1_kv_safety_margin = request.config.getoption("--l1_kv_safety_margin")
     l1_kv_min_viable_tokens = request.config.getoption("--l1_kv_min_viable_tokens")
-    use_adaptive_l1_kv_cache = request.config.getoption("--use_adaptive_l1_kv_cache")
     l1_kv_only_mode = request.config.getoption("--l1_kv_only_mode")
     l1_kv_headroom_json = request.config.getoption("--l1_kv_headroom_json")
-    l1_kv_interleaved_adaptive = request.config.getoption("--l1_kv_interleaved_adaptive")
     l1_memory_view_path = request.config.getoption("--l1_memory_view_path")
 
     if stress_test and token_accuracy:
@@ -1039,16 +1033,14 @@ def test_demo_text(
         page_params=page_params,
         paged_attention=paged_attention,
         num_layers=num_layers,
+        l1_kv_mode=l1_kv_mode,
         l1_kv_window_size=l1_kv_window_size,
         l1_kv_sink_size=l1_kv_sink_size,
-        l1_kv_use_sharded=l1_kv_use_sharded,
         l1_kv_min_expected_hit_ratio=l1_kv_min_expected_hit_ratio,
         l1_kv_safety_margin=l1_kv_safety_margin,
         l1_kv_min_viable_tokens=l1_kv_min_viable_tokens,
-        use_adaptive_l1_kv_cache=use_adaptive_l1_kv_cache,
         l1_kv_only_mode=l1_kv_only_mode,
         l1_kv_headroom_json=l1_kv_headroom_json,
-        l1_kv_interleaved_adaptive=l1_kv_interleaved_adaptive,
     )
 
     # Skip ci-eval tests on P100 devices

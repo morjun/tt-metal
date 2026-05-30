@@ -92,12 +92,6 @@ def pytest_addoption(parser):
         help="Pinned L1 KV sink size in tokens (0 = disabled)",
     )
     parser.addoption(
-        "--l1_kv_use_sharded",
-        action="store_true",
-        default=False,
-        help="Use a sharded L1 KV read cache alongside the interleaved writer cache",
-    )
-    parser.addoption(
         "--l1_kv_min_expected_hit_ratio",
         action="store",
         default=0.0,
@@ -126,30 +120,28 @@ def pytest_addoption(parser):
         help="Optional JSON output path for summarized L1 memory-view snapshots from simple_text_demo",
     )
     parser.addoption(
-        "--use_adaptive_l1_kv_cache",
-        action="store_true",
-        default=False,
-        help="Enable the adaptive N-tier L1 KV cache (measures per-core headroom after decode compile and allocates tiers)",
+        "--l1_kv_mode",
+        action="store",
+        default="dram",
+        choices=["dram", "interleaved", "sharded", "hybrid"],
+        help=(
+            "L1 KV cache layout mode (default: dram = no L1 KV cache):\n"
+            "  dram        - KV cache in DRAM only (baseline; no L1 KV).\n"
+            "  interleaved - single interleaved L1 buffer across all banks, sized by "
+            "--l1_kv_window_size (+ sink). Highest capacity, parallel reads.\n"
+            "  sharded     - N HEIGHT_SHARDED tiers auto-sized from --l1_kv_headroom_json.\n"
+            "  hybrid      - sharded tiers + an interleaved tier (not yet implemented).\n"
+            "Combine with --l1_kv_only_mode for StreamingLLM L1-only decode."
+        ),
     )
     parser.addoption(
         "--l1_kv_only_mode",
         action="store_true",
         default=False,
         help=(
-            "StreamingLLM-style L1-only inference: SDPA decode attends only to L1-cached positions "
-            "(sink + ring), skipping DRAM. Requires --use_adaptive_l1_kv_cache. Quality is close to "
-            "full attention thanks to attention sinks; perf benefit scales with SDPA time savings."
-        ),
-    )
-    parser.addoption(
-        "--l1_kv_interleaved_adaptive",
-        action="store_true",
-        default=False,
-        help=(
-            "Adaptive L1 KV cache stores ONE interleaved buffer (spanning all banks) instead of "
-            "N HEIGHT_SHARDED tiers. Higher capacity (coexists with the model's interleaved buffers) "
-            "and avoids sharded source-core read serialization. Capacity = l1_kv_window_size + l1_kv_sink_size. "
-            "Requires --use_adaptive_l1_kv_cache."
+            "StreamingLLM-style L1-only inference: SDPA decode attends only to L1-cached positions, "
+            "skipping DRAM reads/writes. Applies to interleaved/sharded/hybrid modes. With capacity >= "
+            "sequence the full prompt is seeded into L1 so output matches the DRAM baseline."
         ),
     )
     parser.addoption(
