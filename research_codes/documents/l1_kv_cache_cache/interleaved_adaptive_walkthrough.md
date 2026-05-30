@@ -177,12 +177,15 @@ is L1-resident, decode extends it linearly (no wrap), and l1_only attends to the
 context — output **byte-matches the DRAM baseline**, with **zero DRAM reads in decode** (so
 the DRAM writes are correctly skipped — the "skip DRAM entirely" goal).
 
-Both fixes are layout-independent in the kernel; Bug B's seed currently covers the
-single-tier (interleaved) case. Multi-tier sharded still gets the sink-only seed, so
-sharded l1_only is coherent-but-lossy (Bug A fixed, Bug B not) until a cross-tier
-full-prefill seed is added.
+Bug B's seed now covers ALL tiers: `seed_adaptive_l1_sinks` seeds each tier from its own
+DRAM token range (`DRAM[token_start_i : token_start_i + tok_count_i]`), since the flat ring
+partitions positions contiguously across tiers. So sharded l1_only is also faithful when
+capacity >= sequence; when capacity < sequence the ring wraps and drops earliest context
+(StreamingLLM, expected). Verified: sharded l1_only is coherent and on-topic (seeds all 3
+tiers); interleaved l1_only (capacity >= seq) is byte-identical to the DRAM baseline.
 
-Files: `dataflow_common.hpp` (ceil), `attention.py::seed_adaptive_l1_sinks` (full seed).
+Files: `dataflow_common.hpp` (ceil), `attention.py::seed_adaptive_l1_sinks` (full per-tier seed).
+Commits: d0d6445 (ceil + single-tier seed), 28e02bc (cross-tier seed).
 
 ## 8. Open items
 
@@ -191,5 +194,5 @@ Files: `dataflow_common.hpp` (ceil), `attention.py::seed_adaptive_l1_sinks` (ful
 3. **Genuine auto-sizing**: needs an l1_only-aware headroom basis (vanilla map under-predicts ~2x).
 4. **Long-decode validation**: exercise windows past the ring-wrap point (capacity < seq),
    where StreamingLLM loss is expected and faithfulness will degrade by design.
-5. **Sharded l1_only faithfulness**: add cross-tier full-prefill seed (Bug B for multi-tier).
+5. ~~Sharded l1_only faithfulness~~ — **DONE** (28e02bc, cross-tier per-tier full-prefill seed).
 6. **Hybrid (option 1)** still available if sharded locality is ever wanted on top of the band.
