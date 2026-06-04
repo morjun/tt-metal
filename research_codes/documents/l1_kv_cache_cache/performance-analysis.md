@@ -111,6 +111,11 @@ prompt 파일 생성(토큰 수 고정):
 
 - L1 full-resident와 DRAM의 **생성 토큰이 byte-identical**(같은 prompt, temperature 0 argmax)
   → L1 경로 수치 정확성 확인, 클램프 없음(전체 context 연산).
+  - **정정(human-readable 여부)**: 이 2-layer 출력은 **사람이 읽을 수 있는 문장이 아니다**(32층 중 2층만
+    써서 logit이 무의미 → 프롬프트를 잠깐 따라가다 토큰 garbage로 붕괴: 예 "...hiding␦ecs筒INALeck...").
+    byte-identical은 **"같은 op·같은 수치, KV 소스만 다름 → 동일 출력"이라는 read-path 등가성**을 증명하는
+    것이지 coherence 주장이 아니다. 사람이 읽을 수 있는 정상 출력의 동등성은 32-layer end-to-end run
+    (`run_960_l1.log`, "As a digital AI...")에서 별도로 확인했다(아래 절).
 - L1 수치가 context에 따라 증가(9.88→18.90→24.61)하며 DRAM(9.86→18.59→24.72)을 추종
   → full context를 연산한다는 증거(클램프됐다면 고정값으로 평평해짐).
 - Hybrid(부분 L1 + DRAM fallback)도 동일 context에서 DRAM/L1과 ±2% 이내.
@@ -137,6 +142,110 @@ prompt 파일 생성(토큰 수 고정):
   (`sdpa_flash_decode.cpp`/`compute_common.hpp`)의 matmul/softmax 구간을 `DeviceZoneScopedN`으로
   감싸 재컴파일 후 재측정 필요(미실행).
 
+## SFPU vs FPU 분해 + read/compute overlap (device zone profiling, 2026-06-04)
+
+§3에서 "compute-bound"는 확인됐고, 남은 질문 두 개를 device-zone(`DeviceZoneScopedN`)으로 직접 측정했다:
+(A) attention compute 중 softmax(SFPU)가 병목인가, matmul(FPU)인가? (B) KV read(NCRISC)가 compute(TRISC)
+밑에 정확히 얼마나 가려지나?
+
+방법: SDPA decode 커널(`sdpa_flash_decode.cpp`)에 per-chunk zone 삽입 — FPU `QK_MM`/`PV_MM`,
+SFPU `SM_NORM`(row-max+exp+row-sum)/`SM_RESCALE`(online-softmax rescale), envelope `CMP_CHUNK`.
+reader(`dataflow_common.hpp::read_kv_mask_chunks`)에 `RD_K`/`RD_V`. `SDPA_PROFILE_ZONES` 가드.
+DRAM, ctx 1792, 2-layer, 8 decode step. `profile_log_device.csv`를 `analyze_zones.py`로 집계
+(per-core avg, 같은 코어의 NCRISC·TRISC는 동일 cycle base). DROPPED_ZONES 없음. 재현 명령은 아래 "재현".
+
+### (A) FPU(matmul)가 지배적이다 — softmax는 병목이 **아니다**
+
+compute는 3 TRISC로 파이프라인(UNPACK/MATH/PACK)되며 zone 시간은 스레드별 busy. 칩-wall은 가장 느린
+스레드(여기선 TRISC_1/2 ≈ 8.45 µs/chunk)가 결정. per-chunk avg (µs):
+
+| RISC | QK_MM(FPU) | PV_MM(FPU) | SM_NORM(SFPU) | SM_RESCALE(SFPU) | CMP_CHUNK | FPU% / SFPU% |
+|---|---|---|---|---|---|---|
+| TRISC_0 | 2.06 | 0.49 | 1.54 | 2.98 | 6.31 | 47% / 53% |
+| TRISC_1 | 4.32 | 0.42 | 1.72 | 2.90 | 8.45 | 61% / 39% |
+| TRISC_2 | 4.45 | 0.55 | 1.42 | 2.78 | 8.47 | 65% / 35% |
+
+- wall을 결정하는 TRISC_1/2에서 **FPU matmul 61-65%, SFPU softmax 35-39%**. 단일 최대 zone은
+  **QK^T matmul(`QK_MM`)** (math thread 4.3-4.4 µs). softmax는 2차 비용이다.
+- 따라서 **softmax(SFPU)는 병목이 아니다. attention decode compute는 matmul-bound(특히 QK^T).**
+- `SM_RESCALE`(online-softmax rescale)는 호출당 2.8-3.0 µs로 비싸지만 multi-chunk에서만(896/1920 호출)
+  발생. `SM_NORM`(exp 포함)은 1.4-1.7 µs로 저렴.
+- 함의: `EXP_APPROX_MODE`/math-approx로 softmax를 줄여도 상한은 attention compute의 ~35-40%이고,
+  attention 자체가 decode step device 시간의 작은 비중이라 end-to-end 이득은 제한적. matmul이 바닥.
+
+### (B) KV read는 compute 밑에 100% 가려진다
+
+64개 attention 코어 전부에서 NCRISC read(`RD_K`+`RD_V`) 구간이 같은 코어의 TRISC compute
+(`CMP_CHUNK` 3-TRISC union) 구간 **안에 100% 포함**된다(read-hidden fraction mean/min/max = 100.0%).
+합계: read 8,506 µs vs compute(union) 16,357 µs → **margin 7,851 µs (compute가 read의 ~1.9배)**.
+이는 §2의 L1==DRAM(위치-불변) 결론을 커널 타임라인 수준에서 직접 재확인한 것이다: read ⊆ compute, 여유 큼.
+
+> **read 소스 명시: 이 측정의 read는 전부 DRAM read다** (`--l1_kv_mode dram`이므로 reader가
+> `read_kv_mask_chunks`(DRAM 경로) 실행). 즉 "DRAM read조차 compute 밑에 완전히 숨는다"는 뜻 —
+> 더 빠른 L1 read로 바꿔도 op latency가 안 줄어드는 이유의 직접 증거. (L1 read 타임라인은 32-layer
+> l1_only 프로파일에서 별도 측정 예정 — §To-do.)
+
+타임라인 간트(한 SDPA-decode op, 한 attention 코어, NCRISC DRAM read vs 3×TRISC compute):
+`reprofile/zones_dram_1792/overlap_gantt.png` (`plot_overlap.py`로 생성). NCRISC read 밴드가
+compute span 안에서 끝나고 compute의 SM_RESCALE 꼬리가 read 뒤로 더 이어지는 것이 보인다(read 숨김 + 여유).
+
+### 재현
+
+커널을 `SDPA_PROFILE_ZONES`로 계측(기본은 off — `sdpa_flash_decode.cpp`/`dataflow_common.hpp`의
+`#define SDPA_PROFILE_ZONES 1` 주석 해제). build-key는 소스를 해시하지 않으므로 토글 후 반드시
+`rm -rf ~/.cache/tt-metal-cache` (스크립트의 `wipe` 인자). 그 다음:
+```bash
+bash research_codes/documents/l1_kv_cache_cache/reprofile/run_zones.sh wipe   # 첫 회/커널 수정 후
+bash research_codes/documents/l1_kv_cache_cache/reprofile/run_zones.sh        # 이후
+# 분석: analyze_zones.py <report>/profile_log_device.csv (run_zones.sh가 자동 호출)
+```
+주의: tt-metal run을 강제 종료(kill)하면 device가 wedge되어 다음 run이 prefill에서 hang한다.
+복구: `python_env/bin/tt-smi -r`. 원시 CSV/로그는 `reprofile/zones_dram_1792/`에 보존.
+
+## L1_only 배포 config 확인 + L1 read 타임라인 + warm-up=compile 확정 (2026-06-04)
+
+§A/§B는 DRAM 경로였다. 여기서는 **l1_only(L1 read)** 경로를 같은 방법으로 측정하고, 같은 context에서
+DRAM과 직접 비교한다.
+
+> **왜 2-layer인가 (32-layer zone 불가)**: 커스텀 zone marker는 코어당 marker 버퍼(250개)에 op 호출을
+> 가로질러 누적된다 — 2-layer(SDPA 16회/step-set)는 ~192개로 들어가지만 **32-layer(256회)는 오버플로우 →
+> start/end marker 불균형 → profiler post-proc abort**(`profiler.cpp:1575`)로 device CSV가 안 나온다(실측 확인).
+> SDPA op·reader·compute는 **layer 수와 무관하게 동일**하므로(§2) per-op zone 결과는 2-layer가 32-layer를
+> 그대로 대표한다. 32-layer 고유 지표(end-to-end tok/s, warm-up)는 zone 없이 측정. 또한 context는 큰 2의 거듭제곱
+> 약수를 갖는 값이어야 한다(ctx 900 = 2²·225 → k_chunk 4 → 225 chunk → marker 폭주로 abort; **ctx 896 = 2⁷·7
+> → k_chunk 128 → 7 chunk**로 해결). l1_only window 960이라 ctx 896은 full-resident(클램프 없음).
+
+### 같은 context(896) DRAM vs L1 직접 비교 (2-layer, zones)
+
+| 지표 | DRAM | L1_only |
+|---|---|---|
+| SDPA-decode op latency (per-core avg) | 17.23 µs | 17.33 µs (+0.6%) |
+| FPU(matmul) / SFPU(softmax), wall TRISC_1/2 | 80–84% / 16–20% | 81–84% / 16–19% |
+| K+V read per chunk | **4.16 µs** (RD_K 2.10 + RD_V 2.06, DRAM reader) | **4.72 µs** (RD_CHUNK, n-tier L1 reader) |
+| read-hidden fraction (read ⊆ compute) | 100% (64/64 코어) | 100% (64/64 코어) |
+| warm-up penalty | 없음 (iter1 = 31 ms) | iter1 991 ms + iter2 2259 ms |
+
+- **op latency: L1 == DRAM(+0.6%)** — §2(2-layer, clean)·end-to-end와 일치. 배포 config(l1_only)에서도 compute-bound 재확인.
+- **FPU/SFPU 분해는 L1·DRAM 동일** (matmul ~80%, softmax ~20%). softmax 병목 아님 재확인. (ctx 896은 코어당
+  대개 1 chunk라 `SM_RESCALE`(multi-chunk 전용)이 없어 §A의 1792보다 FPU 비중이 더 높게 보인다 — 결론 동일.)
+- **반직관 포인트: L1 read가 DRAM read보다 오히려 ~13% 느리다**(4.72 vs 4.16 µs/chunk). L1 메모리가 더 빨라도
+  n-tier L1 reader의 **소프트웨어 오버헤드**(`find_tier` tier-dispatch, ring modular remap, goto ladder)가 단순
+  DRAM reader보다 커서, read time 자체가 줄지 않는다. 그런데도 **둘 다 compute 밑에 100% 숨으므로 op latency는
+  동일**. → "read는 lever가 아니다"를 한 번 더 못박는다(더 빠른 메모리는 물론, 더 느린 reader여도 latency 불변).
+
+### read 타임라인(간트)
+- DRAM read: `reprofile/zones_dram_1792/overlap_gantt.png`
+- **L1 read**: `reprofile/zones2_l1only_896/overlap_gantt_l1.png` — NCRISC L1 read 밴드가 TRISC compute 안에서
+  끝나고 PV_MM 꼬리가 read 뒤로 더 간다(read 숨김 + 여유). 생성: `plot_overlap.py <csv> <out.png>`.
+
+### warm-up = compile 확정 (item 2)
+2-layer l1_only run이 결정적: tier alloc(2개)·seed(2층)는 **합 ~0.1s**(16:55:59.6–16:56:00.6)인데도
+**iter1 991 ms + iter2 2259 ms (~3.25s)**가 나온다. alloc+seed로 설명 불가 → 나머지는 **L1-경로 program의
+first-use JIT 컴파일**(n-tier SDPA reader/compute + L1 ring write). 같은 ctx에서 **DRAM run은 warm-up이 전혀 없다**
+(iter1부터 31 ms). 32-layer에선 여기에 alloc+seed(32× = ~3s)가 더해질 뿐, compile 성분(~2–3s)은 layer-무관.
+→ 사용자 의심대로 warm-up은 순수 alloc+copy가 아니라 **compile 포함**. (해소책: program을 미리 워밍업하거나
+persistent cache 재사용으로 first-use compile을 prefill 단계로 흡수.)
+
 ## End-to-end 실측 (32-layer 전체 모델, 비프로파일 run)
 
 `simple_text_demo.py` batch-1 node, 32 layers 전체, 145-tok context, 200 decode tokens,
@@ -158,18 +267,40 @@ DEBUG 재측정), `run_960_l1.log`(`--l1_kv_mode interleaved --l1_kv_only_mode
   생략**(paged_update_cache가 DRAM 대신 L1로 write)하고 DRAM read도 안 하기 때문이며, write/traffic
   쪽의 작은 이득이다. 크기가 작아(~3ms/iter) noise와 경계 수준이지만 방향은 일관된다.
   → "L1은 DRAM을 못 이긴다"는 **SDPA read 경로**에 대한 결론이고, write 생략으로 인한 미세한 edge는 별개.
-- DRAM은 **warm-up 패널티가 없다**(iter 1–2가 이미 steady). L1은 992 tokens × 32 layers tier
-  할당+seed가 iter 1–2의 느린 구간(합 ~5.3s)으로 나타나 200-token 평균을 8.82 tok/s로 끌어내린다.
+- DRAM은 **warm-up 패널티가 없다**(iter 1–2가 이미 steady). L1은 iter 1–2가 느려(3165 / 2173 ms,
+  합 ~5.3s) 200-token 평균을 8.82 tok/s로 끌어내린다.
+  - **warm-up 분해 정정(`run_960_l1.log` 타임스탬프 분석)**: 이전 "iter1–2 = 단순 alloc+seed"는 부정확.
+    iter 0(33.5s) = decode program compile. **iter 1(3165ms)** = post-compile L1 tier alloc(32층, ~1s)
+    + ~0.8s gap + full-prefill seed(32층 × ~41ms ≈ 1.3s) → 합 ~3.1s로 iter 1을 정확히 설명(seed는 iter 1
+    안에서 끝남, 마지막 seed 로그 21:48:11.98). **iter 2(2173ms)는 alloc/seed로 설명 안 됨**(둘 다 iter 1에
+    완료) → **L1 경로 전용 program의 first-use JIT 컴파일**(n-tier SDPA reader/compute + L1 ring write)로
+    추정. iter 0 컴파일은 tier 할당 *이전* graph라 L1-경로 program은 첫 실제 decode(iter 1–2)에서 새로 컴파일됨.
+    즉 사용자 의심대로 **warm-up에 compile이 포함**돼 있다(순수 alloc+copy 아님). **확정**: 위 "L1_only 배포
+    config 확인" 절의 2-layer l1_only run에서 alloc+seed가 ~0.1s에 불과한데도 iter1+2가 ~3.25s 걸려 compile
+    성분이 분리 증명됨.
   즉 L1 l1_only는 **짧은 생성에선 net 손해(8.82 vs 11.05), steady/긴 생성에선 근소 우위(11.44 vs 11.05)**.
   교차점은 warm-up ~5.3s를 step당 ~3ms 이득으로 회수 → 대략 1700+ tokens 이후.
 - 992 tokens = 32-layer에서 달성된 L1 window(앞서 언급한 ~900–1000 ceiling 부근).
 
 ## To-do (갱신)
 
-  - **Hybrid(sharded+interleaved) 구현은 보류/우선순위 낮음.** §2에서 SDPA가 compute-bound이고
-    L1==DRAM임이 확정됐으므로, 코어 여유를 더 짜내 capacity를 늘려도 decode latency 이득이 없다.
-    hybrid의 가치는 순수 capacity뿐이고, dynamic branching 복잡성으로 오히려 느려질 위험이 있다.
-  - ~~cluster-replicated~~ **제거**: head/block-sharding이 8-on-1 congestion을 제거하므로 불필요.
+  - ~~memory read time DRAM/L1 명시 + 간트~~ **[완료 2026-06-04]** read 소스를 DRAM/L1로 라벨링(§"L1_only 배포
+    config 확인", §B). 간트 2종: `reprofile/zones_dram_1792/overlap_gantt.png`(DRAM),
+    `reprofile/zones2_l1only_896/overlap_gantt_l1.png`(L1). DRAM read 4.16 µs vs L1 read 4.72 µs/chunk, 둘 다 100% hidden.
+
+  - ~~warm-up >2000ms 원인~~ **[완료 2026-06-04]** compile 포함 확정: 2-layer l1_only에서 alloc+seed ~0.1s인데도
+    iter1+2 ~3.25s → 나머지는 L1-경로 program first-use JIT 컴파일. DRAM은 warm-up 없음. (§"warm-up = compile 확정")
+
+  - ~~ctx 960(+32) l1_only 32-layer 프로파일~~ **[완료 2026-06-04, 단 caveat]** **32-layer zone은 불가**(marker
+    버퍼가 op 호출 가로질러 누적 → 256회에서 오버플로우 → profiler abort). per-op zone은 layer-무관이라 **2-layer
+    l1_only(ctx 896)로 대표 측정**: op latency L1==DRAM(17.33 vs 17.23 µs), FPU/SFPU 동일, L1 read 100% hidden.
+    ctx는 896 사용(960은 2의 거듭제곱 약수가 작아 OK지만 900류는 chunk 폭주 주의). 32-layer 고유 지표(tok/s, warm-up)는
+    end-to-end run으로 커버. (§"L1_only 배포 config 확인")
+
+  - ~~SDPA profiling output human-readable?~~ **[완료 2026-06-04]** 2-layer 출력은 **human-readable 아님**(32층 중
+    2층 → garbage). byte-identical은 read-path 수치 등가성 증명이지 coherence 주장 아님. coherent 출력 등가성은 32-layer
+    end-to-end(run_960_l1)에서 별도 확인. (§2 정정)
+
   - **"Head sharding" 구현** — 단, 목적은 "DRAM을 이기는 것"이 아니라 sharded path를
     interleaved/DRAM **parity로 복귀**시켜 그 용량을 활용 가능하게 만드는 것. latency win은 기대 불가.
   - 진짜 win이 필요하면 **capacity 쪽**: KV quantization(int8/int4) 또는 multi-chip로 long-context를

@@ -5,6 +5,17 @@
 #include <stdint.h>
 #include "dataflow_api.h"
 #include <vector>
+
+// Profiling-only scaffolding: guarded behind SDPA_PROFILE_ZONES. To DISABLE, comment out the
+// `#define` below (macro becomes empty, build byte-identical). The build-key hash does not
+// include kernel source, so after toggling this you MUST wipe ~/.cache/tt-metal-cache/.
+// #define SDPA_PROFILE_ZONES 1  // PROFILING SCAFFOLDING — uncomment + `rm -rf ~/.cache/tt-metal-cache` to re-enable
+#if defined(SDPA_PROFILE_ZONES)
+#include "tools/profiler/kernel_profiler.hpp"
+#define SDPA_ZONE(name) DeviceZoneScopedN(name)
+#else
+#define SDPA_ZONE(name)
+#endif
 /******************************************************************************
  *                                                                             *
  *                   Common Functions for Dataflow Kernels                     *
@@ -538,25 +549,29 @@ void read_kv_mask_chunks(
     uint32_t PSt) {
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        uint64_t k_base_read_ptr = 0;  // hoisted so RD_V (reuse_k) sees it across the RD_K zone
         // Read K chunk transposed
-        cb_reserve_back(cb_k_in, k_chunk_tiles);
-        uint32_t k_write_ptr = get_write_ptr(cb_k_in);
-        uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
-        barrier_count = 0;
-        for (uint32_t col = 0; col < DHt; ++col) {
-            uint32_t k_tile_id = k_start_tile_id + col;
-            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
-                noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
-                if (++barrier_count == barrier_threshold) {
-                    noc_async_read_barrier();
-                    barrier_count = 0;
+        {
+            SDPA_ZONE("RD_K");  // NCRISC: K chunk read + barrier
+            cb_reserve_back(cb_k_in, k_chunk_tiles);
+            uint32_t k_write_ptr = get_write_ptr(cb_k_in);
+            k_base_read_ptr = get_noc_addr(k_write_ptr);
+            barrier_count = 0;
+            for (uint32_t col = 0; col < DHt; ++col) {
+                uint32_t k_tile_id = k_start_tile_id + col;
+                for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+                    noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
+                    if (++barrier_count == barrier_threshold) {
+                        noc_async_read_barrier();
+                        barrier_count = 0;
+                    }
+                    k_tile_id += DHt;
+                    k_write_ptr += k_tile_bytes;
                 }
-                k_tile_id += DHt;
-                k_write_ptr += k_tile_bytes;
             }
-        }
-        noc_async_read_barrier();
-        cb_push_back(cb_k_in, k_chunk_tiles);
+            noc_async_read_barrier();
+            cb_push_back(cb_k_in, k_chunk_tiles);
+        }  // end RD_K
 
         if constexpr (use_attention_mask) {
             mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
@@ -564,40 +579,43 @@ void read_kv_mask_chunks(
         }
 
         // Read V chunk (tranpose of K), from K's L1 buffer
-        if constexpr (reuse_k) {
-            cb_reserve_back(cb_v_in, v_chunk_tiles);
-            uint32_t v_write_ptr = get_write_ptr(cb_v_in);
-            uint64_t k_read_ptr = k_base_read_ptr;
-            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {       // Row of V
-                k_read_ptr = k_base_read_ptr + row * k_tile_bytes;  // Increment across K's Col
+        {
+            SDPA_ZONE("RD_V");  // NCRISC: V chunk read + barrier
+            if constexpr (reuse_k) {
+                cb_reserve_back(cb_v_in, v_chunk_tiles);
+                uint32_t v_write_ptr = get_write_ptr(cb_v_in);
+                uint64_t k_read_ptr = k_base_read_ptr;
+                for (uint32_t row = 0; row < Sk_chunk_t; ++row) {       // Row of V
+                    k_read_ptr = k_base_read_ptr + row * k_tile_bytes;  // Increment across K's Col
 
-                for (uint32_t col = 0; col < vDHt; ++col) {  // Col of V
-                    noc_async_read(k_read_ptr, v_write_ptr, v_tile_bytes);
+                    for (uint32_t col = 0; col < vDHt; ++col) {  // Col of V
+                        noc_async_read(k_read_ptr, v_write_ptr, v_tile_bytes);
 
-                    v_write_ptr += v_tile_bytes;
-                    k_read_ptr += Sk_chunk_t * k_tile_bytes;  // Strid across K's width
-                }
-            }
-        } else {
-            cb_reserve_back(cb_v_in, v_chunk_tiles);
-            uint32_t v_write_ptr = get_write_ptr(cb_v_in);
-            barrier_count = 0;
-            uint32_t v_tile_id = k_start_tile_id;
-            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
-                for (uint32_t col = 0; col < vDHt; ++col) {
-                    noc_async_read_tile(v_tile_id, v_reader, v_write_ptr);
-                    if (++barrier_count == barrier_threshold) {
-                        noc_async_read_barrier();
-                        barrier_count = 0;
+                        v_write_ptr += v_tile_bytes;
+                        k_read_ptr += Sk_chunk_t * k_tile_bytes;  // Strid across K's width
                     }
-                    v_tile_id++;
-                    v_write_ptr += v_tile_bytes;
                 }
-                v_tile_id += (DHt - vDHt);  // Skip the padding!
+            } else {
+                cb_reserve_back(cb_v_in, v_chunk_tiles);
+                uint32_t v_write_ptr = get_write_ptr(cb_v_in);
+                barrier_count = 0;
+                uint32_t v_tile_id = k_start_tile_id;
+                for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+                    for (uint32_t col = 0; col < vDHt; ++col) {
+                        noc_async_read_tile(v_tile_id, v_reader, v_write_ptr);
+                        if (++barrier_count == barrier_threshold) {
+                            noc_async_read_barrier();
+                            barrier_count = 0;
+                        }
+                        v_tile_id++;
+                        v_write_ptr += v_tile_bytes;
+                    }
+                    v_tile_id += (DHt - vDHt);  // Skip the padding!
+                }
             }
-        }
-        noc_async_read_barrier();
-        cb_push_back(cb_v_in, v_chunk_tiles);
+            noc_async_read_barrier();
+            cb_push_back(cb_v_in, v_chunk_tiles);
+        }  // end RD_V
 
         // Update the starting tile id for next iteration
         k_start_tile_id += k_chunk_tiles;
@@ -742,6 +760,7 @@ void read_kv_mask_chunks_n_tier(
 
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        SDPA_ZONE("RD_CHUNK");  // NCRISC: whole per-chunk K+V read (n-tier / L1 path)
         uint32_t chunk_seq_tile = k_chunk * Sk_chunk_t;
 
         cb_reserve_back(cb_k_in, k_chunk_tiles);

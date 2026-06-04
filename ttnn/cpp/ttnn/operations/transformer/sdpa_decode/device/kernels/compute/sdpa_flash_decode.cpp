@@ -23,6 +23,17 @@
 #include "compute_kernel_api/pack_untilize.h"
 #include "compute_kernel_api/untilize.h"
 
+// Profiling-only scaffolding: guarded behind SDPA_PROFILE_ZONES. To DISABLE, comment out the
+// `#define` below (macro becomes empty, build byte-identical). The build-key hash does not
+// include kernel source, so after toggling this you MUST wipe ~/.cache/tt-metal-cache/.
+// #define SDPA_PROFILE_ZONES 1  // PROFILING SCAFFOLDING — uncomment + `rm -rf ~/.cache/tt-metal-cache` to re-enable
+#if defined(SDPA_PROFILE_ZONES)
+#include "tools/profiler/kernel_profiler.hpp"
+#define SDPA_ZONE(name) DeviceZoneScopedN(name)
+#else
+#define SDPA_ZONE(name)
+#endif
+
 constexpr uint32_t MAX_PACK_UNTILIZE_WIDTH = 8;
 
 namespace NAMESPACE {
@@ -282,6 +293,7 @@ void MAIN {
 
             // Loop through all K chunks
             for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+                SDPA_ZONE("CMP_CHUNK");  // per-chunk compute envelope (TRISC) for read/compute overlay
                 // Reconfig register DF
                 reconfig_data_format(cb_q_in, cb_k_in);
                 pack_reconfig_data_format(cb_qk_im);
@@ -304,23 +316,26 @@ void MAIN {
                     mask_cb_to_use = cb_sliding_window_mask_in;  // Use sliding window mask buffer
                 }
 
-                cb_matmul_blocks(
-                    cb_q_in,
-                    cb_k_in,
-                    cb_qk_im,
-                    Sq_chunk_t,
-                    Sk_chunk_t_dynamic,
-                    DHt,
-                    qk_num_blocks,
-                    qk_in0_num_subblocks_dynamic,
-                    qk_in1_num_subblocks_dynamic,
-                    qk_in0_block_w,
-                    qk_subblock_h_dynamic,
-                    qk_subblock_w_dynamic,
-                    true,
-                    add_mask_fusion,
-                    mask_cb_to_use,
-                    cb_zero_in);
+                {
+                    SDPA_ZONE("QK_MM");  // FPU: QK^T matmul
+                    cb_matmul_blocks(
+                        cb_q_in,
+                        cb_k_in,
+                        cb_qk_im,
+                        Sq_chunk_t,
+                        Sk_chunk_t_dynamic,
+                        DHt,
+                        qk_num_blocks,
+                        qk_in0_num_subblocks_dynamic,
+                        qk_in1_num_subblocks_dynamic,
+                        qk_in0_block_w,
+                        qk_subblock_h_dynamic,
+                        qk_subblock_w_dynamic,
+                        true,
+                        add_mask_fusion,
+                        mask_cb_to_use,
+                        cb_zero_in);
+                }
 
                 /* QK += MASK */
                 if (!add_mask_fusion) {
@@ -362,53 +377,69 @@ void MAIN {
                  * else:
                  *  cur_max = max(qk, dim=-1)
                  */
-                reduce_c<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
-                    cb_cur_max, cb_prev_max, Sk_chunk_t_dynamic, k_chunk > k_chunk_start);
+                {
+                    SDPA_ZONE("SM_NORM");  // SFPU: row-max, exp(x-max), row-sum
+                    reduce_c<
+                        PoolType::MAX,
+                        ReduceDim::REDUCE_ROW,
+                        cb_qk_im,
+                        cb_identity_scale_in,
+                        Sq_chunk_t,
+                        vector_mode>(cb_cur_max, cb_prev_max, Sk_chunk_t_dynamic, k_chunk > k_chunk_start);
 
-                /* QK -= cb_cur_max */
-                /* QK = exp(QK)*/
-                reconfig_data_format(cb_qk_im, cb_cur_max);
-                pack_reconfig_data_format(cb_qk_im);
+                    /* QK -= cb_cur_max */
+                    /* QK = exp(QK)*/
+                    reconfig_data_format(cb_qk_im, cb_cur_max);
+                    pack_reconfig_data_format(cb_qk_im);
 
-                /**
-                 * sub_exp performs `QK = exp((QK - cur_max) * scale)`
-                 */
-                sub_exp_block_bcast_cols_inplace_reduce<
-                    cb_qk_im,
-                    Sq_chunk_t,
-                    scale_fp32,
-                    vector_mode,
-                    cb_identity_scale_in>(cb_cur_max, cb_cur_sum, Sk_chunk_t_dynamic);
-                cb_wait_front(cb_qk_im, qk_chunk_tiles_dynamic);
+                    /**
+                     * sub_exp performs `QK = exp((QK - cur_max) * scale)`
+                     */
+                    sub_exp_block_bcast_cols_inplace_reduce<
+                        cb_qk_im,
+                        Sq_chunk_t,
+                        scale_fp32,
+                        vector_mode,
+                        cb_identity_scale_in>(cb_cur_max, cb_cur_sum, Sk_chunk_t_dynamic);
+                    cb_wait_front(cb_qk_im, qk_chunk_tiles_dynamic);
 
-                // Reconfig register DF
-                reconfig_data_format(cb_qk_im, cb_identity_scale_in);
-                pack_reconfig_data_format(cb_cur_sum);
+                    // Reconfig register DF
+                    reconfig_data_format(cb_qk_im, cb_identity_scale_in);
+                    pack_reconfig_data_format(cb_cur_sum);
 
-                /* reduce_c performs CUR_SUM = sum(QK, dim = -1) */
-                reduce_c<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
-                    cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
+                    /* reduce_c performs CUR_SUM = sum(QK, dim = -1) */
+                    reduce_c<
+                        PoolType::SUM,
+                        ReduceDim::REDUCE_ROW,
+                        cb_qk_im,
+                        cb_identity_scale_in,
+                        Sq_chunk_t,
+                        vector_mode>(cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
+                }
 
                 /* OUT_IM = QK @ V_CHUNK */
                 reconfig_data_format(cb_qk_im, cb_v_in);  // DEBUG
                 pack_reconfig_data_format(cb_out_im);
-                cb_matmul_blocks(
-                    cb_qk_im,
-                    cb_v_in,
-                    cb_out_mm,
-                    Sq_chunk_t,
-                    vDHt,
-                    Sk_chunk_t_dynamic,
-                    out_num_blocks_dynamic,
-                    out_in0_num_subblocks,
-                    out_in1_num_subblocks,
-                    out_in0_block_w_dynamic,
-                    out_subblock_h,
-                    out_subblock_w,
-                    false /*transpose*/,
-                    false,
-                    cb_mask_in,
-                    cb_zero_in);
+                {
+                    SDPA_ZONE("PV_MM");  // FPU: scores @ V matmul
+                    cb_matmul_blocks(
+                        cb_qk_im,
+                        cb_v_in,
+                        cb_out_mm,
+                        Sq_chunk_t,
+                        vDHt,
+                        Sk_chunk_t_dynamic,
+                        out_num_blocks_dynamic,
+                        out_in0_num_subblocks,
+                        out_in1_num_subblocks,
+                        out_in0_block_w_dynamic,
+                        out_subblock_h,
+                        out_subblock_w,
+                        false /*transpose*/,
+                        false,
+                        cb_mask_in,
+                        cb_zero_in);
+                }
 
                 // Reconfig register DF
                 reconfig_data_format_srca(cb_out_im);
@@ -424,27 +455,31 @@ void MAIN {
                     reconfig_data_format(cb_prev_max, cb_cur_max);
                     pack_reconfig_data_format(cb_exp_max_diff);
 
-                    /* EXP_MAX_DIFF = exp(PREV_MAX - CUR_MAX) */
-                    sub_exp_block<scale_fp32, vector_mode>(cb_prev_max, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
-                    cb_pop_front(cb_prev_max, Sq_chunk_t);
+                    {
+                        SDPA_ZONE("SM_RESCALE");  // SFPU: online-softmax rescale (exp + mul + add)
+                        /* EXP_MAX_DIFF = exp(PREV_MAX - CUR_MAX) */
+                        sub_exp_block<scale_fp32, vector_mode>(cb_prev_max, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
+                        cb_pop_front(cb_prev_max, Sq_chunk_t);
 
-                    /* PREV_SUM *= EXP_MAX_DIFF */
-                    mul_block_inplace(cb_prev_sum, cb_exp_max_diff, Sq_chunk_t);
+                        /* PREV_SUM *= EXP_MAX_DIFF */
+                        mul_block_inplace(cb_prev_sum, cb_exp_max_diff, Sq_chunk_t);
 
-                    /* OUT_ACC *= EXP_MAX_DIFF */
-                    reconfig_data_format(cb_out_accumulate_im, cb_exp_max_diff);
-                    pack_reconfig_data_format(cb_out_accumulate_im);
-                    mul_block_bcast_cols(cb_out_accumulate_im, cb_exp_max_diff, cb_out_accumulate_im, Sq_chunk_t, vDHt);
+                        /* OUT_ACC *= EXP_MAX_DIFF */
+                        reconfig_data_format(cb_out_accumulate_im, cb_exp_max_diff);
+                        pack_reconfig_data_format(cb_out_accumulate_im);
+                        mul_block_bcast_cols(
+                            cb_out_accumulate_im, cb_exp_max_diff, cb_out_accumulate_im, Sq_chunk_t, vDHt);
 
-                    /* CUR_SUM += PREV_SUM */
-                    reconfig_data_format(cb_cur_sum, cb_prev_sum);
-                    pack_reconfig_data_format(cb_cur_sum);
-                    add_block_inplace<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+                        /* CUR_SUM += PREV_SUM */
+                        reconfig_data_format(cb_cur_sum, cb_prev_sum);
+                        pack_reconfig_data_format(cb_cur_sum);
+                        add_block_inplace<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
 
-                    /* OUT_ACC += OUT_IM */
-                    reconfig_data_format(cb_out_accumulate_im, cb_out_im);
-                    pack_reconfig_data_format(cb_out_accumulate_im);
-                    add_block_inplace<true>(cb_out_accumulate_im, cb_out_im, out_chunk_tiles);
+                        /* OUT_ACC += OUT_IM */
+                        reconfig_data_format(cb_out_accumulate_im, cb_out_im);
+                        pack_reconfig_data_format(cb_out_accumulate_im);
+                        add_block_inplace<true>(cb_out_accumulate_im, cb_out_im, out_chunk_tiles);
+                    }
                 }
 
                 if (k_chunk < k_chunk_end - 1 || do_reduce) {
