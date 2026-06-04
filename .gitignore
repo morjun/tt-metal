@@ -166,3 +166,13 @@ l1_1_layer/
 research_codes/documents/l1_kv_cache_cache/results
 .claude/scheduled_tasks.lock
 tt_metal/pre-compiled/*
+research_codes/documents/l1_kv_cache_cache/reprofile/dram_1024/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/dram_1792/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/dram_512/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/hybrid_1024_w256/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/hybrid_1792_w512/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/l1_1024/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/l1_1792/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/l1_512/run.log
+run_960_l1.log
+run_original.log
