@@ -1,8 +1,8 @@
-2026-06-04 16:57:42.799 | INFO     | __main__:main:206 - Using port 8086
-2026-06-04 16:57:42.800 | INFO     | tracy:run_report_setup:88 - Verifying tracy profiling tools
-2026-06-04 16:57:42.849 | INFO     | tracy:run_report_setup:108 - Capture command: ('/home/masterjunmo/codes/tt-metal/build/tools/profiler/bin/capture-release -o /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_profile_log_host.tracy -f -p 8086',)
-Connecting to 127.0.0.1:8086...2026-06-04 16:57:42.872 | INFO     | __main__:main:271 - Test process started
-2026-06-04 16:57:44.939 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+2026-06-05 12:44:05.762 | INFO     | __main__:main:206 - Using port 8086
+2026-06-05 12:44:05.763 | INFO     | tracy:run_report_setup:88 - Verifying tracy profiling tools
+2026-06-05 12:44:05.786 | INFO     | tracy:run_report_setup:108 - Capture command: ('/home/masterjunmo/codes/tt-metal/build/tools/profiler/bin/capture-release -o /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_profile_log_host.tracy -f -p 8086',)
+Connecting to 127.0.0.1:8086...2026-06-05 12:44:05.806 | INFO     | __main__:main:271 - Test process started
+2026-06-05 12:44:07.888 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
 Config{cache_path=/home/masterjunmo/.cache/ttnn,model_cache_path=/home/masterjunmo/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
 ============================= test session starts ==============================
 platform linux -- Python 3.10.19, pytest-8.4.2, pluggy-1.6.0 -- /home/masterjunmo/codes/tt-metal/python_env/bin/python3
@@ -14,131 +14,132 @@ plugins: split-0.10.0, timeout-2.4.0, benchmark-5.1.0, xdist-3.8.0, dash-2.15.0,
 timeout: 300.0s
 timeout method: signal
 timeout func_only: False
-collecting ... 2026-06-04 16:57:48.889 | WARNING  | models.perf.benchmarking_utils:<module>:18 - Skipping import of pydantic_models for benchmarking since not running in CI environment
-2026-06-04 16:57:50.736 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
-2026-06-04 16:57:50.737 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:50.737 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:50.952 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:209)
-2026-06-04 16:57:51.224 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
-2026-06-04 16:57:51.224 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:51.224 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:51.756 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
-2026-06-04 16:57:51.757 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:51.757 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
-2026-06-04 16:57:51.971 | info     |             UMD | Harvesting mask for chip 1 is 0xc0 (NOC0: 0xc0, simulated harvesting mask: 0x0). (cluster.cpp:413)
-2026-06-04 16:57:52.161 | info     |             UMD | Harvesting mask for chip 0 is 0xc0 (NOC0: 0xc0, simulated harvesting mask: 0x0). (cluster.cpp:413)
-2026-06-04 16:57:52.242 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 1] and remote chip ids {} (cluster.cpp:257)
-2026-06-04 16:57:52.242 | warning  |             UMD | Firmware version 19.6.0 on the system is newer than the maximum supported version 19.0.0 for blackhole architecture. New features may not be supported. (cluster.cpp:215)
-2026-06-04 16:57:52.242 | info     |             UMD | All devices in cluster running firmware version: 19.6.0 (cluster.cpp:235)
-2026-06-04 16:57:52.243 | info     |             UMD | IOMMU: disabled (cluster.cpp:177)
-2026-06-04 16:57:52.243 | info     |             UMD | KMD version: 2.8.1 (cluster.cpp:180)
-2026-06-04 16:57:52.247 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f8480000000 and size 0x40000000 pinned to physical address 0x2c0000000 (pci_device.cpp:536)
-2026-06-04 16:57:52.248 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f8440000000 and size 0x40000000 pinned to physical address 0x240000000 (pci_device.cpp:536)
-2026-06-04 16:57:52.248 | info     |             UMD | Device: 0 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x2c0000000 (blackhole_tt_device.cpp:95)
-2026-06-04 16:57:52.248 | info     |             UMD | Device: 0 Mapped iATU region 1 from 0x40000000 to 0x7fffffff to 0x240000000 (blackhole_tt_device.cpp:95)
-2026-06-04 16:57:52.249 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f8d00000000 and size 0x40000000 pinned to physical address 0x300000000 (pci_device.cpp:536)
-2026-06-04 16:57:52.250 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f8cc0000000 and size 0x40000000 pinned to physical address 0x280000000 (pci_device.cpp:536)
-2026-06-04 16:57:52.250 | info     |             UMD | Device: 1 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x300000000 (blackhole_tt_device.cpp:95)
-2026-06-04 16:57:52.250 | info     |             UMD | Device: 1 Mapped iATU region 1 from 0x40000000 to 0x7fffffff to 0x280000000 (blackhole_tt_device.cpp:95)
+collecting ... 2026-06-05 12:44:11.304 | WARNING  | models.perf.benchmarking_utils:<module>:18 - Skipping import of pydantic_models for benchmarking since not running in CI environment
+2026-06-05 12:44:41.977 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
+2026-06-05 12:44:41.978 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:41.978 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:42.097 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:209)
+2026-06-05 12:44:42.271 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
+2026-06-05 12:44:42.272 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:42.272 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:42.587 | info     |             UMD | Established cluster ETH FW version: 1.8.1 (topology_discovery_blackhole.cpp:295)
+2026-06-05 12:44:42.587 | warning  |             UMD | Chip 1 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:42.587 | warning  |             UMD | Chip 0 has inconsistent Tensix harvesting information between harvest mask and number of harvested. Board p150 expects 0 units, but harvest mask indicates 2 units. (cluster_descriptor.cpp:1306)
+2026-06-05 12:44:42.705 | info     |             UMD | Harvesting mask for chip 1 is 0xc0 (NOC0: 0xc0, simulated harvesting mask: 0x0). (cluster.cpp:413)
+2026-06-05 12:44:42.848 | info     |             UMD | Harvesting mask for chip 0 is 0xc0 (NOC0: 0xc0, simulated harvesting mask: 0x0). (cluster.cpp:413)
+2026-06-05 12:44:42.895 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 1] and remote chip ids {} (cluster.cpp:257)
+2026-06-05 12:44:42.896 | warning  |             UMD | Firmware version 19.6.0 on the system is newer than the maximum supported version 19.0.0 for blackhole architecture. New features may not be supported. (cluster.cpp:215)
+2026-06-05 12:44:42.896 | info     |             UMD | All devices in cluster running firmware version: 19.6.0 (cluster.cpp:235)
+2026-06-05 12:44:42.896 | info     |             UMD | IOMMU: disabled (cluster.cpp:177)
+2026-06-05 12:44:42.896 | info     |             UMD | KMD version: 2.8.1 (cluster.cpp:180)
+2026-06-05 12:44:42.898 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f2080000000 and size 0x40000000 pinned to physical address 0x2c0000000 (pci_device.cpp:536)
+2026-06-05 12:44:42.898 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f2040000000 and size 0x40000000 pinned to physical address 0x240000000 (pci_device.cpp:536)
+2026-06-05 12:44:42.898 | info     |             UMD | Device: 0 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x2c0000000 (blackhole_tt_device.cpp:95)
+2026-06-05 12:44:42.898 | info     |             UMD | Device: 0 Mapped iATU region 1 from 0x40000000 to 0x7fffffff to 0x240000000 (blackhole_tt_device.cpp:95)
+2026-06-05 12:44:42.899 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f2940000000 and size 0x40000000 pinned to physical address 0x300000000 (pci_device.cpp:536)
+2026-06-05 12:44:42.900 | info     |             UMD | Pinning pages for Hugepage: virtual address 0x7f2900000000 and size 0x40000000 pinned to physical address 0x280000000 (pci_device.cpp:536)
+2026-06-05 12:44:42.900 | info     |             UMD | Device: 1 Mapped iATU region 0 from 0x0 to 0x3fffffff to 0x300000000 (blackhole_tt_device.cpp:95)
+2026-06-05 12:44:42.900 | info     |             UMD | Device: 1 Mapped iATU region 1 from 0x40000000 to 0x7fffffff to 0x280000000 (blackhole_tt_device.cpp:95)
 collected 1 item
 
-models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1] 2026-06-04 16:57:52.762 | DEBUG    | ttnn.device:__init__:150 - Using default dispatch core type for this system: DispatchCoreType.WORKER
-2026-06-04 16:57:52.763 | DEBUG    | ttnn.device:__init__:152 - Using default dispatch core axis for this system: DispatchCoreAxis.COL
-2026-06-04 16:57:52.764 | info     |          Fabric | TopologyMapper mapping start (mesh=0): n_log=2, n_phys=2, log_deg_hist={1:2}, phys_deg_hist={1:2} (topology_mapper.cpp:574)
-2026-06-04 16:57:52.764 | info     |          Fabric | Fast-path path-graph mapping succeeded for mesh 0 (topology_mapper.cpp:777)
-2026-06-04 16:57:54.453 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_pool.cpp:303)
-2026-06-04 16:57:54.480 | info     |           Metal | Profiler started on device 0 (device_pool.cpp:203)
-2026-06-04 16:57:57.724 | DEBUG    | conftest:mesh_device:412 - multidevice with 1 devices is created
-2026-06-04 16:57:57.730 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1008 - Start profiler
-2026-06-04 16:57:57.730 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1012 - Reading inputs...
-2026-06-04 16:57:57.736 | INFO     | models.tt_transformers.tt.model_config:__init__:501 - Inferring device name: P150
-2026-06-04 16:57:57.737 | INFO     | models.tt_transformers.tt.model_config:__init__:571 - Checkpoint directory: meta-llama/Llama-3.1-8B-Instruct
-2026-06-04 16:57:57.737 | INFO     | models.tt_transformers.tt.model_config:__init__:572 - Tokenizer file: meta-llama/Llama-3.1-8B-Instruct/tokenizer.model
-2026-06-04 16:57:57.737 | INFO     | models.tt_transformers.tt.model_config:__init__:573 - Cache directory: model_cache/meta-llama/Llama-3.1-8B-Instruct/P150
-2026-06-04 16:57:57.737 | INFO     | models.tt_transformers.tt.model_config:__init__:574 - Model name: Llama-3.1-8B-Instruct
-2026-06-04 16:57:58.132 | INFO     | models.tt_transformers.tt.model_config:_set_params_from_dict:1605 - Model name from config: Llama-3.1-8B-Instruct
-2026-06-04 16:57:58.132 | WARNING  | models.tt_transformers.tt.model_config:__init__:639 - Unknown model Llama-3.1-8B-Instruct on device P150, setting MAX_PREFILL_CHUNK_SIZE to 4 for compatibility
-2026-06-04 16:57:58.132 | WARNING  | models.tt_transformers.tt.model_config:__init__:642 - Try setting MAX_PREFILL_CHUNK_SIZE to larger powers of 2 up to e.g. 128 for faster performance (if you run out of L1 memory it was too high)
-2026-06-04 16:57:58.133 | INFO     | models.tt_transformers.tt.model_config:_precision_factory:3062 - Model Llama-3.1-8B-Instruct requires specific TensorPrecision and OpFidelity configuration, using /home/masterjunmo/codes/tt-metal/models/tt_transformers/model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json
-2026-06-04 16:57:58.133 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2430 - Tokenizer path: meta-llama/Llama-3.1-8B-Instruct
-2026-06-04 16:57:58.133 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2431 - Model name: Llama-3.1-8B-Instruct
-2026-06-04 16:57:58.133 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2432 - Base model name: Llama-3.1-8B
-2026-06-04 16:57:59.026 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2440 - Successfully loaded tokenizer from meta-llama/Llama-3.1-8B-Instruct
-2026-06-04 16:58:01.422 | INFO     | models.tt_transformers.tt.model_config:create_processor:2512 - Successfully loaded processor from meta-llama/Llama-3.1-8B-Instruct
-2026-06-04 16:58:01.424 | INFO     | models.tt_transformers.tt.model_config:__init__:1375 - Attention grid: ttnn.CoreGrid(x=8, y=4)
-2026-06-04 16:58:01.424 | INFO     | models.tt_transformers.tt.model_config:__init__:1376 - MLP grid: ttnn.CoreGrid(x=8, y=8)
-2026-06-04 16:58:01.424 | INFO     | models.tt_transformers.tt.model_config:__init__:1377 - MLP prefill grids @ 32: w1/w3: (8, 8), w2: (8, 8)
-2026-06-04 16:58:01.424 | INFO     | models.tt_transformers.tt.model_config:__init__:1378 - MLP prefill grids @ max_seq_len(2048): w1/w3: (8, 8), w2: (8, 8)
-2026-06-04 16:58:01.424 | INFO     | models.tt_transformers.tt.model_config:__init__:1381 - LM head grid: ttnn.CoreGrid(x=8, y=8)
-Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 96.35it/s]
-2026-06-04 16:58:03.105 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/tok_embeddings.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128256, 4096])
-  0%|          | 0/2 [00:00<?, ?it/s]2026-06-04 16:58:03.139 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention.wqkv_sharded_2d_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 6144])
-2026-06-04 16:58:03.143 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention.wo_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 4096])
-2026-06-04 16:58:03.145 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
-2026-06-04 16:58:03.146 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
-2026-06-04 16:58:03.159 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w1_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
-2026-06-04 16:58:03.170 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w2_sharded_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([14336, 4096])
-2026-06-04 16:58:03.177 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w3_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
-2026-06-04 16:58:03.177 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.177 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.178 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.ffn_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.178 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.ffn_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.201 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention.wqkv_sharded_2d_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 6144])
-2026-06-04 16:58:03.206 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention.wo_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 4096])
-2026-06-04 16:58:03.208 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
-2026-06-04 16:58:03.208 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
-2026-06-04 16:58:03.221 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w1_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
-2026-06-04 16:58:03.233 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w2_sharded_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([14336, 4096])
-2026-06-04 16:58:03.239 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w3_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
-2026-06-04 16:58:03.239 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.240 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.240 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.ffn_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.240 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.ffn_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-100%|██████████| 2/2 [00:00<00:00, 15.86it/s]100%|██████████| 2/2 [00:00<00:00, 15.83it/s]
-2026-06-04 16:58:03.241 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.241 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
-2026-06-04 16:58:03.391 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_0_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:03.547 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_1_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:03.698 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_2_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:03.885 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_3_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:04.062 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_4_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:04.215 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_5_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:04.372 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_6_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:04.542 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_7_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
-2026-06-04 16:58:05.234 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1080 - Starting inference...
-2026-06-04 16:58:05.234 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1082 - Processing batch 0
-2026-06-04 16:58:05.262 | INFO     | models.tt_transformers.tt.common:preprocess_inputs_prefill:165 - Encoded prompt lengths:896
-2026-06-04 16:58:05.262 | INFO     | models.tt_transformers.tt.common:preprocess_inputs_prefill:217 - # of users: 1
-2026-06-04 16:58:05.263 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1120 - Starting prefill warmup...
-2026-06-04 16:58:05.264 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:242 - Prefilling User 1 up to 896 tokens
-2026-06-04 16:58:05.264 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:252 - Prefill seq len: 1024, max_prefill_chunk_size: 4096, trace: False
-2026-06-04 16:58:29.103 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:325 - Finished prefill for all users up to 896 tokens, Starting decode...
-2026-06-04 16:58:29.104 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1131 - Finished prefill warmup
-2026-06-04 16:58:29.104 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1133 - Starting prefill...
-2026-06-04 16:58:29.104 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:242 - Prefilling User 1 up to 896 tokens
-2026-06-04 16:58:29.105 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:252 - Prefill seq len: 1024, max_prefill_chunk_size: 4096, trace: False
-2026-06-04 16:58:29.120 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:325 - Finished prefill for all users up to 896 tokens, Starting decode...
-2026-06-04 16:58:29.121 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1144 - Prefill finished
-2026-06-04 16:58:29.121 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1189 - Starting decode loop...
-2026-06-04 16:59:03.960 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 0: 34838ms @ 0.0 tok/s/user (0.0 tok/s throughput)
-2026-06-04 16:59:03.962 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...y access behind useful computation often mattered more than raw access speed. Caches,-prependanon
-2026-06-04 16:59:03.993 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 1: 31ms @ 32.4 tok/s/user (32.4 tok/s throughput)
-2026-06-04 16:59:03.995 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...cess behind useful computation often mattered more than raw access speed. Caches,-prependanonstru
-2026-06-04 16:59:04.029 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 2: 34ms @ 29.6 tok/s/user (29.6 tok/s throughput)
-2026-06-04 16:59:04.031 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...s behind useful computation often mattered more than raw access speed. Caches,-prependanonstruاقع
-2026-06-04 16:59:04.064 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 3: 33ms @ 30.5 tok/s/user (30.5 tok/s throughput)
-2026-06-04 16:59:04.066 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...nd useful computation often mattered more than raw access speed. Caches,-prependanonstruاقعichick
-2026-06-04 16:59:04.097 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 4: 31ms @ 32.3 tok/s/user (32.3 tok/s throughput)
-2026-06-04 16:59:04.099 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...eful computation often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle
-2026-06-04 16:59:04.132 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 5: 33ms @ 30.6 tok/s/user (30.6 tok/s throughput)
-2026-06-04 16:59:04.133 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...ation often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled
-2026-06-04 16:59:04.165 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 6: 31ms @ 31.8 tok/s/user (31.8 tok/s throughput)
-2026-06-04 16:59:04.167 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...ion often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled�이
-2026-06-04 16:59:04.200 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 7: 33ms @ 30.6 tok/s/user (30.6 tok/s throughput)
-2026-06-04 16:59:04.201 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled�이лага
-2026-06-04 16:59:04.202 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1283 - Finished decoding, printing the final outputs...
+models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1] 2026-06-05 12:44:43.261 | DEBUG    | ttnn.device:__init__:150 - Using default dispatch core type for this system: DispatchCoreType.WORKER
+2026-06-05 12:44:43.261 | DEBUG    | ttnn.device:__init__:152 - Using default dispatch core axis for this system: DispatchCoreAxis.COL
+2026-06-05 12:44:43.262 | info     |          Fabric | TopologyMapper mapping start (mesh=0): n_log=2, n_phys=2, log_deg_hist={1:2}, phys_deg_hist={1:2} (topology_mapper.cpp:574)
+2026-06-05 12:44:43.262 | info     |          Fabric | Fast-path path-graph mapping succeeded for mesh 0 (topology_mapper.cpp:777)
+2026-06-05 12:44:43.265 | info     |    BuildKernels | Skipping deleting built cache (build.cpp:119)
+2026-06-05 12:44:44.848 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_pool.cpp:303)
+2026-06-05 12:44:44.867 | info     |           Metal | Profiler started on device 0 (device_pool.cpp:203)
+2026-06-05 12:44:48.071 | DEBUG    | conftest:mesh_device:412 - multidevice with 1 devices is created
+2026-06-05 12:44:48.075 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1008 - Start profiler
+2026-06-05 12:44:48.075 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1012 - Reading inputs...
+2026-06-05 12:44:48.082 | INFO     | models.tt_transformers.tt.model_config:__init__:501 - Inferring device name: P150
+2026-06-05 12:44:48.082 | INFO     | models.tt_transformers.tt.model_config:__init__:571 - Checkpoint directory: meta-llama/Llama-3.1-8B-Instruct
+2026-06-05 12:44:48.082 | INFO     | models.tt_transformers.tt.model_config:__init__:572 - Tokenizer file: meta-llama/Llama-3.1-8B-Instruct/tokenizer.model
+2026-06-05 12:44:48.083 | INFO     | models.tt_transformers.tt.model_config:__init__:573 - Cache directory: model_cache/meta-llama/Llama-3.1-8B-Instruct/P150
+2026-06-05 12:44:48.083 | INFO     | models.tt_transformers.tt.model_config:__init__:574 - Model name: Llama-3.1-8B-Instruct
+2026-06-05 12:44:48.447 | INFO     | models.tt_transformers.tt.model_config:_set_params_from_dict:1605 - Model name from config: Llama-3.1-8B-Instruct
+2026-06-05 12:44:48.447 | WARNING  | models.tt_transformers.tt.model_config:__init__:639 - Unknown model Llama-3.1-8B-Instruct on device P150, setting MAX_PREFILL_CHUNK_SIZE to 4 for compatibility
+2026-06-05 12:44:48.447 | WARNING  | models.tt_transformers.tt.model_config:__init__:642 - Try setting MAX_PREFILL_CHUNK_SIZE to larger powers of 2 up to e.g. 128 for faster performance (if you run out of L1 memory it was too high)
+2026-06-05 12:44:48.448 | INFO     | models.tt_transformers.tt.model_config:_precision_factory:3062 - Model Llama-3.1-8B-Instruct requires specific TensorPrecision and OpFidelity configuration, using /home/masterjunmo/codes/tt-metal/models/tt_transformers/model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json
+2026-06-05 12:44:48.448 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2430 - Tokenizer path: meta-llama/Llama-3.1-8B-Instruct
+2026-06-05 12:44:48.448 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2431 - Model name: Llama-3.1-8B-Instruct
+2026-06-05 12:44:48.448 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2432 - Base model name: Llama-3.1-8B
+2026-06-05 12:44:49.151 | INFO     | models.tt_transformers.tt.model_config:create_tokenizer:2440 - Successfully loaded tokenizer from meta-llama/Llama-3.1-8B-Instruct
+2026-06-05 12:44:51.300 | INFO     | models.tt_transformers.tt.model_config:create_processor:2512 - Successfully loaded processor from meta-llama/Llama-3.1-8B-Instruct
+2026-06-05 12:44:51.301 | INFO     | models.tt_transformers.tt.model_config:__init__:1375 - Attention grid: ttnn.CoreGrid(x=8, y=4)
+2026-06-05 12:44:51.301 | INFO     | models.tt_transformers.tt.model_config:__init__:1376 - MLP grid: ttnn.CoreGrid(x=8, y=8)
+2026-06-05 12:44:51.301 | INFO     | models.tt_transformers.tt.model_config:__init__:1377 - MLP prefill grids @ 32: w1/w3: (8, 8), w2: (8, 8)
+2026-06-05 12:44:51.301 | INFO     | models.tt_transformers.tt.model_config:__init__:1378 - MLP prefill grids @ max_seq_len(2048): w1/w3: (8, 8), w2: (8, 8)
+2026-06-05 12:44:51.301 | INFO     | models.tt_transformers.tt.model_config:__init__:1381 - LM head grid: ttnn.CoreGrid(x=8, y=8)
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 100.48it/s]
+2026-06-05 12:44:55.080 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/tok_embeddings.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128256, 4096])
+  0%|          | 0/2 [00:00<?, ?it/s]2026-06-05 12:44:55.216 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention.wqkv_sharded_2d_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 6144])
+2026-06-05 12:44:55.292 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention.wo_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 4096])
+2026-06-05 12:44:55.299 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
+2026-06-05 12:44:55.301 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
+2026-06-05 12:44:55.401 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w1_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
+2026-06-05 12:44:55.679 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w2_sharded_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([14336, 4096])
+2026-06-05 12:44:55.782 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.feed_forward.w3_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
+2026-06-05 12:44:55.783 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:55.783 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.attention_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:55.784 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.ffn_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:55.784 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.0.ffn_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+ 50%|█████     | 1/2 [00:00<00:00,  1.45it/s]2026-06-05 12:44:55.901 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention.wqkv_sharded_2d_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 6144])
+2026-06-05 12:44:55.976 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention.wo_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 1, 4096, 4096])
+2026-06-05 12:44:55.979 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
+2026-06-05 12:44:55.980 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/kvcache_torch.Size([1, 8, 2048, 128])_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([1, 8, 2048, 128])
+2026-06-05 12:44:56.086 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w1_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
+2026-06-05 12:44:56.362 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w2_sharded_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([14336, 4096])
+2026-06-05 12:44:56.462 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.feed_forward.w3_sharded_dtype_BFLOAT4_B_layout_TILE.tensorbin of shape Shape([4096, 14336])
+2026-06-05 12:44:56.463 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:56.464 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.attention_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:56.464 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.ffn_norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:56.465 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/layers.1.ffn_norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+100%|██████████| 2/2 [00:01<00:00,  1.46it/s]100%|██████████| 2/2 [00:01<00:00,  1.46it/s]
+2026-06-05 12:44:56.466 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/norm.weight_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:56.466 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/norm.weight_distributed_dtype_BFLOAT16_layout_ROW_MAJOR.tensorbin of shape Shape([1, 1, 128, 32])
+2026-06-05 12:44:56.815 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_0_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:57.153 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_1_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:57.489 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_2_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:57.852 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_3_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:58.202 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_4_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:58.535 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_5_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:58.867 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_6_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:59.198 | DEBUG    | core:as_tensor:672 - Loaded cache for model_cache/meta-llama/Llama-3.1-8B-Instruct/P150/tensor_cache_instruct_bfp8/output_lm_head_8_split_shard_7_16032_dtype_BFLOAT8_B_layout_TILE.tensorbin of shape Shape([4096, 16032])
+2026-06-05 12:44:59.868 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1080 - Starting inference...
+2026-06-05 12:44:59.869 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1082 - Processing batch 0
+2026-06-05 12:44:59.897 | INFO     | models.tt_transformers.tt.common:preprocess_inputs_prefill:165 - Encoded prompt lengths:896
+2026-06-05 12:44:59.897 | INFO     | models.tt_transformers.tt.common:preprocess_inputs_prefill:217 - # of users: 1
+2026-06-05 12:44:59.899 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1120 - Starting prefill warmup...
+2026-06-05 12:44:59.899 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:242 - Prefilling User 1 up to 896 tokens
+2026-06-05 12:44:59.899 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:252 - Prefill seq len: 1024, max_prefill_chunk_size: 4096, trace: False
+2026-06-05 12:45:23.680 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:325 - Finished prefill for all users up to 896 tokens, Starting decode...
+2026-06-05 12:45:23.680 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1131 - Finished prefill warmup
+2026-06-05 12:45:23.680 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1133 - Starting prefill...
+2026-06-05 12:45:23.681 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:242 - Prefilling User 1 up to 896 tokens
+2026-06-05 12:45:23.681 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:252 - Prefill seq len: 1024, max_prefill_chunk_size: 4096, trace: False
+2026-06-05 12:45:23.696 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:325 - Finished prefill for all users up to 896 tokens, Starting decode...
+2026-06-05 12:45:23.696 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1144 - Prefill finished
+2026-06-05 12:45:23.697 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1189 - Starting decode loop...
+2026-06-05 12:45:58.266 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 0: 34569ms @ 0.0 tok/s/user (0.0 tok/s throughput)
+2026-06-05 12:45:58.269 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...y access behind useful computation often mattered more than raw access speed. Caches,-prependanon
+2026-06-05 12:45:58.300 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 1: 31ms @ 32.6 tok/s/user (32.6 tok/s throughput)
+2026-06-05 12:45:58.302 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...cess behind useful computation often mattered more than raw access speed. Caches,-prependanonstru
+2026-06-05 12:45:58.335 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 2: 32ms @ 30.9 tok/s/user (30.9 tok/s throughput)
+2026-06-05 12:45:58.337 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...s behind useful computation often mattered more than raw access speed. Caches,-prependanonstruاقع
+2026-06-05 12:45:58.370 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 3: 33ms @ 30.7 tok/s/user (30.7 tok/s throughput)
+2026-06-05 12:45:58.371 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...nd useful computation often mattered more than raw access speed. Caches,-prependanonstruاقعichick
+2026-06-05 12:45:58.403 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 4: 32ms @ 31.5 tok/s/user (31.5 tok/s throughput)
+2026-06-05 12:45:58.405 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...eful computation often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle
+2026-06-05 12:45:58.437 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 5: 32ms @ 31.2 tok/s/user (31.2 tok/s throughput)
+2026-06-05 12:45:58.439 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...ation often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled
+2026-06-05 12:45:58.472 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 6: 32ms @ 30.8 tok/s/user (30.8 tok/s throughput)
+2026-06-05 12:45:58.473 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...ion often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled�이
+2026-06-05 12:45:58.506 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1244 - Iteration 7: 30ms @ 32.9 tok/s/user (32.9 tok/s throughput)
+2026-06-05 12:45:58.508 | DEBUG    | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - [User 0] ...often mattered more than raw access speed. Caches,-prependanonstruاقعichickaddle Decompiled�이лага
+2026-06-05 12:45:58.508 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1283 - Finished decoding, printing the final outputs...
 
-2026-06-04 16:59:04.209 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1300 -
+2026-06-05 12:45:58.514 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1300 -
 ==REPEAT BATCH 0
 ==USER 0 - PROMPT
 The history of computing hardware spans developments from early mechanical calculating devices to mo
@@ -147,16 +148,16 @@ at hiding memory access behind useful computation often mattered more than raw a
 ==USER 0 - OUTPUT
 -prependanonstruاقعichickaddle Decompiled�이лага
 
-2026-06-04 16:59:04.209 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1404 -
-2026-06-04 16:59:04.209 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1405 - === Performance metrics ===
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1407 - 1st token decode time: 30.83ms [32.44 t/s/u, 32.44 t/s]
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1424 - ==
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1425 - Prefill compile time: 23.84s
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1426 - Decode compile time: 34.84s
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1427 -
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1428 - Average Time to First Token (TTFT): 16.82ms
-2026-06-04 16:59:04.210 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1429 - Average speed: 32.16ms @ 31.1 tok/s/user (31.1 tok/s throughput)
-2026-06-04 16:59:04.211 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1450 - Model Llama-3.1-8B does not have prefill targets set for device P150
+2026-06-05 12:45:58.514 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1404 -
+2026-06-05 12:45:58.514 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1405 - === Performance metrics ===
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1407 - 1st token decode time: 30.66ms [32.62 t/s/u, 32.62 t/s]
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1424 - ==
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1425 - Prefill compile time: 23.78s
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1426 - Decode compile time: 34.57s
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1427 -
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1428 - Average Time to First Token (TTFT): 16.01ms
+2026-06-05 12:45:58.515 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1429 - Average speed: 31.75ms @ 31.49 tok/s/user (31.49 tok/s throughput)
+2026-06-05 12:45:58.516 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1450 - Model Llama-3.1-8B does not have prefill targets set for device P150
 PASSED
 
 =============================== warnings summary ===============================
@@ -180,30 +181,30 @@ python_env/lib/python3.10/site-packages/llama_models/llama3/api/datatypes.py:162
 ==================================== PASSES ====================================
 - generated xml file: /home/masterjunmo/codes/tt-metal/generated/test_reports/most_recent_tests.xml -
 ============================== slowest durations ===============================
-66.48s call     models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
-5.28s setup    models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
-5.09s teardown models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
+70.44s call     models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
+5.41s teardown models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
+5.02s setup    models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
 =========================== short test summary info ============================
 PASSED models/tt_transformers/demo/simple_text_demo.py::test_demo_text[blackhole-mesh_device0-device_params0-performance-batch-1]
-=================== 1 passed, 4 warnings in 80.46s (0:01:20) ===================
-2026-06-04 16:59:11.551 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:425)
+================== 1 passed, 4 warnings in 112.67s (0:01:52) ===================
+2026-06-05 12:46:05.936 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:425)
 
-Queue delay: 29 ns
+Queue delay: 26 ns
 Timer resolution: 9 ns
 
 Frames: 2
-Time span: 3:44.3
-Zones: 799,316
-Elapsed time: 1:27.2
+Time span: 2:57.5
+Zones: 771,284
+Elapsed time: 1:58.5
 Saving trace... done!
-Trace size 12.27 MB (31.69% ratio)
-2026-06-04 16:59:13.087 | INFO     | tracy:generate_report:154 - Host side ops time report generated at /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_ops_times.csv
-2026-06-04 16:59:13.147 | INFO     | tracy:generate_report:165 - Host side ops data report generated at /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_ops_data.csv
-2026-06-04 16:59:13.148 | INFO     | tracy.process_ops_logs:import_tracy_op_logs:111 - Importing ops logs
-2026-06-04 16:59:16.503 | INFO     | tracy.process_ops_logs:get_device_op_data:255 - Getting device ops
-2026-06-04 16:59:16.505 | INFO     | tracy.process_ops_logs:append_device_data:292 - Appending device data
-2026-06-04 16:59:22.368 | INFO     | tracy.process_device_log:core_to_device_timeseries:413 - Importing Data For Device Number : 0
-2026-06-04 16:59:46.068 | INFO     | tracy.process_ops_logs:generate_reports:646 - OPs' perf analysis is finished! Generating reports ...
-2026-06-04 16:59:46.069 | INFO     | tracy.process_ops_logs:generate_reports:664 - Copying runtime artifacts
-2026-06-04 16:59:46.196 | INFO     | tracy.process_ops_logs:generate_reports:673 - Generating OPs CSV
-2026-06-04 16:59:46.287 | INFO     | tracy.process_ops_logs:generate_reports:909 - OPs csv generated at: /home/masterjunmo/codes/tt-metal/generated/profiler/reports/2026_06_04_16_59_46/ops_perf_results_2026_06_04_16_59_46.csv
+Trace size 11.92 MB (31.69% ratio)
+2026-06-05 12:46:07.293 | INFO     | tracy:generate_report:154 - Host side ops time report generated at /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_ops_times.csv
+2026-06-05 12:46:07.350 | INFO     | tracy:generate_report:165 - Host side ops data report generated at /home/masterjunmo/codes/tt-metal/generated/profiler/.logs/tracy_ops_data.csv
+2026-06-05 12:46:07.351 | INFO     | tracy.process_ops_logs:import_tracy_op_logs:111 - Importing ops logs
+2026-06-05 12:46:10.516 | INFO     | tracy.process_ops_logs:get_device_op_data:255 - Getting device ops
+2026-06-05 12:46:10.517 | INFO     | tracy.process_ops_logs:append_device_data:292 - Appending device data
+2026-06-05 12:46:15.302 | INFO     | tracy.process_device_log:core_to_device_timeseries:413 - Importing Data For Device Number : 0
+2026-06-05 12:46:38.615 | INFO     | tracy.process_ops_logs:generate_reports:646 - OPs' perf analysis is finished! Generating reports ...
+2026-06-05 12:46:38.615 | INFO     | tracy.process_ops_logs:generate_reports:664 - Copying runtime artifacts
+2026-06-05 12:46:38.729 | INFO     | tracy.process_ops_logs:generate_reports:673 - Generating OPs CSV
+2026-06-05 12:46:38.820 | INFO     | tracy.process_ops_logs:generate_reports:909 - OPs csv generated at: /home/masterjunmo/codes/tt-metal/generated/profiler/reports/2026_06_05_12_46_38/ops_perf_results_2026_06_05_12_46_38.csv

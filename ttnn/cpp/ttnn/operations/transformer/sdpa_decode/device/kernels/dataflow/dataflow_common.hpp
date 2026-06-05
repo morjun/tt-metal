@@ -549,6 +549,7 @@ void read_kv_mask_chunks(
     uint32_t PSt) {
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        SDPA_ZONE("RD_CHUNK");         // NCRISC: whole per-chunk K+mask+V read (DRAM path)
         uint64_t k_base_read_ptr = 0;  // hoisted so RD_V (reuse_k) sees it across the RD_K zone
         // Read K chunk transposed
         {
@@ -556,6 +557,17 @@ void read_kv_mask_chunks(
             cb_reserve_back(cb_k_in, k_chunk_tiles);
             uint32_t k_write_ptr = get_write_ptr(cb_k_in);
             k_base_read_ptr = get_noc_addr(k_write_ptr);
+            // RD_LAT probe (profiling-only): isolated single-tile DRAM read round-trip latency.
+            // MUST be fully compiled out in production — the extra read + barrier would add a
+            // per-chunk barrier to every decode and degrade latency. Guard the WHOLE block, not
+            // just the zone marker.
+#if defined(SDPA_PROFILE_ZONES)
+            {
+                SDPA_ZONE("RD_LAT");
+                noc_async_read_tile(k_start_tile_id, k_reader, k_write_ptr);
+                noc_async_read_barrier();
+            }
+#endif
             barrier_count = 0;
             for (uint32_t col = 0; col < DHt; ++col) {
                 uint32_t k_tile_id = k_start_tile_id + col;
@@ -569,7 +581,10 @@ void read_kv_mask_chunks(
                     k_write_ptr += k_tile_bytes;
                 }
             }
-            noc_async_read_barrier();
+            {
+                SDPA_ZONE("RD_KBAR");
+                noc_async_read_barrier();
+            }  // NCRISC: K memory-wait (final barrier)
             cb_push_back(cb_k_in, k_chunk_tiles);
         }  // end RD_K
 
@@ -722,6 +737,11 @@ void read_kv_mask_chunks_n_tier(
     // read garbage and the output to degenerate into repetition. Ceiling here lets
     // l1_only attend purely from L1 (no DRAM read), so DRAM writes can be skipped entirely.
     const uint32_t cur_pos_hi_tile_ceil = (cur_pos_tokens + 1u + TILE_HEIGHT_LOCAL - 1u) / TILE_HEIGHT_LOCAL;
+    // ring_wrapped=false  ⟺ the whole context fits in sink+ring with no wrap (the interleaved
+    // l1_only full-resident case). In that case the ring map is the identity (flat_tile = gst),
+    // so find_tier below skips the per-tile runtime modulo `% ring_tile_count` (a SW divide on
+    // RISC-V). The modulo is only needed when the ring genuinely wraps (hybrid long-context).
+    const bool ring_wrapped = !(cur_pos_tokens + 1u <= sink_tokens + ring_tokens);
     if (cur_pos_tokens + 1u <= sink_tokens + ring_tokens) {
         // No ring wrap yet: fresh ring range is [sink_tile_count, ceil((cur_pos+1)/TILE_HEIGHT)).
         fresh_lo_tile = sink_tile_count;
@@ -760,12 +780,22 @@ void read_kv_mask_chunks_n_tier(
 
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
-        SDPA_ZONE("RD_CHUNK");  // NCRISC: whole per-chunk K+V read (n-tier / L1 path)
+        SDPA_ZONE("RD_CHUNK");  // NCRISC: whole per-chunk K+mask+V read (n-tier / L1 path)
         uint32_t chunk_seq_tile = k_chunk * Sk_chunk_t;
 
         cb_reserve_back(cb_k_in, k_chunk_tiles);
         uint32_t k_write_ptr = get_write_ptr(cb_k_in);
         uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
+        // RD_LAT probe (profiling-only): isolated single-tile L1 read round-trip latency.
+        // MUST be fully compiled out in production (extra read + barrier per chunk). Guard the
+        // WHOLE block, not just the zone marker.
+#if defined(SDPA_PROFILE_ZONES)
+        {
+            SDPA_ZONE("RD_LAT");
+            noc_async_read_tile(l1_kv_head_base * tier_size_tiles[0] * DHt, l1_k0_rd, k_write_ptr);
+            noc_async_read_barrier();
+        }
+#endif
         barrier_count = 0;
 
         // Helper lambda: given global sequence tile gst, return (tier_idx, flat_tile)
@@ -785,8 +815,14 @@ void read_kv_mask_chunks_n_tier(
                 // Sink tile — direct map.
                 flat_tile = gst;
             } else if (gst >= fresh_lo_tile && gst < fresh_hi_tile && ring_tile_count > 0) {
-                // Ring tile — modular ring map within the ring region.
-                flat_tile = sink_tile_count + ((gst - sink_tile_count) % ring_tile_count);
+                // Ring tile — modular ring map within the ring region. When the ring has not
+                // wrapped (interleaved l1_only full-resident), the map is the identity, so skip
+                // the per-tile SW-divide modulo. Only the genuinely-wrapped ring pays it.
+                if (!ring_wrapped) {
+                    flat_tile = gst;
+                } else {
+                    flat_tile = sink_tile_count + ((gst - sink_tile_count) % ring_tile_count);
+                }
             } else {
                 return 0xFFFFFFFFu;
             }
@@ -869,7 +905,10 @@ void read_kv_mask_chunks_n_tier(
                 }
             }
         }
-        noc_async_read_barrier();
+        {
+            SDPA_ZONE("RD_KBAR");
+            noc_async_read_barrier();
+        }  // NCRISC: K memory-wait (final barrier)
         cb_push_back(cb_k_in, k_chunk_tiles);
 
         if constexpr (use_attention_mask) {
@@ -1045,7 +1084,10 @@ void read_kv_mask_chunks_dual_source(
                 }
             }
         }
-        noc_async_read_barrier();
+        {
+            SDPA_ZONE("RD_KBAR");
+            noc_async_read_barrier();
+        }  // NCRISC: K memory-wait (final barrier)
         cb_push_back(cb_k_in, k_chunk_tiles);
 
         if constexpr (use_attention_mask) {

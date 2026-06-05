@@ -176,3 +176,7 @@ research_codes/documents/l1_kv_cache_cache/reprofile/l1_1792/run.log
 research_codes/documents/l1_kv_cache_cache/reprofile/l1_512/run.log
 run_960_l1.log
 run_original.log
+research_codes/documents/l1_kv_cache_cache/reprofile/*.log
+research_codes/documents/l1_kv_cache_cache/reprofile/*/*.log
+research_codes/documents/l1_kv_cache_cache/reprofile/zones2_dram_896/run.log
+research_codes/documents/l1_kv_cache_cache/reprofile/zones2_l1only_896/run.log

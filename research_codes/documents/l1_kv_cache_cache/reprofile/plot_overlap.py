@@ -86,7 +86,9 @@ zone_color = {
     "SM_RESCALE": "#17becf",  # SFPU = green/cyan
     "CMP_CHUNK": "#cccccc",
 }
-read_src = "L1" if any(z["zone"] == "RD_CHUNK" for z in items) else "DRAM"
+# both readers now emit RD_CHUNK, so infer source from arg or path (not zone name)
+read_src = sys.argv[3] if len(sys.argv) > 3 else ("L1" if "l1only" in path else "DRAM")
+has_rdchunk = any(z["zone"] == "RD_CHUNK" for z in items)
 lanes = []
 for risc, kind in lane_order:
     if any(i["risc"] == risc for i in items):
@@ -111,6 +113,8 @@ for li, (risc, kind) in enumerate(lanes):
             continue
         if kind == "read" and z["zone"] not in READ_ZONES:
             continue
+        if kind == "read" and has_rdchunk and z["zone"] != "RD_CHUNK":
+            continue  # draw only the whole-chunk read band, not nested RD_K/RD_V
         if kind == "cmp" and z["zone"] == "CMP_CHUNK":
             continue
         ax.broken_barh(

@@ -30,8 +30,8 @@ CX, CY, RISC, CYC, RHID, ZNAME, ZTYPE = (
     idx["type"],
 )
 
-CUSTOM = {"CMP_CHUNK", "QK_MM", "SM_NORM", "PV_MM", "SM_RESCALE", "RD_K", "RD_V", "RD_CHUNK"}
-READ_ZONES = ("RD_K", "RD_V", "RD_CHUNK")
+CUSTOM = {"CMP_CHUNK", "QK_MM", "SM_NORM", "PV_MM", "SM_RESCALE", "RD_K", "RD_V", "RD_CHUNK", "RD_KBAR", "RD_LAT"}
+READ_ZONES = ("RD_CHUNK",)  # whole-chunk read for overlap; RD_K/RD_V/RD_KBAR are nested sub-zones
 
 # (core, risc) -> stack of (zone_name, start_cycle); closed zones collected as dicts
 stacks = defaultdict(list)
@@ -154,14 +154,17 @@ for core, d in by_core.items():
 
 # read-zone breakdown by source (RD_CHUNK = L1 reader, RD_K/RD_V = DRAM reader)
 print("\n=== Read zones (NCRISC) by source ===")
-for zn in ("RD_CHUNK", "RD_K", "RD_V"):
+for zn in ("RD_LAT", "RD_KBAR", "RD_CHUNK", "RD_K", "RD_V"):
     durs = agg.get(("NCRISC", zn))
     if durs:
-        src = "L1" if zn == "RD_CHUNK" else "DRAM"
         print(
-            f"  {zn:<9} ({src:4s}): n={len(durs):4d}  total={sum(durs)*c2ns/1000:.2f}us  "
+            f"  {zn:<9}: n={len(durs):4d}  total={sum(durs)*c2ns/1000:.2f}us  "
             f"avg={statistics.mean(durs)*c2ns/1000:.3f}us"
         )
+print(
+    "  (RD_CHUNK=whole-chunk read incl mask; RD_KBAR=final K barrier=memory-wait; "
+    "issue ~= RD_CHUNK - barriers. Compare RD_CHUNK and RD_KBAR across the L1 vs DRAM runs.)"
+)
 
 print(f"\n=== Goal B: read/compute overlap ({ncores} cores with both NCRISC read + TRISC compute) ===")
 if fracs:

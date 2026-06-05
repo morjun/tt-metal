@@ -1186,6 +1186,33 @@ def test_demo_text(
 
         out_tok = prefilled_token
 
+        # Optional untimed decode warmup (env DECODE_WARMUP_ITERS=N): run N throwaway decode
+        # steps to absorb the one-time JIT compiles (decode graph + L1-KV path) and the L1 tier
+        # alloc+seed BEFORE the timed loop, so every measured decode step is steady-state. The
+        # warmup uses CLONES of (current_pos, out_tok) and does NOT advance the real state, so the
+        # real loop reproduces the same positions; any KV the warmup writes is overwritten
+        # identically by the real decode before it is read. Default 0 = off (behavior unchanged).
+        _decode_warmup_iters = int(os.environ.get("DECODE_WARMUP_ITERS", "0"))
+        if _decode_warmup_iters > 0 and mode != "prefill":
+            logger.info(
+                f"Starting decode warmup ({_decode_warmup_iters} untimed steps: absorb JIT compile + L1 alloc/seed)..."
+            )
+            w_pos = current_pos.clone()
+            w_tok = out_tok.clone()
+            for _w in range(_decode_warmup_iters):
+                w_logits = generator.decode_forward_text(
+                    w_tok,
+                    w_pos,
+                    enable_trace=enable_trace,
+                    page_table=page_table,
+                    kv_cache=tt_kv_cache,
+                    sampling_params=device_sampling_params,
+                )
+                if device_sampling_params is not None:
+                    w_tok = w_logits.unsqueeze(1)
+                w_pos = w_pos + 1
+            logger.info("Finished decode warmup")
+
         logger.info(f"Starting decode loop...")
 
         # Log total inference (accounting for compile_decode as well)
