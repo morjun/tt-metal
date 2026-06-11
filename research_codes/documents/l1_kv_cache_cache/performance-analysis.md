@@ -133,10 +133,13 @@ prompt 파일 생성(토큰 수 고정):
   N과 무관. context를 늘리면 "이미 숨은" chunk 반복만 늘 뿐 → read는 **영구히 숨는다**. DRAM 대역폭 포화도 context로는
   안 생긴다(단위시간당 바이트 = (bytes∝N)/(step time∝N) = N-불변).
 - **read가 노출되는(= L1이 latency로 이길 수 있는) 유일한 조건은 context가 아니라 per-chunk compute:read 균형이
-  뒤집힐 때**다: (1) decode matmul의 **Sq tile padding**(쿼리 1행을 32행 타일로 패딩 → effective compute 최대 ~32× 부풀림)
-  제거 시 compute 급감 → intensity ~1 FLOP/byte로 read 지배 → L1 이득; (2) sharded congested layout(8-on-1 직렬화)
-  로 read 노출(단 parity 회복이지 win 아님); (3) LM head/MLP의 DRAM 대역폭 경쟁으로 KV read starvation.
-  (KV quant은 read를 더 싸게 만들어 **더 숨김** — capacity용이지 read-latency용 아님.)
+  뒤집힐 때**다: ~~(1) decode matmul의 Sq tile padding(쿼리 1행→32행) 제거~~ **[전제 정정 2026-06-08]** — SDPA의 matmul
+  row 차원은 single token이 아니라 **query HEAD**다(`Sq_chunk_t=PNHt`, head 수 기반). 단일 chip Llama-8B는
+  `n_local_heads=32`라 32행 타일을 head가 채워 batch-1 SDPA엔 제거할 query padding이 사실상 없다. "1행→32행" padding은
+  per-token LINEAR op(QKV·o_proj·MLP·LM-head, M=batch×seq=1)의 현상이지 SDPA가 아니다(§"Multi-chip TP scope" lever 표).
+  (2) sharded congested layout(8-on-1 직렬화)로 read 노출(단 parity 회복이지 win 아님); (3) LM head/MLP의 DRAM
+  대역폭 경쟁으로 KV read starvation. 근본적으론 compute:read 비율이 HW 상수(FPU tile-MAC ~2× NoC tile-read)라
+  이를 뒤집는 건 **아키텍처(ALU↑/SRAM↓)** 뿐. (KV quant은 read를 더 싸게 만들어 **더 숨김** — capacity용이지 read-latency용 아님.)
 - 즉 관건은 layout도 "긴 context"도 아니다. **capacity(multi-chip/quant)는 긴 context를 on-chip으로 돌리는
   feasibility lever**이고, read를 병목으로 만들어 latency를 이기게 하는 lever가 **아니다**.
 - **[정정 2026-06-05] l1_only는 end-to-end에서도 DRAM을 못 이긴다**: "DRAM write 생략 ~3.5% edge"는 **철회**.
@@ -376,16 +379,40 @@ single-run은 순위가 뒤집힌다(이전 results/ 로그 flip의 원인). 단
 **N=4 (작은-표본 fluke)**: DRAM 85.33 / L1 88.85 ms → +4.1%, 분포 분리처럼 보였으나 그 DRAM 4회가 우연히
 ~85로 타이트했던 탓. **이 "reliable 4%, not a tie"는 아래 N=8로 철회됨.**
 
-**N=8 (최종, 8회씩 교대)**:
-| mode | mean | std | range |
-|---|---|---|---|
-| DRAM | **87.38 ms** | 1.94 | 84.8–90.0 |
-| L1 (interleaved l1_only) | **89.29 ms** | 1.44 | 86.9–91.0 |
+**N=8 (최종, 8회씩 교대 D/L; ctx896, 32-layer, DECODE_WARMUP_ITERS=4, max_generated_tokens 64, steady avg iters 5–63)**
 
-**L1 − DRAM = +1.91 ms (+2.2%), ~2σ, 분포 OVERLAP(86.9–90.0).** N=8에서 DRAM 실제 spread는 ~6%(84.8–90.0)다.
-→ **L1은 DRAM에 신뢰성 있게 지지 않는다 = tie within noise**(기껏해야 유의성 경계의 ~2% lean, ±6% run-to-run noise에
-묻힘). 이는 (a-3) 진단(어떤 L1 KV op도 gap을 안 짊어짐 — write 동일, read 숨김, dispatch 동일)과 일치 — 닫을 실제
-gap이 처음부터 없었다. modulo-opt도 read가 이미 숨어 end-to-end엔 안 잡힌다.
+raw runs (ms):
+- DRAM: 87.1, 89.6, 89.6, 85.9, 85.4, 90.0, 84.8, 86.6
+- L1  : 90.8, 88.5, 91.0, 89.4, 91.0, 88.0, 86.9, 88.7
+
+기술통계:
+| mode | n | mean | sample sd (n−1) | pop sd | CV | min | max | range |
+|---|---|---|---|---|---|---|---|---|
+| DRAM | 8 | **87.38 ms** | 2.08 | 1.94 | 2.4% | 84.8 | 90.0 | 5.2 (~6%) |
+| L1 (interleaved l1_only) | 8 | **89.29 ms** | 1.53 | 1.44 | 1.7% | 86.9 | 91.0 | 4.1 (~5%) |
+
+추론통계 (Welch's two-sample t-test, unequal variance):
+| 지표 | 값 |
+|---|---|
+| 차이 L1 − DRAM | **+1.91 ms (+2.2%)** |
+| 표준오차 (SE of diff) | 0.913 ms |
+| Welch t | 2.10 |
+| df (Welch–Satterthwaite) | 12.9 |
+| two-tailed p | **0.056** |
+| 95% CI (L1 − DRAM) | **[−0.06, +3.88] ms** (0 포함) |
+| Cohen's d (pooled) | 1.05 |
+| 분포 range 중첩 | OVERLAP (86.9–90.0) |
+
+**해석: α=0.05에서 유의하지 않다 (p=0.056, 95% CI가 0을 포함).** 따라서 "L1 ≠ DRAM"이라는 귀무가설 기각 불가
+→ **tie within noise.** 점추정은 L1이 +2.2% lean이고 Cohen's d=1.05(겉보기 큰 효과크기)지만, N=8·중첩 분포·CI가
+0을 가로질러 통계적으로 입증되지 않는다(경계선; 단측 p≈0.028). DRAM 자체 run-to-run CV가 2.4%(range ~6%)라
+~2% 차이는 그 noise floor 안이다. N=4의 "reliable 4%, separated"는 그 DRAM 4회가 우연히 ~85로 타이트했던
+작은-표본 fluke였다(N=4 DRAM sd 0.54 vs N=8 sd 2.08). 이는 (a-3) 진단(어떤 L1 KV op도 gap을 안 짊어짐 —
+write 동일, read 숨김, dispatch 동일)과 일치 — 닫을 실제 gap이 처음부터 없었다. modulo-opt도 read가 이미 숨어
+end-to-end엔 안 잡힌다.
+
+> 재현: `bash research_codes/documents/l1_kv_cache_cache/reprofile/run_final_eval.sh` (N=8 alternating,
+> per-run steady avg + mean/std + range-overlap). t-test/CI는 위 raw runs로 Welch 계산.
 ### (a-3) per-layer host-dispatch 분해 (TT_L1_KV_PERF, 2026-06-05) — write-dispatch 가설 **반증**
 
 32-layer L1 vs DRAM의 host-side per-section enqueue 시간(min=steady; avg/max는 warmup compile 오염이라 무시):
@@ -458,6 +485,66 @@ DEBUG 재측정), `run_960_l1.log`(`--l1_kv_mode interleaved --l1_kv_only_mode
   steady에선 DRAM와 동급이거나 약간 느림**(write 이득 없음 + n-tier reader 오버헤드). 이전의 "긴 생성 근소 우위"는 철회.
 - 992 tokens = 32-layer에서 달성된 L1 window(앞서 언급한 ~900–1000 ceiling 부근).
 
+## Multi-chip TP scope — notes.md 4개 lever 최종 판정 (2026-06-07)
+
+> `notes.md`의 "L1이 DRAM을 latency로 이길 길" 후보들을 코드 추적으로 종결한다. **결론: 단일 P150 batch-1
+> 환경에서 SW/config lever로 L1이 decode latency를 이기는 길은 없다.** 4개 항목 판정:
+
+### lever 판정 요약
+
+| notes 항목 | 판정 | 근거 (file:line) |
+|---|---|---|
+| (c) decode-matmul depad | **불가능 + 무의미 (전제 정정)** | **정정**: SDPA의 matmul row 차원은 single token이 아니라 query HEAD다(`Sq_chunk_t=PNHt=PNH/TILE_HEIGHT`, `PNH=q_shape[2]`=head 수, `program_factory.cpp:84,121`; kernel은 `cur_head`/`num_heads_per_core`로 head loop, `sdpa_flash_decode.cpp:238`). 단일 chip Llama-8B는 `n_local_heads=32`라 32행 타일을 head가 채움 → batch-1 SDPA엔 제거할 query padding이 거의 없다. "1행/31 padding"은 SDPA가 아니라 **per-token LINEAR op**(QKV proj·o_proj·MLP·LM-head, M=batch×seq=1)의 현상이고, 이는 KV read/L1과 무관. 게다가 Tensix는 32×32 tile 단위라 어느 쪽도 서브타일로 못 줄이고, trace 강제 off(`simple_text_demo.py:931`)라 decode가 dispatch-bound(~87ms/step host-queue, 32-layer device compute는 sub-ms) → device 절감이 wall-clock에 안 잡힘 |
+| (1) multi-chip TP | **latency win 불가** (아래 상세) | head-shard는 per-chip compute·read를 둘 다 1/N로 줄여 ratio 불변; KV는 replicate·local read |
+| (2) SRAM↓/ALU↑ 아키텍처 | **유효하나 HW 제언** | compute-bound(FPU 61–65% on wall TRISC, §"SFPU vs FPU") + per-core compute:read ~2:1이 직접 뒷받침. SW로 구현 불가 |
+| (3) batch-32 | **crossover 없음** | batch가 별도 코어로 매핑(`cur_batch=i/num_cores_per_batch`, `program_factory.cpp:1049`); `PNHt/Sq_chunk_t`는 head-per-core 파생(`:121`) → per-core tile·byte 모두 batch 불변 (§a-2와 동일 invariance) |
+| (상단) DRAM write 측정 | **전제 반증됨** | l1_only는 write를 생략하지 않고 L1로 동일 비용 리다이렉트; N=8 tie(p=0.056, CI가 0 포함) (§a-2, §a-3) |
+
+### multi-chip TP 상세 (선택한 lever)
+
+**BLUF: TP head-sharding은 L1을 DRAM보다 빠르게 만들지 못한다.** 1→N chip 시 per-chip compute ~1/N,
+per-chip KV read ~1/N로 **둘 다 같은 비율로 줄어 per-chip compute:read ratio가 불변**(GQA `n_heads/n_kv_heads
+= 32/8 = 4` 고정). KV는 device마다 **replicate**되어(`attention.py:459`) attention이 전부 local이라 TP는
+read를 노출시킬 remote/느린 read를 만들지 않는다. TP는 병렬화로 per-chip 절대 latency만 줄일 뿐 L1-vs-DRAM은
+모든 N에서 tie. 이 ratio는 HW 상수(측정상 FPU tile-MAC ≈ 2× NoC tile-read, §2/§3)이고 **시도한 모든
+sharding 축(batch·context·heads/chips)에 불변**이다.
+
+per-chip head 분배 (`attention.py:52-59`):
+| num_devices N | num_devices_per_group | n_local_heads (32/·) | n_local_kv_heads (8/·) |
+|---|---|---|---|
+| 1 | 1 | 32 | 8 |
+| 2 | 2 | 16 | 4 |
+| 4 | 4 | 8 | 2 |
+| 8 | 8 | 4 | 1 |
+| 32 (TG/BHGLX) | 8 | 4 | 1 |
+
+**왜 TP가 read를 노출 못 시키나**: KV cache가 `ReplicateTensorToMesh`로 device-local replica
+(`attention.py:435-459`), attention 연산이 chip 내부에서 완결. CCL(`tt_all_reduce`/`tt_all_gather`)은
+QKV projection·output projection에만 작동하고 **KV read에는 절대 작동 안 함**(forward_decode 내 all-reduce
+QKV ~`attention.py:1266`, all-gather out ~`:1531`, all-reduce dense-out ~`:1569`). decode용
+sequence/context parallelism은 **미구현**(검색상 부재) — 그것만이 KV를 inter-chip link로 remote read하게 만들어
+read를 노출시킬 수 있는 sharding인데 tt_transformers엔 없다.
+
+**L1이 latency로 이기는 유일한 두 조건 (둘 다 현재 충족 불가)**:
+1. compute throughput을 memory 대비 올린다(아키텍처: ALU↑/SRAM↓ → notes 항목 2). SW 불가.
+2. remote KV read를 만드는 sharding(sequence/context-parallel). tt_transformers decode 미구현; TP는
+   KV local+replicate라 해당 안 됨.
+
+**multi-chip의 진짜 L1 가치 = capacity (latency 아님)**: N chip에서 `n_local_kv_heads = 8/N`이라 chip당
+KV head가 적어져 같은 L1 예산으로 더 긴 full-resident context를 담는다. mesh 전체 aggregate L1이 fully-in-L1
+가능 context 길이를 N배로 늘린다. "L1의 가치는 feasibility/capacity이지 decode latency가 아니다"라는 기존 결론을
+mesh로 확장한 것.
+
+**HW + 실행가능성**: harness에 multi-chip Blackhole config 존재 — P300(2), P150x4(4), P150x8(8),
+BHGLX(32) (`simple_text_demo.py:853-864`). L1 KV 경로는 single-device gated가 **아님**(num_devices assert
+없음; per-chip ring write 동작 `attention.py:1341-1391`; generator gate는 window/adaptive 전용
+`generator.py:96-98`). 현재 환경은 단일 P150이라 아래 실험은 multi-chip BH HW 확보 시까지 보류.
+
+**확인 실험 (보류, recipe만)**: P150x8(또는 P300/P150x4) 확보 시 `MESH_DEVICE=P150x8`로 기존 tracy per-op
+flow(`reprofile/run_one.sh` 패턴)를 DRAM vs L1 동일 context로 돌려 SDPA-decode `DEVICE KERNEL DURATION PER
+CORE AVG [ns]` 추출. **예측: 모든 N에서 per-chip L1 ≈ DRAM (tie)** → ratio 불변 확인. multi-chip 유일 차이는
+chip당 context-capacity 압력 감소. 실행 시 예측 vs 실측 기록.
+
 ## To-do (갱신)
 
   - ~~memory read time DRAM/L1 명시 + 간트~~ **[완료 2026-06-04]** read 소스를 DRAM/L1로 라벨링(§"L1_only 배포
@@ -482,8 +569,12 @@ DEBUG 재측정), `run_960_l1.log`(`--l1_kv_mode interleaved --l1_kv_only_mode
     interleaved/DRAM **parity로 복귀**시켜 그 용량을 활용 가능하게 만드는 것. latency win은 기대 불가.
   - **정정**: "long-context면 read가 병목"은 틀림 — compute·read 둘 다 context에 선형이라 read는 영구 숨김(§3).
     capacity(KV quant int8/int4, multi-chip)는 **긴 context를 on-chip으로 돌릴 feasibility**용이지 decode latency를
-    이기게 하는 lever가 아니다. read를 실제로 노출시키려면(= L1이 latency로 이길 유일한 길) context가 아니라
-    **per-chunk compute:read 균형**을 바꿔야 한다 → 진짜 latency-lever 후보는 **decode matmul depadding**(Sq 1행을 32행
-    타일로 패딩하는 비효율 제거; compute가 급감하면 read가 노출되어 L1이 의미). congested layout/cross-op DRAM 경쟁 해소도 보조.
+    이기게 하는 lever가 아니다.
+  - **~~decode matmul depadding을 latency-lever 후보로~~ [철회 2026-06-07; 전제 정정 2026-06-08]** — 애초에 SDPA엔
+    제거할 query padding이 없다: SDPA matmul row 차원은 single token이 아니라 query HEAD(`Sq_chunk_t=PNHt`)라 단일 chip
+    Llama-8B(`n_local_heads=32`)는 32행 타일을 head가 채운다. "1행→32행" padding은 per-token LINEAR op(QKV·MLP·LM-head)
+    것이고 KV/L1과 무관. 게다가 Tensix는 32×32 tile 단위라 서브타일로 못 줄이고(§"Multi-chip TP scope" lever 표), 설사 줄여도 trace off로
+    decode가 dispatch-bound라 wall-clock에 안 잡힘. read를 노출시킬 유일한 길은 (1) ALU↑/SRAM↓ 아키텍처(HW 제언,
+    notes 항목 2) 또는 (2) remote-KV sequence-parallel(미구현)뿐 — SW/config로는 도달 불가. (§"Multi-chip TP scope")
   - (선택) NoC event profiler(`--collect-noc-traces`)로 read가 compute 밑에 얼마나 여유 있게
     숨는지(노출까지의 margin)를 정량화 — 위 결론에는 불필요하지만 crossover context 추정에 유용.
