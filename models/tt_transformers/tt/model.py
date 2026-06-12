@@ -337,18 +337,24 @@ class Transformer(LightweightModule):
                 ),
             )
 
-            seq_tiles = torch.div(torch.clamp(current_pos, min=0) + 32, 32, rounding_mode="floor")
-            sink_tiles = math.ceil(sink_size / 32) if sink_size > 0 else 0
-            ring_tiles = math.ceil(ring_size / 32) if ring_size > 0 else 0
-            hot_tiles = torch.clamp(seq_tiles, max=sink_tiles)
-            if ring_tiles > 0:
-                hot_tiles = hot_tiles + torch.clamp(seq_tiles - sink_tiles, min=0, max=ring_tiles)
-            expected_hit_ratio = torch.where(
-                seq_tiles > 0, hot_tiles.float() / seq_tiles.float(), torch.zeros_like(seq_tiles, dtype=torch.float32)
-            )
-            expected_hit_ratio_mean = expected_hit_ratio.mean().item()
-            l1_kv_perf.add_sample("decode.expected_l1_hit_ratio", expected_hit_ratio_mean)
+            # Hit-ratio gating is opt-in (l1_kv_min_expected_hit_ratio > 0). When it is off
+            # (the default), skip the whole per-step computation: it runs on the host on the
+            # decode critical path (the loop is serial — sample_host blocks on the trace
+            # output before the next step's host prep), and the .item()/add_sample only feed
+            # diagnostics. Gating it removes that per-step host overhead.
             if self.args.l1_kv_min_expected_hit_ratio > 0.0:
+                seq_tiles = torch.div(torch.clamp(current_pos, min=0) + 32, 32, rounding_mode="floor")
+                sink_tiles = math.ceil(sink_size / 32) if sink_size > 0 else 0
+                ring_tiles = math.ceil(ring_size / 32) if ring_size > 0 else 0
+                hot_tiles = torch.clamp(seq_tiles, max=sink_tiles)
+                if ring_tiles > 0:
+                    hot_tiles = hot_tiles + torch.clamp(seq_tiles - sink_tiles, min=0, max=ring_tiles)
+                expected_hit_ratio = torch.where(
+                    seq_tiles > 0,
+                    hot_tiles.float() / seq_tiles.float(),
+                    torch.zeros_like(seq_tiles, dtype=torch.float32),
+                )
+                l1_kv_perf.add_sample("decode.expected_l1_hit_ratio", expected_hit_ratio.mean().item())
                 l1_write_enabled = bool(torch.any(expected_hit_ratio >= self.args.l1_kv_min_expected_hit_ratio).item())
                 # Do NOT None-out l1_update_pos_tt here. The set of host tensors must
                 # keep the same None-pattern across trace capture and every replay step,
