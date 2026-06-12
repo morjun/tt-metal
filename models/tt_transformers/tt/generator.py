@@ -876,8 +876,26 @@ class Generator:
         logger.info("Done Compiling Model")
 
         # Post-compile: allocate adaptive L1 KV cache now that all CB addresses are frozen.
+        did_l1_alloc = self.l1_kv_needs_alloc
         if self.l1_kv_needs_alloc:
             self._post_compile_allocate_l1_kv()
+
+        # Warm up the L1-tier ops OUTSIDE the trace. The compile forward above ran
+        # before the tiers existed (live-scan/JSON allocation happens post-body), so
+        # the L1 ring write (paged_update_cache into the L1 tier) and the L1-mode SDPA
+        # read never compiled. Their first invocation enqueues host-side writes for
+        # program/sharded-buffer setup, which is illegal inside trace capture
+        # ("Writes are not supported during trace capture"). Running one extra no-trace
+        # decode now — with tiers present (l1_kv_needs_alloc is False) — compiles and
+        # initializes those programs so capture records only the device-side enqueue.
+        if did_l1_alloc:
+            self._decode_forward_no_trace_text(
+                tokens,
+                current_pos,
+                page_table=page_table,
+                kv_cache=kv_cache,
+                sampling_on_device=sampling_on_device,
+            )
 
         # Get inputs ready for trace run
         device_inputs = []

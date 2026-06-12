@@ -350,8 +350,13 @@ class Transformer(LightweightModule):
             l1_kv_perf.add_sample("decode.expected_l1_hit_ratio", expected_hit_ratio_mean)
             if self.args.l1_kv_min_expected_hit_ratio > 0.0:
                 l1_write_enabled = bool(torch.any(expected_hit_ratio >= self.args.l1_kv_min_expected_hit_ratio).item())
-                if not l1_write_enabled:
-                    l1_update_pos_tt = None
+                # Do NOT None-out l1_update_pos_tt here. The set of host tensors must
+                # keep the same None-pattern across trace capture and every replay step,
+                # or the in-place copy_host_to_device (generator._decode_forward_trace_text)
+                # asserts device_tensors[i] is None and crashes. The l1_write_enabled bool
+                # already gates the actual L1 write in attention.forward_decode on the
+                # no-trace path. Under trace, l1_write_enabled is dropped (host_inputs[:-1])
+                # and defaults True, so hit-ratio gating is inoperative under trace by design.
 
         if page_table is not None:
             page_table = ttnn.from_torch(

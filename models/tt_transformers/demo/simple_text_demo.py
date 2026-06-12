@@ -927,8 +927,8 @@ def test_demo_text(
     json_config_file = request.config.getoption("--decoder_config_file")
     token_accuracy = request.config.getoption("--token_accuracy") or token_accuracy
     stress_test = request.config.getoption("--stress_test") or stress_test
-    enable_trace = request.config.getoption("--enable_trace") or enable_trace
-    enable_trace = False  # FORECE DISABLE FOR DPRINT DEBUGGING
+    # enable_trace = request.config.getoption("--enable_trace") or enable_trace
+    enable_trace = True  # Trace enabled (incl. L1 KV mode). Set False to use DPRINT.
     num_layers = request.config.getoption("--num_layers") or num_layers
     mode = request.config.getoption("--mode") or mode
     l1_kv_mode = request.config.getoption("--l1_kv_mode")
