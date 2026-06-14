@@ -316,26 +316,13 @@ class Transformer(LightweightModule):
             ring_size = self.args.l1_kv_window_size
             total_l1_tokens = sink_size + ring_size
         if total_l1_tokens > 0:
-            l1_update_pos = current_pos.clone()
-            if sink_size > 0:
-                if ring_size > 0:
-                    recent_pos = sink_size + torch.remainder(torch.clamp(current_pos - sink_size, min=0), ring_size)
-                    l1_update_pos = torch.where(current_pos < sink_size, current_pos, recent_pos)
-                else:
-                    l1_update_pos = torch.clamp(current_pos, max=max(sink_size - 1, 0))
-            elif ring_size > 0:
-                l1_update_pos = torch.remainder(current_pos, ring_size)
-
-            l1_update_pos_tt = ttnn.from_torch(
-                l1_update_pos,
-                device=None,
-                dtype=ttnn.int32,
-                mesh_mapper=ttnn.ShardTensor2dMesh(
-                    self.mesh_device,
-                    dims=(None, 0) if (self.args.is_galaxy and B > 1) else (None, None),
-                    mesh_shape=self.args.cluster_shape,
-                ),
-            )
+            # The flat ring write position is NOT computed on the host anymore. It is derived
+            # ON-DEVICE from the device current_pos in ttnn_decode_forward
+            # (Transformer._compute_l1_ring_pos_device), so this host path does no modulo, no
+            # from_torch, and no extra host->device push of l1_update_pos. That removes the only
+            # per-step host work L1 had over the DRAM baseline (host parity). l1_update_pos_tt
+            # stays None; the device path fills it (and the None slot is config-invariant across
+            # steps, so the in-place copy_host_to_device used under trace stays consistent).
 
             # Hit-ratio gating is opt-in (l1_kv_min_expected_hit_ratio > 0). When it is off
             # (the default), skip the whole per-step computation: it runs on the host on the
@@ -468,6 +455,58 @@ class Transformer(LightweightModule):
         ttnn.plus_one(current_pos, skip_negative_entries=True)
         ttnn.plus_one(rot_mat_idxs)
 
+    def _compute_l1_ring_pos_device(self, current_pos):
+        """Trace-safe, on-device flat L1 ring write position from the device current_pos.
+
+        Replaces the former host-side torch.remainder + from_torch + H2D push (host parity with
+        DRAM). Computed ONCE per step here (not 32x in each attention layer). Pure ttnn ops, no
+        to_torch, so it is safe inside a captured trace.
+
+        Returns:
+          - None when no L1 KV cache is active (T == 0) -> DRAM path, l1_update_pos unused.
+          - current_pos itself (NO new tensor, NO ops) when the ring never wraps
+            (capacity >= max_seq_len): the write index equals the position. Caller must NOT
+            deallocate it.
+          - a NEW int32 row-major tensor (the wrapped index) otherwise. Caller deallocates it.
+        """
+        T = getattr(self.args, "l1_kv_adaptive_total_capacity", 0) or 0
+        if T <= 0:
+            T = self.args.l1_kv_sink_size + self.args.l1_kv_window_size
+        if T <= 0:
+            return None  # no L1 KV cache active
+        sink = self.args.l1_kv_sink_size
+        # No-wrap fast path: index == position, hand back current_pos unchanged (zero ops, like DRAM).
+        if T >= self.args.max_seq_len:
+            return current_pos
+        orig_shape = current_pos.shape
+        p = ttnn.to_layout(current_pos, ttnn.TILE_LAYOUT)
+        p = ttnn.typecast(p, ttnn.float32)
+        ring = T - sink
+        if sink > 0 and ring > 0:
+            # Match the former host semantics exactly:
+            #   recent = sink + remainder(clamp(pos - sink, min=0), ring)
+            #   index  = where(pos < sink, pos, recent)
+            shifted = ttnn.relu(ttnn.subtract(p, float(sink)))  # clamp(pos - sink, min=0)
+            ringed = ttnn.remainder(shifted, float(ring))
+            recent = ttnn.add(ringed, float(sink))
+            in_sink = ttnn.lt(p, float(sink))
+            wrapped = ttnn.where(in_sink, p, recent)
+            for t in (shifted, ringed, recent, in_sink, p):
+                ttnn.deallocate(t)
+            p = wrapped
+        else:
+            p = ttnn.remainder(p, float(T))
+        p = ttnn.typecast(p, ttnn.int32)
+        p = ttnn.to_layout(p, ttnn.ROW_MAJOR_LAYOUT)
+        # Strip tile padding back to the original (batch,) shape.
+        padded = p.shape
+        slice_starts = [0] * len(padded)
+        slice_ends = list(padded)
+        for i in range(len(orig_shape)):
+            slice_ends[-(i + 1)] = orig_shape[-(i + 1)]
+        p = ttnn.slice(p, slice_starts, slice_ends)
+        return p
+
     def ttnn_decode_forward(
         self,
         x,
@@ -485,6 +524,14 @@ class Transformer(LightweightModule):
         """
         rot_mats_global = self.rope_setup.get_rot_mats(rot_mat_idxs)
         rot_mats_local = self.rope_local_setup.get_rot_mats(rot_mat_idxs) if hasattr(self, "rope_local_setup") else None
+        # Derive the L1 ring write position on-device (once per step) when it was not supplied
+        # by the host. This is the on-device replacement for the former host modulo + push, and
+        # is trace-safe (pure ttnn ops). built_ring_pos tracks whether a NEW tensor was created
+        # (the no-wrap fast path returns current_pos itself, which must not be deallocated).
+        built_ring_pos = False
+        if l1_update_pos is None:
+            l1_update_pos = self._compute_l1_ring_pos_device(current_pos)
+            built_ring_pos = l1_update_pos is not None and l1_update_pos is not current_pos
         with l1_kv_perf.timed("decode.transform_inputs_device"):
             x_embed = self._transform_decode_inputs_device(x)
         with l1_kv_perf.timed("decode.model_forward"):
@@ -499,6 +546,8 @@ class Transformer(LightweightModule):
                 l1_write_enabled=l1_write_enabled,
                 kv_cache=kv_cache,
             )
+        if built_ring_pos:
+            ttnn.deallocate(l1_update_pos)
 
         if sampling_on_device and self.tt_sampling is not None:
             # Perform on-device sampling using TTSampling
