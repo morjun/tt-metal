@@ -6,7 +6,10 @@ not a speedup, on single-stream decode latency.**
 
 Platform: Tenstorrent Blackhole P150, single card, Llama-3.1-8B, batch-1 decode.
 Method: device-zone profiling (Tracy `DeviceZoneScopedN`) + op-level latency + end-to-end tok/s.
-Figures: `reprofile/sdpa_bigpicture.png`, `reprofile/zones2_l1only_896/overlap_gantt_l1.png`.
+Figures (see the "Figures" section for captions): `reprofile/dram_bigpicture.png`,
+`reprofile/sram_bigpicture.png`, `reprofile/hole_cdf_l1_vs_dram.png`,
+`reprofile/zones2_l1only_896/overlap_gantt_l1.png`, and the orthogonal raw-access study
+`reprofile/rawaccess_latency.png` / `rawaccess_bandwidth.png`.
 
 ---
 
@@ -236,6 +239,199 @@ The single L1-only cost that genuinely cannot be removed is the one-time tier al
 which does not touch steady-state latency. The on-device ring index adds ~5 ttnn ops/step inside
 the trace (wrap case) or zero (no-wrap), which is hidden in device time and does not regress
 tok/s (measured 20.95, up from 20.90). This is why L1 reaches exact host parity with DRAM.
+
+---
+
+## Figures (captions; the charts are data-only)
+
+- **`dram_bigpicture.png` / `sram_bigpicture.png`** — per-backend SDPA-decode big picture.
+  *Panel A:* each of the 192 (core × TRISC) units' compute timeline, sorted by envelope length;
+  segments `pre | QK_MM | <hole> | SM_NORM | rest(PV_MM+rescale+post)` sum to the unit's CMP_CHUNK.
+  The QK_MM→SM_NORM interval is left BLANK (a hole — no zone covers it, Section 7). The dashed line
+  is the per-chunk KV read (RD_CHUNK); it sits left of every unit ⇒ read is hidden on every core.
+  *Panel C:* the bottleneck unit (longest envelope, sets op latency) with its read bar — the read
+  ends inside the QK^T matmul alone. The two charts are near-identical: SDPA compute is the same
+  whether KV is in DRAM or SRAM. (The SRAM Panels omit the small green PV/rest tail — the
+  CMP_CHUNK envelope zone is dropped by the profiler on the L1 path, so the SRAM timeline ends at
+  SM_NORM; QK_MM-dominance, the hole, and read-hidden are unaffected.)
+- **`hole_cdf_l1_vs_dram.png`** — CDF of the QK_MM→SM_NORM hole duration, SRAM vs DRAM. The two
+  curves coincide (p90 ~590 vs ~541 ns; >500 ns tail ~12% both) ⇒ the hole is memory-invariant, so
+  it is not a read wait (Section 7).
+- **`zones2_l1only_896/overlap_gantt_l1.png`** — same-core (shared-counter) NCRISC read vs TRISC
+  compute: the L1 read bar lies entirely inside the compute envelope.
+
+## 10b. Raw memory-hierarchy access (orthogonal study)
+
+Independently of SDPA, the raw READ latency and bandwidth of the memory hierarchy were swept over
+transfer size (64 B → 1 MB; the per-read destination is one core's L1, ~1.5 MB, so a single
+resident transfer caps there — the 4 MB end is bandwidth-via-iteration, not one read) for three
+sources: DRAM, local SRAM (a core's own L1), and remote SRAM (another Tensix core's L1 over NoC).
+This generalizes the old single-point RD_LAT (DRAM ~412 ns / L1 ~336 ns at one 2 KB tile).
+
+- Harness (reused, no custom kernel): `tests/.../perf_microbenchmark/dispatch/test_bw_and_latency`
+  — `-m 1` DRAM, `-m 2` L1 (`-sx/-sy` source core: == reader ⇒ local, far core ⇒ remote over NoC),
+  `-p` per-read size, `-bs` total KB, `-l` latency mode, `-i` iterations.
+- Figures: **`rawaccess_latency.png`** (latency ns vs size, log-y) and **`rawaccess_bandwidth.png`**
+  (GB/s vs size), each with three series (DRAM / local SRAM / remote SRAM), log-scale x.
+- Measured (P150): latency floor at 64 B — local SRAM ~55 ns < remote SRAM ~245 ns < DRAM ~337 ns
+  (consistent with the old RD_LAT ~336/412 ns at 2 KB); the three converge at large sizes
+  (transfer-time-bound). **Single-reader** bandwidth at 1 MB — SRAM ~82 GB/s vs DRAM ~63 GB/s
+  (one core / one NoC link; the device aggregate DRAM BW across all cores is the ~512 GB/s spec).
+  So SRAM's edge over DRAM is real at the raw-access level (~12% lower 1-tile latency, ~30% higher
+  single-reader BW) — but it is hidden behind compute in SDPA decode (Sections 4-7), which is why
+  it does not change op latency.
+- Note: even "local SRAM" goes through the NoC read path here (loopback), matching how SDPA reads
+  L1 — the apples-to-apples comparison vs DRAM and remote SRAM.
+- Repro: `reprofile/run_rawaccess_sweep.sh` → `rawaccess/rawaccess.csv` → `reprofile/draw_rawaccess.py`.
+
+### Bandwidth-saturation crossover — there is none on a single chip
+The "where does L1 finally beat DRAM" question reduces to: where does the SDPA DRAM read DEMAND
+reach the DRAM aggregate CEILING? Demand = KV-bytes/token ÷ SDPA-op time/token. For Llama-8B
+(8 kv-heads × 128 × {K,V}): bf16 = 4096 B/token, bfp8 ≈ 2176 B/token; the measured SDPA-op slope
+is ~0.0116 µs/token, so demand **asymptotes at ~353 GB/s (bf16) / ~188 GB/s (bfp8)** — below the
+~512 GB/s GDDR6 aggregate ceiling (single-reader DRAM measured ~63 GB/s; the multi-core aggregate
+test was unreliable in this env, so 512 is the spec). Batch and context distribute across cores
+preserving the compute:read ratio, so they do NOT raise the asymptote. Result: **DRAM never
+saturates at any context or batch on one chip ⇒ the read stays hidden ⇒ L1 cannot beat DRAM on a
+single chip** (~1.45x DRAM headroom at the bf16 asymptote). Figure: `crossover_demand_vs_ceiling.png`
+(`reprofile/draw_crossover.py`). The crossover requires one of: a model with higher
+KV-bytes-per-compute, KV larger than fits one chip's L1 (⇒ quantization / multi-chip — a CAPACITY
+lever), or multi-chip where per-chip DRAM BW is divided while KV is replicated. None is a layout
+change. This is the quantitative form of "the lever is capacity, not layout."
+
+### When can DRAM bandwidth saturate? (and why multi-chip alone cannot) — detailed
+
+**The governing quantity.** DRAM is saturated (the read stops being hideable) iff, per chip,
+`DEMAND ≥ CEILING`, where
+`DEMAND = (KV bytes read per token) / (SDPA compute time per token)` and `CEILING` = that chip's
+DRAM aggregate bandwidth (~512 GB/s GDDR6). DEMAND is a *ratio of per-token quantities*, so it is
+a property of the model, not of scale.
+
+**Why it is invariant under scale and standard sharding.** Expand it:
+`DEMAND ∝ (n_kv_heads · head_dim · dtype_bytes) / (n_q_heads · head_dim · compute_rate)`
+`     = (n_kv_heads / n_q_heads) · (dtype_bytes / compute_rate)`.
+The dependence on context length and batch cancels (both KV bytes and compute scale with them),
+leaving a per-token architectural ratio: the GQA group size, the KV dtype, and the attention
+arithmetic intensity. Now apply each multi-chip scheme — each shards numerator and denominator
+together, and each chip brings its own DRAM (its own CEILING):
+- **TP (tensor/head parallel, N ≤ n_kv_heads):** chip computes `n_q_heads/N` q-heads and reads
+  `n_kv_heads/N` kv-heads ⇒ DEMAND unchanged; CEILING per chip unchanged ⇒ no saturation.
+- **DP (data/batch parallel):** each chip is the full model on different sequences ⇒ identical to
+  one chip ⇒ no saturation.
+- **CP (context/sequence parallel):** each chip holds `1/N` of the context, computes a partial
+  attention over its slice (read `1/N`, compute `1/N`) ⇒ DEMAND unchanged ⇒ no saturation.
+
+So adding chips adds DEMAND and CEILING in lockstep — **you cannot saturate DRAM by scaling out.**
+(Empirically consistent with the measured per-core invariance under batch/heads.) For Llama-8B
+bf16, DEMAND ≈ 353 GB/s vs CEILING ≈ 512 GB/s — ~1.45x headroom, at every context, batch, and chip
+count under standard parallelism.
+
+**The one sharding exception (a corner case).** TP with `N > n_kv_heads`: kv-heads cannot divide
+below 1, so per-chip read floors at one kv-head while per-chip compute keeps shrinking
+(`n_q_heads/N`). DEMAND then rises ∝ `N / n_kv_heads` and can eventually exceed CEILING. But this
+is an over-decomposed, inefficient TP degree (beyond the kv-head count) rarely used for decode, and
+per-chip latency is dominated by other costs there — not a practical crossover.
+
+**When DRAM DOES saturate (where L1 could win on latency).** Raise the read:compute ratio past the
+~1.45x headroom:
+1. **Attention architecture — the dominant dial.**
+   - **MHA / low-GQA:** `n_kv_heads → n_q_heads`. For Llama-8B that is 32 vs 8 → **4× the KV read
+     for the same matmul compute** → DEMAND ≈ 4·188 ≈ **750 GB/s (bfp8) ≫ 512** → saturated. Any
+     MHA or small-GQA-group model qualifies.
+   - **Wide KV dtype:** fp16/bf16 vs int8/int4 — more bytes/token raises DEMAND. (Quantizing KV
+     *lowers* DEMAND, i.e., hides the read *more* — the opposite of what helps L1.)
+   - **Not** `head_dim`, **not** FFN width / "arithmetic intensity": `head_dim` cancels (it scales
+     read and compute equally, see derivation below), and the read is hidden behind the **SDPA**
+     compute (QK^T / PV), not the FFN — so model-level arithmetic intensity is irrelevant to whether
+     the KV read is exposed. The only architectural dials are the **GQA ratio** and the **KV dtype**.
+2. **Hardware balance:** a memory-light / compute-heavy chip (lower DRAM BW, or much higher FLOPs)
+   lowers CEILING and/or shrinks the compute time that hides the read → DEMAND crosses CEILING.
+   (Counter-intuitively, a *faster*-compute future chip saturates DRAM *more* easily, because there
+   is less compute time to hide the same read behind.)
+
+**But saturation alone is not an L1 win — capacity still gates it.** Even once DRAM is saturated
+and the read is exposed, L1 beats DRAM only if the KV actually fits in (aggregate) L1. The very
+regimes that expose the read (MHA, large head_dim, wide dtype) are the ones with the *largest* KV,
+so they are the hardest to fit — the crossover and the capacity requirement compound. That is why
+the lever is fundamentally **capacity** (get the KV into on-chip SRAM at all — quantization,
+multi-chip aggregate L1), not **layout** (how it is arranged once it already fits). And note "SRAM
+is faster" is true only at the raw-access level (Section 10b); that speed is hidden behind compute,
+so what L1 actually offers is being *outside the shared DRAM bandwidth pool* — useful only in the
+saturated regimes above.
+
+### The saturation formula, derived from first principles
+
+We want a single closed-form test for "does the KV read saturate DRAM (stop being hideable behind
+SDPA compute)?" applied to any model config, with no per-model profiling. Derive it from the two
+per-decode-step quantities.
+
+**Numerator — KV bytes read per step (context `C`).** The flash-decode op reads the entire K and V
+cache once per step:
+`READ = C · n_kv_heads · head_dim · 2 · dtype_bytes`  (the `2` = K and V).
+
+**Denominator — SDPA compute time per step.** QK^T is a dot product of length `head_dim` for each of
+`n_q_heads` query heads against each of `C` cached positions; PV is the symmetric contraction. So
+the MAC count is `COMPUTE_MACs = C · n_q_heads · head_dim · k`, where `k` folds the fixed
+per-position work (QK^T + PV + softmax) and is a constant for a given kernel. At a sustained FPU MAC
+rate `R` (MAC/s), compute time `= COMPUTE_MACs / R`.
+
+**Demand = numerator / denominator:**
+```
+DEMAND = READ / (COMPUTE_MACs / R)
+       = [C · n_kv_heads · head_dim · 2 · dtype_bytes] · R / [C · n_q_heads · head_dim · k]
+       = (n_kv_heads / n_q_heads) · dtype_bytes · (2R / k)
+```
+`C` cancels (read and compute both scale with context) and `head_dim` cancels (it scales read and
+compute equally). What survives is a pure per-token architectural ratio. Collapse the two hardware
+constants `(2R / k)` into one calibrated constant **`Κ`**:
+```
+DEMAND[GB/s] ≈ (n_kv_heads / n_q_heads) · dtype_bytes · Κ
+```
+
+**Calibrating Κ from the one measured model.** Llama-3.1-8B (`n_kv/n_q = 8/32 = 0.25`, KV = bfp8 ≈
+1.0625 B/elem) has a measured SDPA-op slope of 0.0116 µs/token, i.e. an asymptotic
+`DEMAND = (8·128·2·1.0625) / 0.0116 = 2176 B / 0.0116 µs ≈ 188 GB/s`. Solving
+`188 = 0.25 · 1.0625 · Κ` gives **`Κ ≈ 707 GB/s`**. Because `Κ` is `2R/k` — purely the FPU rate and
+the kernel's fixed per-position cost — it is a hardware constant, identical across models on the
+same chip/kernel. (Cross-check: the same Κ reproduces the bf16 asymptote, `0.25·2·707 ≈ 353 GB/s`,
+matching `crossover_demand_vs_ceiling.png`.)
+
+**The test:** the read saturates DRAM iff `DEMAND ≥ CEILING (≈512 GB/s)`, i.e.
+```
+(n_kv_heads / n_q_heads) · dtype_bytes  ≥  512 / 707  ≈  0.72
+```
+So the saturation threshold on the product `ratio · dtype_bytes` is ≈ **0.72**: e.g. ratio > 0.36 at
+bf16 (2 B), or essentially MHA-only (ratio ≈ 1) at bfp8 (1.06 B).
+
+### Per-model evaluation across tt_transformers configs
+
+Applying `DEMAND = ratio · dtype_bytes · 707` to every model the framework has configs for
+(`model_config.py`: `LOCAL_HF_PARAMS` L439-452, plus the HF-loaded Phi-3 family at L108/116/631-632/
+2427). KV dtype is bfp8 (~1.06 B) for the Llama/Mistral/Phi-3 accuracy group and the Qwen-VL models;
+Qwen2.5-7B forces bf16 (L162-170). Llama-3.2-3B also runs bf16 in accuracy mode.
+
+| model | n_q / n_kv | ratio | KV dtype (B) | DEMAND (GB/s) | ≥ 512? |
+|---|---|---|---|---|---|
+| Llama-3.1-70B / 3.2-90B-V / Qwen2.5-VL-72B | 64/8 | 0.125 | bfp8 (1.06) | ~94 | no |
+| Qwen2.5-VL-3B | 16/2 | 0.125 | bfp8 (1.06) | ~94 | no |
+| Qwen2.5-7B | 28/4 | 0.143 | bf16 (2.0) | ~202 | no |
+| Qwen2.5-VL-32B | 40/8 | 0.20 | bfp8 (1.06) | ~150 | no |
+| Llama-3.1-8B / Mistral-7B-v0.3 / 3.2-1B / 3.2-11B-V | 32/8 | 0.25 | bfp8 (1.06) | ~188 | no |
+| Llama-3.2-3B | 24/8 | 0.333 | bfp8 / bf16 | ~250 / ~471 | no (closest) |
+| **Phi-3-mini / Phi-3.5-mini** | **32/32** | **1.00** | **bfp8 (1.06)** | **~750** | **YES (1.46×)** |
+
+**Conclusion.** Every GQA model with a shipped config stays compute-bound — the highest, Llama-3.2-3B
+in bf16 accuracy mode, reaches only ~471 GB/s, still ~8% under the ~512 GB/s ceiling. The single
+config that saturates is **Phi-3-mini / Phi-3.5-mini**, which are **MHA** (32 query = 32 KV heads,
+ratio 1.0, head_dim 96): they read 4× the KV per token for the same matmul compute, so DEMAND ≈ 750
+GB/s (bfp8) to ~1414 GB/s (bf16) clears the ceiling at long context. There the KV read is exposed
+and L1 could in principle beat DRAM on decode latency.
+
+Two caveats: (1) it remains a **capacity** story — MHA's 4× KV/token (≈3× Llama-8B's bytes after the
+head_dim-96 offset) shrinks the L1-resident context to ≈1/3, so the L1 win is realizable only where
+that larger KV still fits; (2) this is an **analytical prediction** from the calibrated Κ and the
+published Phi-3 head config (the repo loads it from HF, not a local params file), not an on-device
+measurement — and Phi-3-mini is not supported on P150, so it was not run.
 
 ---
 

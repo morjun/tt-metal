@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
-"""SDPA-decode big picture (Demand 2). Built from self-consistent per-unit decompositions.
+"""Per-backend SDPA-decode big-picture charts (DRAM and SRAM/L1) + the L1-vs-DRAM hole CDF.
 
-Per (core,TRISC) unit, one representative op invocation (median-CMP rhid): the timeline is
-  pre | QK_MM | <HOLE> | SM_NORM | rest(=PV_MM + rescale + post)
-and the segments sum to that unit's CMP_CHUNK envelope (same core => shared counter => valid).
+Data-only figures — short titles/labels only. All explanation lives in COMPUTE_BOUND_PROOF.md
+(the "Figures" section). Outputs: dram_bigpicture.png, sram_bigpicture.png, hole_cdf_l1_vs_dram.png.
 
-The interval between the QK_MM zone END and the SM_NORM zone START is left as a HOLE (blank): no
-device zone covers it, so it is NOT labelled as a characterized "gap". (A separate sub-zone run
-attributed only ~30% of it to two data-format reconfig instructions; the rest is unaccounted.)
-We only use QK_MM/SM_NORM/CMP_CHUNK zones here (robust to the profiler dropping later-declared
-zones at the per-kernel marker cap).
-
-Panels:
-  A  per-unit stacked timeline, sorted by envelope: QK^T matmul dominates; the white HOLE before
-     SM_NORM is the unaccounted interval; per-chunk KV read (RD_CHUNK) line sits left of every
-     unit -> read hidden everywhere.
-  B  the HOLE-duration CDF, L1 vs DRAM OVERLAID -> it is MEMORY-INVARIANT (identical), so the
-     >1us tail is NOT a read wait (a read wait would shrink with L1's 12% lower latency).
-  C  bottleneck unit + read bar -> read ends inside the QK^T matmul -> fully hidden.
+Per (core,TRISC) unit, one representative invocation (median-CMP rhid); the timeline
+  pre | QK_MM | <HOLE> | SM_NORM | rest(=PV_MM+rescale+post)  sums to the CMP_CHUNK envelope.
+The QK_MM->SM_NORM interval is left BLANK (a hole: no zone covers it).
 """
 from collections import defaultdict
 import statistics as st
@@ -29,14 +18,14 @@ from matplotlib.patches import Patch
 
 BASE = "research_codes/documents/l1_kv_cache_cache/reprofile"
 C2NS = 1000.0 / 1350.0
-# "hole" is intentionally NOT drawn (left blank) — no zone identifies it.
 DRAWN = [
     ("pre", "#dddddd", "pre"),
-    ("QK_MM", "#1f77b4", "QK_MM (QK^T matmul, FPU)"),
-    ("SM_NORM", "#ff7f0e", "SM_NORM (softmax, SFPU)"),
-    ("rest", "#2ca02c", "rest (PV_MM + rescale + post)"),
+    ("QK_MM", "#1f77b4", "QK_MM (QK^T matmul)"),
+    ("SM_NORM", "#ff7f0e", "SM_NORM (softmax)"),
+    ("rest", "#2ca02c", "rest (PV_MM+rescale+post)"),
 ]
 ORDER = ["pre", "QK_MM", "hole", "SM_NORM", "rest"]
+FILL = {k: c for k, c, _ in DRAWN}
 
 
 def parse(path, want):
@@ -76,7 +65,12 @@ def parse(path, want):
 
 
 def decomp(d):
-    c0, cE = d["CMP_CHUNK"]
+    # CMP_CHUNK (the envelope) gives pre/rest; the profiler drops it on the L1 path, so when it is
+    # absent fall back to op-start = QK_MM start, op-end = SM_NORM end (PV/rest tail omitted).
+    if "CMP_CHUNK" in d:
+        c0, cE = d["CMP_CHUNK"]
+    else:
+        c0, cE = d["QK_MM"][0], d["SM_NORM"][1]
     return {
         "pre": (d["QK_MM"][0] - c0) * C2NS,
         "QK_MM": (d["QK_MM"][1] - d["QK_MM"][0]) * C2NS,
@@ -87,172 +81,114 @@ def decomp(d):
     }
 
 
-NEED = {"QK_MM", "SM_NORM", "CMP_CHUNK"}
-z = parse(f"{BASE}/zones2_l1only_896/profile_log_device.csv", NEED)
-byunit = defaultdict(dict)
-for key, zn, s, e in z:
-    if key[1].startswith("TRISC"):
-        byunit[key][zn] = (s, e)
-byunit2 = defaultdict(list)
-for key, d in byunit.items():
-    if NEED <= d.keys():
-        dd = decomp(d)
-        if all(dd[k] >= 0 for k in ("pre", "hole", "SM_NORM", "rest")):
-            byunit2[(key[0], key[1])].append(dd)
-units = []
-for u, lst in byunit2.items():
-    lst.sort(key=lambda x: x["cmp"])
-    units.append(lst[len(lst) // 2])
-units.sort(key=lambda x: x["cmp"])
+NEED = {"QK_MM", "SM_NORM"}  # CMP_CHUNK used if present (DRAM); optional (L1 path drops it)
 
 
-def holes_for(tag):
-    zz = parse(f"{BASE}/zones2_{tag}_896/profile_log_device.csv", {"QK_MM", "SM_NORM"})
+def load_units(tag):
+    z = parse(f"{BASE}/zones2_{tag}_896/profile_log_device.csv", NEED | {"CMP_CHUNK"})
+    byunit = defaultdict(dict)
+    for key, zn, s, e in z:
+        if key[1].startswith("TRISC"):
+            byunit[key][zn] = (s, e)
+    per = defaultdict(list)
+    for key, d in byunit.items():
+        if NEED <= d.keys():
+            dd = decomp(d)
+            if all(dd[k] >= 0 for k in ("pre", "hole", "SM_NORM", "rest")):
+                per[(key[0], key[1])].append(dd)
+    units = [sorted(lst, key=lambda x: x["cmp"])[len(lst) // 2] for lst in per.values()]
+    units.sort(key=lambda x: x["cmp"])
+    return units
+
+
+def rd_median(readtag):
+    z = parse(f"{BASE}/zones_rw_{readtag}/profile_log_device.csv", {"RD_CHUNK"})
+    d = [(e - s) * C2NS for _, zn, s, e in z]
+    return st.median(d) if d else 0.0
+
+
+def holes(tag):
+    z = parse(f"{BASE}/zones2_{tag}_896/profile_log_device.csv", {"QK_MM", "SM_NORM"})
     bu = defaultdict(dict)
-    for key, zn, s, e in zz:
+    for key, zn, s, e in z:
         if key[1].startswith("TRISC"):
             bu[key][zn] = (s, e)
     out = [(d["SM_NORM"][0] - d["QK_MM"][1]) * C2NS for d in bu.values() if "QK_MM" in d and "SM_NORM" in d]
     return sorted(h for h in out if 0 <= h <= 10000)
 
 
-holes_l1 = holes_for("l1only")
-holes_dram = holes_for("dram")
-rz = parse(f"{BASE}/zones_rw_l1only/profile_log_device.csv", {"RD_CHUNK"})
-rd = st.median([(e - s) * C2NS for _, zn, s, e in rz])
-
-n = len(units)
-maxcmp = units[-1]["cmp"]
-fig = plt.figure(figsize=(14, 11))
-gs = fig.add_gridspec(3, 1, height_ratios=[3, 1.5, 1.1], hspace=0.4)
-axA, axB, axC = fig.add_subplot(gs[0]), fig.add_subplot(gs[1]), fig.add_subplot(gs[2])
-
-# ---- A: per-unit stacked; the hole is left blank ----
-fill = {k: c for k, c, _ in DRAWN}
-for i, u in enumerate(units):
+def draw_backend(tag, readtag, label, out):
+    units = load_units(tag)
+    rd = rd_median(readtag)
+    n = len(units)
+    maxcmp = units[-1]["cmp"]
+    fig, (axA, axC) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1.1]})
+    # Panel A: per-unit stacked; hole blank
+    for i, u in enumerate(units):
+        x = 0
+        for name in ORDER:
+            w = u[name]
+            if w <= 0:
+                continue
+            if name == "hole":
+                x += w
+                continue
+            axA.broken_barh([(x, w)], (i - 0.45, 0.9), facecolors=FILL[name])
+            x += w
+    axA.axvline(rd, color="#9467bd", lw=2.0, ls="--")
+    axA.set_xlim(0, maxcmp * 1.08)
+    axA.set_ylim(-2, n + 2)
+    axA.set_ylabel("units (64 cores x 3 TRISC), sorted by envelope")
+    axA.set_xlabel("time from unit's own compute start (ns)")
+    axA.set_title(f"A. Per-unit SDPA compute — {label}", fontsize=11)
+    # Panel C: bottleneck unit + read bar
+    b = units[-1]
     x = 0
     for name in ORDER:
-        w = u[name]
+        w = b[name]
         if w <= 0:
             continue
-        if name == "hole":  # unaccounted interval: no zone -> leave blank
+        if name == "hole":
             x += w
             continue
-        axA.broken_barh([(x, w)], (i - 0.45, 0.9), facecolors=fill[name])
+        axC.broken_barh([(x, w)], (0.55, 0.8), facecolors=FILL[name])
         x += w
-axA.axvline(rd, color="#9467bd", lw=2.2, ls="--")
-axA.text(
-    rd,
-    n * 1.02,
-    f"RD_CHUNK={rd:.0f}ns (KV read/chunk)\nleft of every unit's compute -> READ HIDDEN",
-    color="#9467bd",
-    fontsize=9,
-    ha="center",
-    fontweight="bold",
-)
-axA.text(maxcmp, -3, f"op latency = slowest unit {maxcmp:.0f} ns", fontsize=8, ha="right")
-axA.set_xlim(0, maxcmp * 1.1)
-axA.set_ylim(-5, n * 1.12)
-axA.set_ylabel("192 units (64 cores x 3 TRISC), sorted by envelope")
-axA.set_xlabel("duration from each unit's own compute start (ns)  [same-core; not cross-core wall-clock]")
-axA.set_title(
-    "A. Per-unit SDPA compute (segments sum to the envelope). QK^T matmul dominates; the WHITE HOLE "
-    "before SM_NORM is an unaccounted interval (no zone); KV read fits under every unit.",
-    fontsize=9.5,
-)
+    axC.broken_barh([(300, rd)], (-0.45, 0.8), facecolors="#9467bd")
+    axC.set_yticks([-0.05, 0.95])
+    axC.set_yticklabels(["NCRISC\nread", "TRISC\ncompute"])
+    axC.set_ylim(-0.8, 1.6)
+    axC.set_xlim(0, maxcmp * 1.08)
+    axC.set_xlabel("time within op (ns)")
+    axC.set_title(f"C. Bottleneck unit — {label}", fontsize=11)
+    leg = [Patch(facecolor=c, label=lab) for _, c, lab in DRAWN]
+    leg.append(Patch(facecolor="white", edgecolor="#999", label="hole (no zone)"))
+    leg.append(Patch(facecolor="#9467bd", label="RD_CHUNK (KV read)"))
+    fig.legend(handles=leg, loc="lower center", ncol=6, fontsize=8, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    print("wrote", out, f"(units={n}, maxcmp={maxcmp:.0f}, rd={rd:.0f})")
 
 
-# ---- B: hole-duration CDF, L1 vs DRAM -> memory-invariant ----
-def cdf(ax, arr, color, label):
-    m = len(arr)
-    ys = [100 * (i + 1) / m for i in range(m)]
-    ax.plot(arr, ys, color=color, lw=2.2, label=label)
-    return arr[len(arr) // 2], arr[int(0.90 * (m - 1))], sum(x > 500 for x in arr), m
+def draw_hole_cdf(out):
+    hl, hd = holes("l1only"), holes("dram")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for arr, color, lab in [(hl, "#d62728", "SRAM (L1)"), (hd, "#1f77b4", "DRAM")]:
+        m = len(arr)
+        ax.plot(arr, [100 * (i + 1) / m for i in range(m)], color=color, lw=2.2, label=lab)
+    ax.axvline(500, color="gray", ls=":", lw=0.8)
+    ax.set_xlim(0, 1700)
+    ax.set_ylim(0, 105)
+    ax.set_xlabel("QK_MM->SM_NORM hole duration (ns)")
+    ax.set_ylabel("% of units <= x")
+    ax.legend(loc="lower right")
+    ax.set_title("QK_MM->SM_NORM hole CDF: SRAM vs DRAM", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    p90l = hl[int(0.9 * (len(hl) - 1))]
+    p90d = hd[int(0.9 * (len(hd) - 1))]
+    print("wrote", out, f"(p90 SRAM={p90l:.0f} DRAM={p90d:.0f})")
 
 
-p50l, p90l, bigl, ml = cdf(axB, holes_l1, "#d62728", "L1-only")
-p50d, p90d, bigd, md = cdf(axB, holes_dram, "#1f77b4", "DRAM")
-axB.axvline(500, color="gray", ls=":", lw=0.8)
-axB.text(
-    560, 28, f">500ns tail:\nL1 {bigl} ({100*bigl/ml:.0f}%)\nDRAM {bigd} ({100*bigd/md:.0f}%)", fontsize=8, va="center"
-)
-axB.set_xlim(0, 1700)
-axB.set_ylim(0, 105)
-axB.set_xlabel("QK_MM->SM_NORM hole duration (ns)  [interval no zone covers]")
-axB.set_ylabel("% of units <= x")
-axB.legend(loc="lower right", fontsize=9)
-axB.set_title(
-    f"B. The QK_MM->SM_NORM hole: L1 vs DRAM are IDENTICAL (p50 {p50l:.0f}/{p50d:.0f}, p90 {p90l:.0f}/{p90d:.0f} ns; "
-    f">500ns tail {100*bigl/ml:.0f}%/{100*bigd/md:.0f}%) => MEMORY-INVARIANT.\n   A read wait would shrink with "
-    "L1's 12% lower latency; it does not. No read dep in the interval (mask fused, reduction post-PV) "
-    "=> the hole (incl >1us tail) is NOT a read wait.",
-    fontsize=8.6,
-)
-
-# ---- C: bottleneck unit + read ----
-b = units[-1]
-x = 0
-for name in ORDER:
-    w = b[name]
-    if w <= 0:
-        continue
-    if name == "hole":
-        axC.annotate(
-            f"hole {w:.0f}ns (no zone)",
-            xy=(x + w / 2, 1.35),
-            xytext=(x + w / 2, 1.72),
-            color="#888",
-            fontsize=8,
-            ha="center",
-            arrowprops=dict(arrowstyle="->", color="#888"),
-        )
-        x += w
-        continue
-    axC.broken_barh([(x, w)], (0.55, 0.8), facecolors=fill[name])
-    if name == "QK_MM":
-        axC.text(
-            x + w / 2,
-            0.95,
-            f"QK_MM {w:.0f}ns ({100*w/b['cmp']:.0f}%)",
-            ha="center",
-            va="center",
-            color="white",
-            fontsize=9,
-        )
-    x += w
-axC.broken_barh([(300, rd)], (-0.45, 0.8), facecolors="#9467bd")
-axC.annotate(
-    f"KV read {rd:.0f}ns ends inside the QK^T matmul -> fully hidden",
-    xy=(300 + rd, -0.05),
-    xytext=(300 + rd + 200, -0.05),
-    color="#9467bd",
-    fontsize=9,
-    va="center",
-)
-axC.set_yticks([-0.05, 0.95])
-axC.set_yticklabels(["NCRISC\n(read)", "TRISC\n(compute)"])
-axC.set_ylim(-0.8, 2.0)
-axC.set_xlim(0, maxcmp * 1.1)
-axC.set_xlabel("time within op (ns)")
-axC.set_title(
-    f"C. BOTTLENECK unit (longest envelope, sets latency): QK^T matmul {b['QK_MM']:.0f}ns "
-    f"({100*b['QK_MM']/b['cmp']:.0f}%); white hole {b['hole']:.0f}ns; read {rd:.0f}ns hidden.",
-    fontsize=10,
-)
-
-leg = [Patch(facecolor=c, label=lab) for _, c, lab in DRAWN]
-leg.append(Patch(facecolor="white", edgecolor="#999", label="HOLE (no zone — unaccounted)"))
-leg.append(Patch(facecolor="#9467bd", label="RD_CHUNK (KV read)"))
-fig.legend(handles=leg, loc="lower center", ncol=6, fontsize=8, bbox_to_anchor=(0.5, -0.01))
-fig.suptitle(
-    "SDPA-decode big picture: compute-bound (QK^T matmul), KV read hidden on every core, and the "
-    "QK_MM->SM_NORM hole is memory-invariant (L1==DRAM) -> not a read wait",
-    fontsize=11,
-)
-fig.tight_layout(rect=[0, 0.04, 1, 0.97])
-out = f"{BASE}/sdpa_bigpicture.png"
-fig.savefig(out, dpi=130, bbox_inches="tight")
-print("wrote", out)
-print(
-    f"units={n} maxcmp={maxcmp:.0f} rd={rd:.0f}; hole p90 L1={p90l:.0f} DRAM={p90d:.0f}; tail>500 L1={bigl} DRAM={bigd}"
-)
+draw_backend("dram", "dram", "DRAM", f"{BASE}/dram_bigpicture.png")
+draw_backend("l1only", "l1only", "SRAM (L1)", f"{BASE}/sram_bigpicture.png")
+draw_hole_cdf(f"{BASE}/hole_cdf_l1_vs_dram.png")
