@@ -101,10 +101,21 @@ def load_units(tag):
     return units
 
 
-def rd_median(readtag):
+def rd_stats(readtag):
+    # Per-core RD_CHUNK durations. Return the DISTRIBUTION (p10/median/p90/max), not a single
+    # number: DRAM reads are near-uniform across cores (~5%), but L1 reads have a fat tail
+    # (NoC hop/contention), so a single line would misrepresent L1. Durations only (cross-core
+    # absolute placement is not constructible: per-core counters are on different epochs).
     z = parse(f"{BASE}/zones_rw_{readtag}/profile_log_device.csv", {"RD_CHUNK"})
-    d = [(e - s) * C2NS for _, zn, s, e in z]
-    return st.median(d) if d else 0.0
+    percore = defaultdict(list)
+    for key, zn, s, e in z:
+        percore[key[0]].append((e - s) * C2NS)
+    d = sorted(st.median(v) for v in percore.values())  # per-core medians
+    if not d:
+        return (0.0, 0.0, 0.0, 0.0)
+    m = len(d)
+    pct = lambda p: d[min(m - 1, int(p * (m - 1)))]
+    return (pct(0.1), pct(0.5), pct(0.9), d[-1])
 
 
 def holes(tag):
@@ -119,7 +130,7 @@ def holes(tag):
 
 def draw_backend(tag, readtag, label, out):
     units = load_units(tag)
-    rd = rd_median(readtag)
+    rd_p10, rd_med, rd_p90, rd_max = rd_stats(readtag)
     n = len(units)
     maxcmp = units[-1]["cmp"]
     fig, (axA, axC) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1.1]})
@@ -135,7 +146,10 @@ def draw_backend(tag, readtag, label, out):
                 continue
             axA.broken_barh([(x, w)], (i - 0.45, 0.9), facecolors=FILL[name])
             x += w
-    axA.axvline(rd, color="#9467bd", lw=2.0, ls="--")
+    # KV read shown as a per-core band [p10,p90] + median + max tail, NOT a single line.
+    axA.axvspan(rd_p10, rd_p90, color="#9467bd", alpha=0.18)
+    axA.axvline(rd_med, color="#9467bd", lw=2.0, ls="--")
+    axA.axvline(rd_max, color="#9467bd", lw=1.0, ls=":")
     axA.set_xlim(0, maxcmp * 1.08)
     axA.set_ylim(-2, n + 2)
     axA.set_ylabel("units (64 cores x 3 TRISC), sorted by envelope")
@@ -153,7 +167,10 @@ def draw_backend(tag, readtag, label, out):
             continue
         axC.broken_barh([(x, w)], (0.55, 0.8), facecolors=FILL[name])
         x += w
-    axC.broken_barh([(300, rd)], (-0.45, 0.8), facecolors="#9467bd")
+    # read bar to per-core median, lighter band median->p90, dotted whisker to max tail
+    axC.broken_barh([(300, rd_med)], (-0.45, 0.8), facecolors="#9467bd")
+    axC.broken_barh([(300 + rd_med, rd_p90 - rd_med)], (-0.45, 0.8), facecolors="#9467bd", alpha=0.3)
+    axC.plot([300 + rd_max, 300 + rd_max], [-0.45, 0.35], color="#9467bd", lw=1.0, ls=":")
     axC.set_yticks([-0.05, 0.95])
     axC.set_yticklabels(["NCRISC\nread", "TRISC\ncompute"])
     axC.set_ylim(-0.8, 1.6)
@@ -162,11 +179,15 @@ def draw_backend(tag, readtag, label, out):
     axC.set_title(f"C. Bottleneck unit — {label}", fontsize=11)
     leg = [Patch(facecolor=c, label=lab) for _, c, lab in DRAWN]
     leg.append(Patch(facecolor="white", edgecolor="#999", label="hole (no zone)"))
-    leg.append(Patch(facecolor="#9467bd", label="RD_CHUNK (KV read)"))
+    leg.append(Patch(facecolor="#9467bd", label="RD_CHUNK KV read (band=per-core p10-p90, dotted=max)"))
     fig.legend(handles=leg, loc="lower center", ncol=6, fontsize=8, bbox_to_anchor=(0.5, -0.02))
     fig.tight_layout(rect=[0, 0.05, 1, 1])
     fig.savefig(out, dpi=130, bbox_inches="tight")
-    print("wrote", out, f"(units={n}, maxcmp={maxcmp:.0f}, rd={rd:.0f})")
+    print(
+        "wrote",
+        out,
+        f"(units={n}, maxcmp={maxcmp:.0f}, rd p10/med/p90/max={rd_p10:.0f}/{rd_med:.0f}/{rd_p90:.0f}/{rd_max:.0f})",
+    )
 
 
 def draw_hole_cdf(out):

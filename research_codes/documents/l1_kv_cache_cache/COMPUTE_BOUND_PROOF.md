@@ -247,13 +247,20 @@ tok/s (measured 20.95, up from 20.90). This is why L1 reaches exact host parity 
 - **`dram_bigpicture.png` / `sram_bigpicture.png`** — per-backend SDPA-decode big picture.
   *Panel A:* each of the 192 (core × TRISC) units' compute timeline, sorted by envelope length;
   segments `pre | QK_MM | <hole> | SM_NORM | rest(PV_MM+rescale+post)` sum to the unit's CMP_CHUNK.
-  The QK_MM→SM_NORM interval is left BLANK (a hole — no zone covers it, Section 7). The dashed line
-  is the per-chunk KV read (RD_CHUNK); it sits left of every unit ⇒ read is hidden on every core.
-  *Panel C:* the bottleneck unit (longest envelope, sets op latency) with its read bar — the read
-  ends inside the QK^T matmul alone. The two charts are near-identical: SDPA compute is the same
-  whether KV is in DRAM or SRAM. (The SRAM Panels omit the small green PV/rest tail — the
-  CMP_CHUNK envelope zone is dropped by the profiler on the L1 path, so the SRAM timeline ends at
-  SM_NORM; QK_MM-dominance, the hole, and read-hidden are unaffected.)
+  The QK_MM→SM_NORM interval is left BLANK (a hole — no zone covers it, Section 7). The KV read
+  (RD_CHUNK) is drawn as a **per-core distribution, not a single line**: a shaded band spanning the
+  per-core p10-p90, a dashed median, and a dotted line at the per-core max. This is deliberate — the
+  read is *not* uniform across cores in general. Measured per-core read medians: **DRAM 4609-4845 ns
+  (1.05x spread, band collapses to ~a line because flash-decode splits the context evenly across the
+  64 cores and DRAM-bank latency is balanced); SRAM/L1 4399-6508 ns (1.48x, all-sample tail to
+  ~10100 ns)** because the sharded KV is pulled over the NoC with variable hop distance/contention.
+  Even the L1 max tail sits left of the compute envelope ⇒ read still hidden on every core, now shown
+  honestly rather than as a fake uniform line. (Only read *durations* are plotted, anchored at each
+  row's own compute start — per-core absolute placement on a shared clock is not constructible:
+  per-core counters are on different epochs.) *Panel C:* the bottleneck unit (longest envelope, sets
+  op latency); its read bar runs to the per-core median with a lighter band to p90 and a dotted
+  whisker to the max — the read ends inside the QK^T matmul alone. The two charts are near-identical:
+  SDPA compute is the same whether KV is in DRAM or SRAM.
 - **`hole_cdf_l1_vs_dram.png`** — CDF of the QK_MM→SM_NORM hole duration, SRAM vs DRAM. The two
   curves coincide (p90 ~590 vs ~541 ns; >500 ns tail ~12% both) ⇒ the hole is memory-invariant, so
   it is not a read wait (Section 7).
