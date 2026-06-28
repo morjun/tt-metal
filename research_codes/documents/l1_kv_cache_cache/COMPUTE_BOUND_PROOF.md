@@ -306,6 +306,112 @@ KV-bytes-per-compute, KV larger than fits one chip's L1 (⇒ quantization / mult
 lever), or multi-chip where per-chip DRAM BW is divided while KV is replicated. None is a layout
 change. This is the quantitative form of "the lever is capacity, not layout."
 
+### Why massive context (100K+) still does not saturate DRAM — even though the KV tensor grows
+
+The intuition "a 100K-token KV is huge, so surely the read finally saturates the bus" conflates a
+**total** with a **rate**. Bandwidth saturation is about GB/s (a rate), not GB (a size). What
+matters is how many bytes the read must move *per unit of compute time it has to hide behind*, and
+that ratio does not grow with context.
+
+**Both terms grow linearly, so the rate is invariant.** Per decode step at context `C`, flash-decode
+attends to all `C` cached positions:
+- bytes read `READ(C) = C · n_kv_heads · head_dim · 2 · dtype_bytes` — linear in `C`.
+- compute time `T(C) = intercept + slope · C` — also linear in `C` (the QK^T and PV matmuls run over
+  all `C` positions; measured `T ≈ 3.9 + 0.0116·C` µs for Llama-8B).
+
+The read **demand** is their ratio:
+```
+DEMAND(C) = READ(C) / T(C) = (b · C) / (intercept + slope · C),   b = bytes/token
+```
+As `C → ∞` this tends to `b / slope` — a constant (the per-token byte count over the per-token
+compute slope, = 353 GB/s bf16 / 188 bfp8 for Llama-8B). A 10× or 100× larger context multiplies
+numerator and denominator by the same factor, so the rate is unchanged. The tensor is bigger, but
+the kernel also takes proportionally longer to consume it, and the bus sees the same GB/s.
+
+**Long context moves demand UP toward the asymptote, never past it.** Because of the fixed `intercept`
+(per-op setup that does not scale with `C`), `DEMAND(C)` is actually *lower* at short context and
+rises monotonically toward `b/slope`. So 100K context is the regime *closest* to saturation, and it
+still tops out at the asymptote (353 GB/s bf16) — ~31% below the ~512 GB/s ceiling. Massive context
+maximizes the read rate and is still not enough; nothing longer helps, because the asymptote is the
+ceiling on demand and it is set by the per-token ratio, not by `C`.
+
+**Empirical confirmation.** Measured 1-layer DRAM SDPA-decode latency is linear out to 24,576 tokens
+(41.3 / 67.0 / 117.1 / 165.4 µs at 4K / 8K / 16K / 24K; slope ~0.006 µs/tok, if anything slightly
+*decreasing*). A read that was starting to expose past compute would bend the curve **supra-linearly**
+(latency growing faster than `C` as the read rate hit the bus limit). It does not bend — confirming
+the read stays hidden and the demand stays on its sub-ceiling asymptote even at large `C`.
+
+**What would break the linearity (and none applies here).** Demand would rise with `C` only if read
+grew *faster* than compute — e.g. an attention variant whose compute is sub-linear in context while
+the read is not. Standard full attention is linear-linear (ratio fixed); sliding-window attention
+caps *both* read and compute at the window (ratio still fixed). So no full-attention decode, at any
+context, raises the per-token ratio. (Separately, at 100K the KV cannot fit L1 anyway — the L1 path
+caps near 4K via the non-paged prefill route — but that is the capacity limit, independent of this
+bandwidth argument, which is about DRAM.)
+
+### Strict proof: neither batch size nor context reaches the compute↔memory crossover
+
+**Claim.** The SDPA-decode read is exposed (and faster L1 could win) iff the aggregate KV-read
+bandwidth demand reaches the aggregate DRAM ceiling, `DEMAND ≥ CEILING`. `DEMAND` is **invariant
+under both batch size `B` and context length `C`**. Therefore no choice of `B` or `C` can reach the
+crossover on a single chip. The context half was shown above; this is the unified, strict form
+covering `B` as well, with the on-device mechanism that makes it true.
+
+**Setup (one decode step, batch `B`, context `C`).** The decode SDPA op processes all `B` users in a
+single invocation and distributes the `B · n_q_heads` query-head jobs across the `P` active Tensix
+cores. Per user, attention reads that user's whole K and V cache and does the QK^T/PV matmuls over
+all `C` positions. So, summed over the chip:
+- **Aggregate bytes read per step:** `READ = B · C · n_kv_heads · head_dim · 2 · dtype_bytes`
+  (`B` independent per-user caches, each `C` long; the `2` is K and V).
+- **Aggregate MACs per step:** `MACs = B · C · n_q_heads · head_dim · κ` (`κ` folds the fixed
+  per-position QK^T+PV+softmax work; constant for the kernel).
+- **Wall-clock compute time:** the `P` cores run in parallel at MAC rate `R` each, so
+  `T = MACs / (P · R) = B · C · n_q_heads · head_dim · κ / (P · R)`.
+
+**The cancellation.** Aggregate read-bandwidth demand is bytes ÷ the time available to move them:
+```
+DEMAND = READ / T
+       = [B · C · n_kv_heads · head_dim · 2 · dtype_bytes]
+         ----------------------------------------------------------
+         [B · C · n_q_heads · head_dim · κ / (P · R)]
+       = (n_kv_heads / n_q_heads) · dtype_bytes · (2 · P · R / κ)
+```
+**`B` and `C` both cancel** (and so do `head_dim` and `κ`-independent factors). What remains is a
+per-token architectural ratio times a hardware constant — the same `Κ`-form as the per-op DEMAND
+above, now derived at the chip-aggregate level. So scaling batch or context multiplies the bytes
+read and the compute time *by the same factor*, leaving the GB/s demand fixed. `DEMAND` sits at its
+asymptote (Llama-8B: 353 GB/s bf16 / 188 bfp8) for every `B` and `C`, never the ~512 GB/s ceiling.
+
+**Why the time-denominator really does scale with `B` (the on-device mechanism, not an assumption).**
+The proof needs `T ∝ B` (more batch ⇒ proportionally more compute time to hide the proportionally
+larger read behind). That is exactly how the kernel shards batch:
+- `sdpa_decode_program_factory.cpp:213,221`:
+  `num_cores_per_batch = num_active_cores / B` — the `P` cores are *divided among* the `B` users, so
+  each user gets `P/B` cores. Per-core work (hence per-core read and per-core compute) is set by the
+  heads-per-core, **independent of `B`** (`num_heads_per_core` at `:216`, `PNHt` from head count not
+  batch). Adding batch does not make any core's slice cheaper; it consumes more of the fixed `P`
+  cores, and once `B ≥ P` (cores can no longer subdivide, `num_cores_per_batch` floors at 1) extra
+  users serialize on a core — `T` then grows with `B` directly. Either way `READ` and `T` scale with
+  `B` together.
+- The KV cache is **per-user** (batch is a dimension of the cache tensor), so reading `B` users is
+  `B×` the bytes — the numerator's `B` is structural, not incidental.
+Context `C` scales both sides identically by construction (read all `C`, compute over all `C`), as in
+the subsection above.
+
+**Boundary cases (all preserve the result).**
+1. `B > P` (more users than cores): batch serializes on cores, `T ∝ B` directly; ratio still fixed.
+2. Finite `B, C` vs the asymptote: the fixed per-op `intercept` makes `DEMAND` *lower* than the
+   asymptote at small `B·C` and rising toward it as `B·C` grows — so scaling up only ever
+   *approaches* 353 GB/s from below, never crosses 512.
+3. KV dtype / GQA ratio: these are the *only* knobs in the surviving expression — they are model
+   architecture, not `B` or `C` (see the per-model table below).
+
+**Conclusion.** `∂DEMAND/∂B = 0` and `∂DEMAND/∂C = 0`. Batch and context move the read demand and the
+compute that hides it in lockstep; neither can drive the SDPA read past the DRAM ceiling, so neither
+creates the compute↔memory crossover where faster L1 memory would help. (This is the SDPA/KV stream.
+For the *whole step*, batch interacts with the **weight** stream oppositely — see §8c — but that
+relieves DRAM, it does not saturate via KV either.)
+
 ### When can DRAM bandwidth saturate? (and why multi-chip alone cannot) — detailed
 
 **The governing quantity.** DRAM is saturated (the read stops being hideable) iff, per chip,
@@ -439,6 +545,57 @@ head_dim-96 offset) shrinks the L1-resident context to ≈1/3, so the L1 win is 
 that larger KV still fits; (2) this is an **analytical prediction** from the calibrated Κ and the
 published Phi-3 head config (the repo loads it from HF, not a local params file), not an on-device
 measurement — and Phi-3-mini is not supported on P150, so it was not run.
+
+---
+
+## 8c. Full-step scope: weights saturate DRAM, KV does not (and L1-KV is the wrong stream)
+
+Everything above scopes the *SDPA op*. Widen the scope to a whole decode step (embedding → 32
+decoder layers → norm → LM head) and the binding resource changes: the dominant DRAM traffic is
+**weight streaming**, not KV. At batch-1 every weight matrix is read from DRAM once per token and
+used in an `M=1` matmul, so the step is weight-bandwidth-bound, not compute-bound, the moment the
+fixed dispatch overhead is removed. This does **not** rescue L1-KV — it relocates a stream that is
+~1% of the traffic.
+
+**Per-step DRAM traffic (Llama-3.1-8B, BFP8 weights & KV, ctx 896):**
+| stream | bytes / token | share |
+|---|---|---|
+| model weights (32 layers QKV+WO+FF1+FF3+FF2 + LM head, read once each) | **7.97 GB** | 99.2% |
+| KV cache read (SDPA, all layers) | **62 MB** | 0.8% |
+
+Weights outweigh the KV read **~128:1**. (Ratio is layer-count- and context-independent: both scale
+with layers; KV also scales with context, but even at 32k context KV is ~2.2 GB vs ~8 GB weights.)
+
+**Is DRAM saturated? Separate the fixed overhead with a layer differential.** Two measured runs at
+different depths cancel the layer-independent per-step cost (dispatch, kernel launch, sampling, CCL):
+- 2-layer (zone run): ~32.0 ms/step.   32-layer (trace run, 20.95 tok/s): 47.7 ms/step.
+- Marginal cost of 30 layers = 15.7 ms ⇒ **0.524 ms/layer** for **232 MB/layer** ⇒
+  **442 GB/s ≈ 86% of the 512 GB/s spec** — i.e. the per-layer weight stream runs **at DRAM
+  saturation**.
+- Extrapolated fixed overhead ≈ **31 ms/step**, layer-independent.
+- Time-averaged over the whole 47.7 ms step: only **167 GB/s (33% of spec)** — the fixed overhead
+  dilutes the average.
+
+**Diagnostic that nails the regime:** 16× the layers (2→32) slows the step only ~1.5× (32→47.7 ms).
+A throughout-bandwidth-bound step would slow ~16×. The near-flatness proves the *measured* config is
+**dispatch-bound**, with the weight-streaming portion saturating DRAM underneath that overhead. This
+matches the code: the DRAM-sharded weight matmuls use HiFi2 precisely so the math keeps up with the
+weight DMA (`attention.py:1246`) — they are deliberately tuned to be DRAM-read-bound. A fully
+trace-/dispatch-optimized deployment shrinks the 31 ms fixed cost and pushes the end-to-end step
+toward the 442 GB/s weight-bound ceiling.
+
+**Why this still does not help L1-KV.** Even in the weight-saturated regime, KV is <1% of DRAM load,
+so moving it to L1 removes <1% of the bottleneck stream — the weights still come from DRAM. The
+lever matched to a weight-bound step is **weight-resident L1** (cache weights, not KV), which only
+fits for a tiny model (8B BFP8 weights ≈ 8 GB ≫ ~100 MB aggregate L1; a small draft model's weights
+could fit). So the scope widening confirms, rather than overturns, the thesis: SDPA stays
+compute-bound, the full step is weight-bandwidth-bound, and in neither scope is the KV stream the
+constraint that L1 layout could relieve.
+
+Confidence: high on the 128:1 ratio and the differential method (it cancels fixed overhead by
+construction); medium on the absolute 442 GB/s (it rides on the 2-layer step ≈ 32 ms carrying the
+same fixed overhead as the 32-layer step, and on the 512 spec rather than a measured sustained
+aggregate).
 
 ---
 
