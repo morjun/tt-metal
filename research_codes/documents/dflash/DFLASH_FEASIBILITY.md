@@ -25,16 +25,17 @@ Inputs: `dflash.pdf` (DFlash: Block Diffusion for Flash Speculative Decoding, Ch
    blob) in L1. Caveat: whether the draft fully fits L1 is a capacity question (a target-width 5-layer
    draft is ~GB-scale > aggregate L1; a narrower draft could fit). Note a weight-caching feature was
    built and **removed** on this branch (`8afb4bb`, `114e5a7`) — this would build on that.
-6. **DFlash vs the In-SRAM RAG proposal — different axes (see `../sram_rag/FEASIBILITY.md`).** The
-   *revised* In-SRAM RAG proposal fixed its earlier correctness-fatal flaw (it no longer claims the QKV
-   projection computes similarity; it adds an explicit `Q·K_doc` dot and hides the threshold on the idle
-   scalar core during the FPU-bound SDPA). It is now mechanistically sound but targets a **different
-   axis**: it adds RAG capability at ~zero marginal decode latency (~0 speedup by design), whereas
-   DFlash delivers 4-6× raw decode speedup. For pure decode performance, pick DFlash. The RAG path is a
-   legitimate, higher-novelty research direction gated on an offline retrieval-quality (Recall@K) study
-   of its untrained in-core metric. The shared "use the idle batch-1 capacity" instinct now lands
-   correctly in both (DFlash fills matmul rows with real verify tokens → fewer dispatches; In-SRAM RAG
-   fills them with docs to precompute K_doc → a useful free byproduct).
+6. **DFlash vs the In-SRAM RAG proposal (see `../sram_rag/FEASIBILITY.md`).** The *revised* In-SRAM RAG
+   proposal fixed its earlier correctness-fatal flaw (explicit `Q·K_doc` dot; threshold hidden on the
+   idle scalar core during the FPU-bound SDPA), so the mechanism is now sound and near-free. But it
+   targets the **wrong part of the RAG pipeline**: it makes the in-core re-ranking of a host-prefiltered
+   Top-1000 free, while the expensive retrieval work (full-corpus ANN) stays on the host and the real
+   end-to-end bottleneck (generation) is untouched — and re-ranking 1000 candidates was trivial and
+   amortized anyway. So DFlash is the clear pick for impact (it attacks generation, the actual
+   bottleneck, with measured 4-6×); In-SRAM RAG is a near-free mechanism of narrow value, gated on an
+   unproven retrieval-quality question. The shared "use the idle batch-1 capacity" instinct lands
+   usefully only in DFlash (real verify tokens → fewer dispatches); in In-SRAM RAG it produces a free
+   but marginal byproduct.
 
 ---
 

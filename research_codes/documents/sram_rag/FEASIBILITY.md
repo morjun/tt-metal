@@ -1,126 +1,126 @@
-# Feasibility re-evaluation — In-SRAM RAG (revised proposal) vs DFlash
+# Feasibility evaluation — In-SRAM RAG (revised proposal) vs DFlash
 
-Re-evaluates the **revised** `proposal.md` (now with §2.1 distributed placement and §2.4 asynchronous
-thresholding + micro-rollback) against this project's measured results
-(`../l1_kv_cache_cache/COMPUTE_BOUND_PROOF.md`, `../l1_kv_cache_cache/notes.md`) and against the DFlash
-path (`../dflash/DFLASH_FEASIBILITY.md`). Platform: Blackhole P150. Supersedes the prior review, which
-judged the pre-revision proposal.
+Evaluates the **revised** `proposal.md` (§2.1 distributed placement, §2.4 async thresholding +
+micro-rollback) against this project's measured results (`../l1_kv_cache_cache/COMPUTE_BOUND_PROOF.md`,
+`../l1_kv_cache_cache/notes.md`) and the DFlash path (`../dflash/DFLASH_FEASIBILITY.md`).
+Platform: Blackhole P150.
 
-## Verdict (updated)
-**The revision fixes the correctness-fatal flaw. In-SRAM RAG is now mechanistically sound and a
-legitimate, novel research direction — gated on one empirical make-or-break question (the retrieval
-quality of the in-core score).** It is no longer "not feasible." DFlash remains the stronger bet for
-*raw decode speedup*, but the two now target **different axes**: DFlash makes decode 4-6× faster;
-In-SRAM RAG adds a RAG capability at ~zero marginal decode latency (≈0 speedup by design). "Which is
-more promising" therefore depends on the goal — see §5.
+> Verdict history (for honesty): v1 judged the original proposal "not feasible / not promising." v2
+> over-corrected to "promising, different axis" by crediting the repaired mechanism but quietly
+> retiring a still-valid objection (it optimizes a cheap, amortized sub-step of RAG). This version is
+> the corrected, stable verdict: **the mechanism is sound and near-free, but it targets the wrong part
+> of the RAG pipeline, so its expected impact is low.** Both the mechanism credit (v2) and the
+> wrong-bottleneck critique (v1) are kept; the inflated "promising" framing is removed.
+
+## Verdict
+The revision fixes the correctness-fatal flaw, so In-SRAM RAG is now a **sound, near-zero-cost
+mechanism**. But it is elegance applied to a step that was never expensive: it makes the in-core
+**re-ranking of a host-prefiltered Top-1000** free, while the costly retrieval work (full-corpus ANN
+search) stays on the host and the real end-to-end decode bottleneck (generation) is untouched. So for
+**impact**, DFlash remains the stronger bet. In-SRAM RAG is worth pursuing only as (a) a niche
+capability — per-token adaptive re-ranking/injection within the resident pool — and only if (b) its
+in-core retrieval metric actually ranks documents well, which is unproven and must be measured first.
 
 ---
 
-## 1. What the revision fixed (genuine credit)
-The earlier version claimed the QKV projection *itself* computed the query-doc similarity (false:
-matmul rows are independent). The revision replaces that with a coherent three-part mechanism:
+## 1. What the revision genuinely fixed (mechanism credit)
+The original claimed the QKV projection *itself* yielded the similarity (false — matmul rows are
+independent). The revision is a coherent, mostly-correct mechanism:
+1. **Free K_doc precompute (§2.2).** `Y = X·W_qkv` with rows 1-9 = resident doc vectors yields each
+   doc's projected **K** for free — the matmul processes the full 32-row tile and streams `W_qkv` once
+   regardless of populated rows (batch-1 linear ops are weight-streaming-bound, `COMPUTE_BOUND_PROOF.md`
+   §8c). Filling the idle rows is legitimate *here* because the result (K_doc) is consumed downstream.
+2. **Explicit `Q_token · K_doc` dot (§2.4.1).** The real score, replacing the false "projection =
+   similarity."
+3. **Threshold hidden on the idle scalar core during the FPU-bound ~8900 ns SDPA (§2.4.2-3).** A
+   correct use of the measured compute-bound result (BRISC is idle while the FPU runs SDPA).
 
-1. **Free K_doc precompute in the projection's idle rows (§2.2).** `Y = X·W_qkv` with rows 1-9 = the
-   8-9 resident doc vectors yields `doc_i·W_qkv`, i.e. each doc's projected **K** (and Q,V). This is
-   genuinely free in wall-clock: the matmul processes the full 32-row tile and streams `W_qkv` once
-   regardless of how many rows are populated (batch-1 linear ops are weight-streaming-bound,
-   `COMPUTE_BOUND_PROOF.md` §8c). **This is the one correct use of "fill the idle rows"** — because the
-   filled rows now produce a *useful byproduct* (K_doc) consumed downstream, not a discarded one.
-2. **Explicit `Q_token · K_doc` dot (§2.4.1).** `score_i = (e_tok·W_q)·(e_doc_i·W_k)` is the actual
-   similarity — the model's own attention logit between the current token and each doc-as-key. This is
-   a real `[9×head_dim]·[head_dim]` tile MAC and replaces the false "projection = similarity" claim.
-3. **Threshold hidden on the idle scalar core during the FPU-bound SDPA (§2.4.2-3).** The ~8900 ns
-   SDPA is FPU-bound (measured: QK^T ≈ 77% of the envelope, FPU 68-84%, `COMPUTE_BOUND_PROOF.md` §4),
-   so the scalar core (BRISC) is idle during it; a ~50 ns threshold check there is genuinely hidden.
-   **This is the correct "zero-overhead" mechanism** — overlap with idle BRISC, not the (false) "free
-   because matmul rows are idle." It is a correct application of this project's compute-bound result.
+Precision: the cost is **near**-zero, not zero — the `Q·K` dot is ~100 ns of FPU **serial** with the
+SDPA on the same engine (~1% of the per-layer FPU window); only the ~50 ns BRISC threshold is truly
+hidden. Per-step DRAM is genuinely zero (docs resident in L1, loaded once per query).
 
-Also now defensible: **per-step zero DRAM bandwidth (§2.3).** The Top-1000 set is retrieved once per
-query and resides in L1 across the whole generation (≈68 KB/core for 4096-dim vectors — trivial), so
-*per decode step* the RAG adds no DRAM traffic. The one-time host→L1 load is amortized over all decode
-steps (my earlier "reintroduces PCIe per step" objection was wrong; it is once per query).
+## 2. The decisive limitation — it optimizes a cheap, amortized sub-step (the real point)
+This is why "near-free mechanism" does not translate to "promising system":
+- **The expensive retrieval work stays on the host.** §2.1 step 1 keeps the full-corpus ANN search
+  (Top-1000 out of millions/billions) on the host. That — plus the host→device transfer of candidates —
+  is the hard, costly part of retrieval, and the proposal does not touch it.
+- **What it makes free was already trivial.** Re-ranking 1000 candidates is ~1000 dot products —
+  microseconds anywhere. Making that free saves a negligible absolute amount of time.
+- **It is not even the end-to-end bottleneck.** In standard one-shot RAG, retrieval runs once per query
+  and is amortized over the whole generation (hundreds of tokens), so generation dominates end-to-end —
+  and generation is exactly what DFlash accelerates and what In-SRAM RAG leaves unchanged.
 
-## 2. The make-or-break risk: retrieval quality (the one thing to test first)
-The score is the model's attention metric `(e_tok·W_q)·(e_doc·W_k)` applied to **document hidden-state
-vectors**. Open questions, all unproven:
-- **Untrained for retrieval.** `W_q, W_k` were trained for next-token attention, not document relevance.
-  Using them as a retriever may or may not rank documents well.
-- **Representation.** A document is many tokens; `e_doc` must be a single pooled hidden state (lossy),
-  and the docs must live in the LLM's hidden space (not a separate encoder's space).
-- **Per-head.** The score is per attention head (`n_q` of them) — needs pooling across heads.
-- **Which layer.** The projection/SDPA happen at every layer; the proposal must fix which layer's
-  `W_q/W_k` defines the score.
+So the proposal inserts itself at the one point in the RAG pipeline that is both cheap and amortized. A
+correct, near-zero-cost mechanism aimed there yields a near-zero-impact system. (This is the
+"wrong-bottleneck" critique from v1, which the revision does not address and which v2 wrongly dropped.)
 
-This is exactly what §3.2 (Recall@K vs Faiss/Milvus) measures, and it must be done **first, offline, in
-pure Python — before any kernel work**. If the in-core metric does not retrieve competitively, no amount
-of clever kernel hiding matters. High uncertainty; this is where the proposal lives or dies.
+## 3. The make-or-break question — does the in-core metric actually retrieve? (unproven)
+Stated honestly: the metric is **not proven inadequate, but it is unvalidated and plausibly weak.** The
+score is the model's own attention geometry `(e·W_q)·(e·W_k)`.
+- *Could work:* it is the model's native "what would I attend to" relevance, arguably better aligned
+  with generation than an external cosine similarity.
+- *May not:* `W_q,W_k` were trained for next-token attention, not document ranking; a document must be a
+  single pooled hidden vector (lossy); the score is per-head (needs pooling); docs must live in the
+  LLM's hidden space, not a sentence-encoder's.
 
-## 3. Remaining issues to fix in the writeup (not fatal, but needed)
-1. **§2.2 wording.** State explicitly that the rows precompute **K_doc, consumed in §2.4.1**; delete any
-   residual "projection into latent space = retrieval" implication.
-2. **§2.4.4 micro-rollback semantics.** "Append the retrieved document's K,V" injects a single vector,
-   but a real document is many tokens. Specify: either a 1-vector summary (weak context) or a real
-   multi-token doc prefill (which is *not* "micro" — it is a chunked-prefill of the doc, the expensive
-   path). And threshold injection **changes the output** — it is a deliberate behavior change, not
-   "structural correctness." Frame it as a quality feature, not losslessness.
-3. **Contribution 2 ("100% FPU utilization").** Reframe. At batch-1 a higher FPU-utilization counter
-   does **not** imply speedup — the matmul is weight-streaming-bound, so filling rows changes the metric,
-   not the wall-clock (`COMPUTE_BOUND_PROOF.md` §8c). The real contribution is "**free in-core K_doc
-   precompute + score fully hidden behind SDPA**," not "100% utilization → faster."
-4. **Hit-rate assumption.** The "1% hit" figure is unjustified (depends on threshold + corpus). If hits
-   are frequent, each costs a recompute (and possibly a doc prefill), so the amortization claim needs a
-   sensitivity analysis.
+This is testable offline (the §3.2 Recall@K plan) and **must be the first experiment** — pure PyTorch,
+no kernels. If it fails, nothing else matters. High uncertainty.
 
-## 4. Feasibility on tt-metal (the revised mechanism)
+## 4. The one real-but-narrow upside
+To be fair to the proposal: per-token, generation-adaptive re-ranking/injection at ~zero marginal
+latency is something one-shot host RAG cannot do cheaply (a host round trip per token would be
+prohibitive). As the generation evolves, the model can pull in a different one of the resident
+candidates. That is a genuine capability — but bounded: the candidate pool is a **one-shot host
+retrieval**, so if the generation needs a document outside the original 1000, the mechanism cannot fetch
+it (that would require per-token corpus search, which it does not do). So the upside is "adaptively
+re-rank within a frozen pool," gated on §3.
+
+## 5. Remaining writeup fixes (if pursued)
+1. §2.2: say the rows precompute **K_doc consumed in §2.4.1**; drop any "projection = retrieval" wording.
+2. §2.4.4 micro-rollback: a single K,V vector ≠ a multi-token document; specify whether injection is a
+   1-vector summary (weak) or a real multi-token doc prefill (not "micro"). And it changes the output —
+   frame as a behavior feature, not "structural correctness."
+3. Contribution 2 ("100% FPU utilization"): reframe. Higher batch-1 FPU utilization does not imply
+   speedup (the matmul is weight-streaming-bound). The real contribution is "free K_doc precompute +
+   score hidden behind SDPA," not "100% utilization → faster."
+4. "Zero overhead": say **near**-zero (~1% FPU for the dot; threshold hidden), not literally zero.
+
+## 6. Feasibility on tt-metal (the mechanism is implementable)
 | step | primitive / change | feasibility |
 |---|---|---|
-| dual-fetch docs into projection rows 1-9 | NCRISC reads L1-resident doc vectors into `X` | small kernel change ✓ |
-| free K_doc via projection | reuse the existing QKV matmul (tile + weight stream unchanged) | correct, free ✓ |
-| `Q_token · K_doc` score | a small tile MAC (`[9×dh]·[dh]`) | straightforward ✓ |
-| threshold on BRISC during SDPA | scalar op on the idle 5th RISC | plausible ✓ (BRISC idle during FPU-bound SDPA) |
-| micro-rollback / doc injection into KV | discard token + insert doc K,V + recompute | **hard**; same rollback complexity as spec-decode, lands on the KV ring-write path |
+| dual-fetch docs into projection rows | NCRISC reads L1-resident doc vectors into `X` | small kernel change ✓ |
+| free K_doc via projection | reuse the existing QKV matmul | correct, free ✓ |
+| `Q·K_doc` score | small tile MAC (`[9×dh]·[dh]`) | ~100 ns FPU, serial ✓ |
+| threshold on BRISC during SDPA | scalar op on the idle 5th RISC | plausible ✓ |
+| micro-rollback / doc injection into KV | discard token + insert doc K,V + recompute | **hard**; same rollback complexity as spec-decode, on the KV ring-write path |
 
-The mechanism is implementable; the hard engineering is the rollback/injection (shared with the
-spec-decode path), and the hard *research* is §2 (quality).
+Feasible to build; the hard engineering is rollback/injection, and the hard *research* is §3.
 
-## 5. Recalibrated comparison — different axes
+## 7. vs DFlash — recalibrated
 | dimension | In-SRAM RAG (revised) | DFlash |
 |---|---|---|
-| goal | RAG re-ranking + dynamic context injection at ~0 marginal decode latency | make decode 4-6× faster |
-| core mechanism sound now? | **yes** (free K_doc precompute + Q·K dot + BRISC-hidden threshold) | yes |
-| end-to-end decode speedup | ~0 by design (free feature, not faster decode) | 4-6× (measured GPU) |
-| novelty | **high** (first in-core fused RAG; zero-marginal-latency retrieval) | medium (port of a known method) |
-| make-or-break risk | **retrieval quality** of the untrained in-core metric (testable offline) | porting a trained draft checkpoint |
-| per-step DRAM cost | zero (docs resident in L1) | unchanged (weights still stream) |
-| feasibility | feasible; hard parts = quality + rollback | feasible; hard part = checkpoint port |
+| what it changes | makes in-core re-ranking of a host-prefiltered pool free; adds per-token adaptive injection | makes decode 4-6× faster |
+| mechanism sound? | yes | yes |
+| targets a real cost? | **no** — re-ranking is cheap & amortized; corpus ANN (expensive) stays on host; generation (the end-to-end bottleneck) untouched | **yes** — generation, the actual bottleneck |
+| end-to-end impact | ~0 (free but marginal) | large (measured 4-6×) |
+| novelty | high (in-core fused retrieval) but value-narrow | medium (port of a known method) |
+| make-or-break | does the untrained in-core metric retrieve? (unproven) | porting a trained draft checkpoint |
+| feasibility | feasible | feasible |
 
-The shared instinct ("use the idle batch-1 decode capacity") now lands correctly in **both**: DFlash
-fills the matmul rows with *real tokens to verify* (cutting sequential dispatches → speed), and
-In-SRAM RAG fills them with *docs to precompute K* and hides the score on the idle scalar core (→ free
-capability). The earlier objection — "filling idle rows is zero-benefit" — applied only to the old
-version, where the filled rows produced nothing useful; here they produce K_doc.
-
-## 6. Recommendation
-1. **Run the decisive cheap experiment first:** an offline Recall@K study of the in-core metric
-   `(e_tok·W_q)·(e_doc·W_k)` (pure PyTorch, no tt-metal) vs Faiss on a standard RAG benchmark, with the
-   pooling/layer choices fixed. This gates everything and needs no kernel work.
-2. **If quality holds:** In-SRAM RAG is the more *novel/publishable* path — a genuinely new mechanism
-   (zero-marginal-latency in-core retrieval + dynamic KV injection) well-matched to this hardware's
-   FPU-bound SDPA window. Then build the kernel pipeline in §4 and the (shared) rollback path.
-3. **If quality fails:** drop the retrieval-metric angle; DFlash is the safe, high-value path for raw
-   decode speedup.
-4. They are **not mutually exclusive** — different axes (speed vs capability) — and could even compose,
-   though both add KV-rollback complexity, so sequence them rather than build at once.
-
-Net: for an engineering speedup deliverable, **DFlash**. For a novel research contribution, the
-**revised In-SRAM RAG** is now a real candidate, contingent on the offline quality study. The revision
-moved it from "the math is wrong" to "the systems mechanism is right; does the metric retrieve?" — a
-much better place to be.
+## 8. Recommendation
+1. **For decode impact: DFlash.** It attacks the part that actually costs time (generation), with
+   measured 4-6×.
+2. **If the RAG direction is pursued:** run the **offline Recall@K study first** (pure PyTorch). If the
+   in-core metric does not rank competitively, stop — no kernel work is justified.
+3. **The genuinely high-impact RAG target is the one this proposal avoids:** move the coarse corpus ANN
+   search itself **on-device**, so retrieval stops being a host round trip at all. That is much harder
+   but attacks the part of RAG that is actually expensive. In-core re-ranking of a host-prefiltered pool
+   is, by contrast, a free optimization of a cheap step.
 
 ## Confidence
-- **Certain:** the revised mechanism is internally coherent; the free K_doc precompute and the
-  BRISC-hidden threshold are correct uses of this project's measured compute-bound result; per-step DRAM
-  is zero.
-- **Certain:** DFlash is the stronger bet for raw decode speedup; the two optimize different axes.
-- **Speculating (high uncertainty):** the retrieval quality of the untrained in-core metric — the
-  make-or-break — which is untested and must be measured offline before committing kernel effort.
+- **Certain:** the wrong-bottleneck critique (re-ranking 1000 is trivial and amortized; the expensive
+  corpus ANN stays on host; generation is the end-to-end bottleneck) — this is hardware-independent.
+- **Certain:** the revised mechanism is internally sound and near-free; DFlash is the stronger
+  impact bet.
+- **Unknown (must measure):** whether the in-core attention metric retrieves well — the gate on any
+  value at all.
