@@ -75,6 +75,19 @@ Verified in `ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/`:
   Helpers `max_block` (`compute_common.hpp:33`), `reduce_c` (`:64`), `sub_exp_block` (`:297`) are the
   online-softmax primitives. This is precisely the **synchronous cross-split update** the paper
   eliminates — tt-metal does it both across chunks (intra-core) and across cores (inter-split).
+- **Branch note — linear reducer vs O(log n) tree reduction.** The lines above describe the
+  `l1-kv-cache` branch this audit was written against: the reducer combines workers in a **linear
+  reducer-waits-for-workers loop** (one reducer core absorbs `num_cores_per_head - 1` partials
+  serially). The **`upstream` branch implements the same FlashDecoding algorithm but with a more
+  scalable combine — an O(log n) tree reduction** ("Tree reduction reduces the online softmax results
+  in O(log n) rounds", `upstream:.../sdpa_flash_decode.cpp:510`), so partials merge in log-depth
+  rounds instead of a single serial fan-in. Crucially, **both variants are still synchronous and
+  max-based** (each merge step does `max_block` + `exp(Δmax)` rescale, e.g. `upstream:...:536-546`);
+  neither uses the paper's unified-φ async combine. So the tree reduction is an orthogonal
+  scalability improvement to the *cross-core barrier structure*, not an adoption of FlashDecoding++Next
+  — the synchronous max-rescale the paper removes is present in both. (FlashDecoding itself — KV split
+  across cores + online softmax + LSE combine — is core upstream tt-metal, not added by this feature
+  branch; the L1-KV read path is layered on top of it.)
 - **No unified-φ path.** There is no fixed-scale softmax option, no φ constant, no overflow
   recomputation fallback. The scale applied is the QK scale (`scale_fp32`), not a softmax-stabilizing
   unified max; stabilization is always via the running/elementwise max.
@@ -85,7 +98,7 @@ Verified in `ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/`:
 | softmax stabilizer | **unified constant φ** (per Eq. 3) | **running / elementwise max** (`cb_m_in`) |
 | partial-split combine | independent, then plain sum (async) | **max + `exp(Δmax)` rescale** (synchronous) |
 | intra-core across chunks | no rescale (φ fixed) | per-chunk `SM_RESCALE` (`reduce_c` + `sub_exp`) |
-| inter-core across splits | plain numerator/denominator add | reducer waits workers, max-rescale combine (`:506-549`) |
+| inter-core across splits | plain numerator/denominator add | synchronous max-rescale combine — **linear** reducer loop on `l1-kv-cache` (`:506-549`), **O(log n) tree reduction** on `upstream` (`:510`) |
 | overflow handling | recomputation fallback when `x-φ∉[a,b]` | n/a (max guarantees no overflow) |
 | target overhead | ~18.8% softmax sync (A100) | carries that sync, intra- and inter-core |
 
