@@ -30,6 +30,8 @@ independent). The revision is a coherent, mostly-correct mechanism:
    doc's projected **K** for free — the matmul processes the full 32-row tile and streams `W_qkv` once
    regardless of populated rows (batch-1 linear ops are weight-streaming-bound, `COMPUTE_BOUND_PROOF.md`
    §8c). Filling the idle rows is legitimate *here* because the result (K_doc) is consumed downstream.
+   **Caveat (see §3a):** this is free only if what sits in the rows is already in the LLM hidden space —
+   raw RAG embeddings require an offline alignment map first, or the piggyback breaks.
 2. **Explicit `Q_token · K_doc` dot (§2.4.1).** The real score, replacing the false "projection =
    similarity."
 3. **Threshold hidden on the idle scalar core during the FPU-bound ~8900 ns SDPA (§2.4.2-3).** A
@@ -65,6 +67,32 @@ score is the model's own attention geometry `(e·W_q)·(e·W_k)`.
 
 This is testable offline (the §3.2 Recall@K plan) and **must be the first experiment** — pure PyTorch,
 no kernels. If it fails, nothing else matters. High uncertainty.
+
+## 3a. The embedding-space alignment requirement (a gap in §2.2)
+The mechanism silently assumes the document vectors already live in the LLM's residual-stream space.
+They do not: a RAG encoder (sentence-transformer, dim 384/768/1024, its own geometry) produces
+embeddings that cannot be fed into the LLM's `W_k`. An **alignment map `A: R^{d_rag} → R^{H}`** (likely
+nonlinear — a small MLP — to fit arbitrary relevance into the bilinear attention form `W_q^T W_k`) is
+**mandatory** before any `K_doc = doc·W_k` is meaningful. Three consequences:
+
+1. **Alignment breaks the free piggyback unless precomputed offline.** The token (row 0) needs
+   `W_qkv`; the docs (rows 1-9) need `A` then `W_k` — different transforms. A single matmul applies one
+   weight matrix to all rows, so raw RAG embeddings cannot ride the `X·W_qkv` tile. The per-step "free"
+   property survives **only** if `A` is applied offline and the already-aligned `doc_llm = A(doc_rag)`
+   is what is stored in L1; then `K_doc = doc_llm·W_qkv` rides the projection for free. The raw RAG
+   index cannot be used as-is — the resident pool (or the corpus) must be re-encoded/re-stored in
+   LLM-key space, an extra offline component and a new index format.
+2. **It compounds the quality gate (§3).** The score becomes `(e·W_q)·(A(doc)·W_k)` — two stacked
+   transforms — so "does it retrieve" is even less obvious than for the raw attention metric.
+3. **But it points to a stronger design.** If `A` must be trained anyway, train it **end-to-end as a
+   retriever head** so the composed score directly optimizes Recall@K. That converts the proposal's
+   weakest point ("use the LLM's *untrained* attention metric") into "free in-core inference of a
+   *learned* cross-space retriever head" — a more defensible and more novel framing, and it turns §3
+   from "hope an untrained metric ranks docs" into a normal trainable-retriever question.
+
+What this does **not** change: the §2 bottleneck verdict. Even a perfect aligned retriever head still
+only re-ranks a host-prefiltered, amortized Top-1000 while the expensive corpus ANN stays on host.
+Alignment sharpens (arguably improves) the quality story; it does not lift the impact ceiling.
 
 ## 4. The one real-but-narrow upside
 To be fair to the proposal: per-token, generation-adaptive re-ranking/injection at ~zero marginal
