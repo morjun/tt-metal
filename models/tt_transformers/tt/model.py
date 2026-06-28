@@ -529,7 +529,7 @@ class Transformer(LightweightModule):
         # is trace-safe (pure ttnn ops). built_ring_pos tracks whether a NEW tensor was created
         # (the no-wrap fast path returns current_pos itself, which must not be deallocated).
         built_ring_pos = False
-        if l1_update_pos is None:
+        if l1_update_pos is None:  # host-provided position
             l1_update_pos = self._compute_l1_ring_pos_device(current_pos)
             built_ring_pos = l1_update_pos is not None and l1_update_pos is not current_pos
         with l1_kv_perf.timed("decode.transform_inputs_device"):

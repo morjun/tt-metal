@@ -180,3 +180,4 @@ research_codes/documents/l1_kv_cache_cache/reprofile/*.log
 research_codes/documents/l1_kv_cache_cache/reprofile/*/*.log
 research_codes/documents/l1_kv_cache_cache/reprofile/zones2_dram_896/run.log
 research_codes/documents/l1_kv_cache_cache/reprofile/zones2_l1only_896/run.log
+research_codes/documents/l1_kv_cache_cache/FlashDecodingNext_High_Throughput_LLM_Inference_With_Latency_and_Memory_Optimization.pdf
