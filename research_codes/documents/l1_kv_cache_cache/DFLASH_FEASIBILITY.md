@@ -25,6 +25,12 @@ Inputs: `dflash.pdf` (DFlash: Block Diffusion for Flash Speculative Decoding, Ch
    blob) in L1. Caveat: whether the draft fully fits L1 is a capacity question (a target-width 5-layer
    draft is ~GB-scale > aggregate L1; a narrower draft could fit). Note a weight-caching feature was
    built and **removed** on this branch (`8afb4bb`, `114e5a7`) — this would build on that.
+6. **DFlash beats the alternative proposal.** Against the "In-SRAM RAG via FPU spatial multiplexing"
+   proposal (`../sram_rag/FEASIBILITY.md`), DFlash is the clear pick: that proposal's core mechanism is
+   correctness-fatal (a QKV projection cannot compute query-doc similarity — matmul rows are
+   independent), and even repaired it optimizes a non-bottleneck. Both share the "fill the 31 wasted
+   rows" instinct, but it only pays off when the filled rows do more *sequential work* (DFlash verify
+   packs k real tokens), not when they compute an unrelated quantity in already-free cycles.
 
 ---
 
