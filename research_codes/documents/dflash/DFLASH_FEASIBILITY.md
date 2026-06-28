@@ -25,12 +25,16 @@ Inputs: `dflash.pdf` (DFlash: Block Diffusion for Flash Speculative Decoding, Ch
    blob) in L1. Caveat: whether the draft fully fits L1 is a capacity question (a target-width 5-layer
    draft is ~GB-scale > aggregate L1; a narrower draft could fit). Note a weight-caching feature was
    built and **removed** on this branch (`8afb4bb`, `114e5a7`) — this would build on that.
-6. **DFlash beats the alternative proposal.** Against the "In-SRAM RAG via FPU spatial multiplexing"
-   proposal (`../sram_rag/FEASIBILITY.md`), DFlash is the clear pick: that proposal's core mechanism is
-   correctness-fatal (a QKV projection cannot compute query-doc similarity — matmul rows are
-   independent), and even repaired it optimizes a non-bottleneck. Both share the "fill the 31 wasted
-   rows" instinct, but it only pays off when the filled rows do more *sequential work* (DFlash verify
-   packs k real tokens), not when they compute an unrelated quantity in already-free cycles.
+6. **DFlash vs the In-SRAM RAG proposal — different axes (see `../sram_rag/FEASIBILITY.md`).** The
+   *revised* In-SRAM RAG proposal fixed its earlier correctness-fatal flaw (it no longer claims the QKV
+   projection computes similarity; it adds an explicit `Q·K_doc` dot and hides the threshold on the idle
+   scalar core during the FPU-bound SDPA). It is now mechanistically sound but targets a **different
+   axis**: it adds RAG capability at ~zero marginal decode latency (~0 speedup by design), whereas
+   DFlash delivers 4-6× raw decode speedup. For pure decode performance, pick DFlash. The RAG path is a
+   legitimate, higher-novelty research direction gated on an offline retrieval-quality (Recall@K) study
+   of its untrained in-core metric. The shared "use the idle batch-1 capacity" instinct now lands
+   correctly in both (DFlash fills matmul rows with real verify tokens → fewer dispatches; In-SRAM RAG
+   fills them with docs to precompute K_doc → a useful free byproduct).
 
 ---
 
