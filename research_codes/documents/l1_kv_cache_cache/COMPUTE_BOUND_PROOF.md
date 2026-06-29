@@ -351,6 +351,43 @@ bandwidth argument, which is about DRAM.)
 
 ### Strict proof: neither batch size nor context reaches the compute↔memory crossover
 
+> **⚠ MEASUREMENT UPDATE (2026-06-29) — the batch half of this "proof" is REFUTED by profiling.**
+> The formula below assumes per-core SDPA compute is batch-independent (so read and compute scale with
+> `B` in lockstep and the ratio is invariant). **That assumption is false on Blackhole**, and the
+> error is exactly the one the batch-32 critique predicted. Measured (DRAM, Llama-3.1-8B, ctx896,
+> device zones; `reprofile/run_batch_sweep.sh`, `reprofile/zones{1,2}_dram_b{1,8}_896`):
+>
+> | batch | read:compute ratio | hidden-margin | per-core read-hidden | SDPA op latency | aggregate read demand |
+> |---|---|---|---|---|---|
+> | 1 | **0.48** | 2.09× | 100% (min 100) | 17.2 µs | 114 GB/s (22% of 512) |
+> | 8 | **0.89** | 1.12× | mean 100% / **min 75%** | 61.7 µs | 253 GB/s (49% of 512) |
+>
+> From batch-1→8 the read:compute ratio nearly **doubles** (0.48→0.89), the hidden-margin **collapses**
+> (2.09×→1.12×), aggregate read demand **doubles** toward the ceiling (22%→49%), and by batch-8 the
+> worst cores **already expose the read** (min read-hidden 75%). So "the compute-bound headroom is
+> batch-invariant" is **wrong**: it erodes sharply with batch.
+>
+> **Mechanism (why the formula broke).** At long context + low batch the kernel heavily *context-splits*
+> each head across cores (`num_cores_per_head`≫1), and the cross-core online-softmax **reduction is
+> extra compute that hides the read** — making the batch-1 ratio artificially low (0.48). As batch
+> rises, cores are divided among users (`num_cores_per_batch = P/B`), the split **collapses**
+> (`num_cores_per_head`→1), the reduction compute **vanishes**, and the ratio rises to its "natural"
+> no-split value (~0.89) where the margin is thin. Control: at **ctx128** there is no context-split at
+> any batch, and the ratio is flat (0.77→0.73 over batch-1→8) — confirming the effect is the
+> split-collapse, present only at long-context + low-batch.
+>
+> **Caveat — batch-16/32 not measured.** The device profiler's per-core marker buffer overflows at
+> 16/32-user op counts in this environment (independent of the SDPA zones), so the crossing past
+> ratio 1.0 (fully read-bound) is **unconfirmed**; the trend (demand 22%→49%, margin 2.09×→1.12×, and
+> `num_heads_per_core` rising to 2/4 at b16/b32) extrapolates toward it but is not proven.
+>
+> **Corrected verdict.** Increasing batch *does* move SDPA toward the compute↔memory crossover at long
+> context (the headroom is not batch-invariant; it collapses, with partial read exposure by batch-8).
+> The original formula's flaw is the "per-core compute is batch-independent" step below — it ignores the
+> context-split reduction that disappears as batch fills cores. The L1-KV latency lever, dead at
+> batch-1, **may revive at high batch + long context**, pending a batch-16/32 measurement on hardware
+> that can profile it. The formula is retained below as the (now-falsified) baseline argument.
+
 **Claim.** The SDPA-decode read is exposed (and faster L1 could win) iff the aggregate KV-read
 bandwidth demand reaches the aggregate DRAM ceiling, `DEMAND ≥ CEILING`. `DEMAND` is **invariant
 under both batch size `B` and context length `C`**. Therefore no choice of `B` or `C` can reach the
@@ -383,6 +420,9 @@ read and the compute time *by the same factor*, leaving the GB/s demand fixed. `
 asymptote (Llama-8B: 353 GB/s bf16 / 188 bfp8) for every `B` and `C`, never the ~512 GB/s ceiling.
 
 **Why the time-denominator really does scale with `B` (the on-device mechanism, not an assumption).**
+*(REFUTED — see the measurement update above. The claim "per-core work is independent of `B`" is
+false: at long context the batch-1 per-core work includes context-split reduction compute that
+collapses as batch rises, so `T` grows **slower** than `B` and the ratio rises. Kept for the record.)*
 The proof needs `T ∝ B` (more batch ⇒ proportionally more compute time to hide the proportionally
 larger read behind). That is exactly how the kernel shards batch:
 - `sdpa_decode_program_factory.cpp:213,221`:
@@ -406,11 +446,13 @@ the subsection above.
 3. KV dtype / GQA ratio: these are the *only* knobs in the surviving expression — they are model
    architecture, not `B` or `C` (see the per-model table below).
 
-**Conclusion.** `∂DEMAND/∂B = 0` and `∂DEMAND/∂C = 0`. Batch and context move the read demand and the
-compute that hides it in lockstep; neither can drive the SDPA read past the DRAM ceiling, so neither
-creates the compute↔memory crossover where faster L1 memory would help. (This is the SDPA/KV stream.
-For the *whole step*, batch interacts with the **weight** stream oppositely — see §8c — but that
-relieves DRAM, it does not saturate via KV either.)
+**Conclusion (as originally argued — FALSIFIED for batch; see the measurement update above).**
+`∂DEMAND/∂B = 0` and `∂DEMAND/∂C = 0`. *This held only under the false "per-core compute is
+batch-independent" assumption. Measurement shows `∂DEMAND/∂B > 0` at long context (ratio 0.48→0.89,
+demand 22%→49% of ceiling, batch-1→8): batch erodes the headroom via context-split-reduction collapse.
+The context half (`∂DEMAND/∂C` ≈ 0) is unaffected and still holds — context scales read and compute in
+genuine lockstep.* (This is the SDPA/KV stream. For the *whole step*, batch interacts with the
+**weight** stream oppositely — see §8c — but that relieves DRAM, it does not saturate via KV either.)
 
 ### When can DRAM bandwidth saturate? (and why multi-chip alone cannot) — detailed
 
