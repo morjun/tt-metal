@@ -14,7 +14,12 @@ latency config. Demo: `models/tt_transformers/demo/simple_text_demo.py -k
 - Measured on the same P150: parent commit `ca3c90bbb73` (#31750) = **35.49
   t/s/u**; `58ac27a9125` (#31046) = **21.51 t/s/u**. Clean step change at the
   direct parent boundary.
-- Mechanism (high-confidence inference, not yet directly profiled): #31046 moves
+- **Workaround validated**: forcing host-side sampling on the Nov-5 base
+  (`device_sampling_params = None`) recovers decode from 21.3 to **31.19 t/s/u**
+  (+47%). This confirms the on-device sampling op is the dominant cost
+  (~15 ms/token). The residual gap to ~35 (the pre-#31046 level) is ~4 ms/token
+  from other Sept5->Nov5 commits — a small secondary effect, not the main story.
+- Mechanism (now corroborated by the host-vs-device A/B above): #31046 moves
   the per-token token-selection step from the host onto the device, but the
   on-device sampling op runs the full top-k/top-p machinery over the entire
   128,256-entry vocabulary **every decode step, even for greedy (temperature=0)
@@ -180,8 +185,14 @@ All measurements on the same P150, canonical `performance batch-1` config
 | main merge-base `eb29ebf1c63` (Sept 5) | Sep 5 | **35.08** | bisect good endpoint |
 | `ca3c90bbb73` (#31750, parent of culprit) | late Oct | **35.49** | last good |
 | **`58ac27a9125` (#31046 on-device sampling)** | late Oct | **21.51** | **first bad** |
-| Nov-5 base `e47fe9a3417` (l1-kv-cache upstream base) | Nov 5 | **21.3** | slow |
+| Nov-5 base `e47fe9a3417` (l1-kv-cache upstream base) | Nov 5 | **21.3** | slow (on-device sampling) |
+| Nov-5 base + forced **host** sampling (`device_sampling_params=None`) | Nov 5 | **31.19** | workaround: +47% |
 | current `upstream` HEAD `82ca47adc7c` | Jun 2026 | **~22** | still not fixed |
+
+Decomposition of the regression (per-token, at 800 MHz):
+- `ca3c90` host sampling: 28.2 ms (35.5 t/s/u)
+- Nov-5 base host sampling: 32.1 ms (31.2 t/s/u)  -> ~4 ms from other Sept5->Nov5 commits (secondary)
+- Nov-5 base on-device sampling: 47.0 ms (21.3 t/s/u)  -> **~15 ms added by the on-device sampling op (dominant)**
 
 Steps:
 
@@ -251,13 +262,17 @@ does not carry this cost.)
 
 In order of preference:
 
-1. **Use host-side argmax for greedy decode.** Setting `sampling_params=None` for
-   the batch-1 latency path routes token selection back to the host, which should
-   recover ~35 t/s/u. This failed to test at `58ac27` itself due to that commit's
-   other in-development bugs (a `NoneType` subscript in the demo), but on the
-   complete Nov-5 base / current code the None path is fully implemented and should
-   work. **This is the quickest way to un-regress your L1-KV benchmarks.** (Not yet
-   validated end-to-end — pending one run on the Nov-5 base.)
+1. **Use host-side sampling.** VALIDATED on the Nov-5 base: forcing
+   `device_sampling_params = None` recovers **21.3 -> 31.19 t/s/u (+47%)**.
+   Note the right lever is `device_sampling_params`, not the demo's
+   `sampling_params` dict: the demo builds `device_sampling_params` from the dict
+   whenever `model._supports_on_device_sampling` is True (simple_text_demo.py
+   ~L993), and simply passing `sampling_params=None` instead crashes with
+   `'NoneType' object is not subscriptable` at L995. Force host sampling by either
+   setting `device_sampling_params = None` directly, or making the model report
+   `_supports_on_device_sampling = False`. **This is the quickest way to
+   un-regress L1-KV benchmarks** (recovers most of the gap; the last ~4 ms/token to
+   35 is a separate small regression).
 
 2. **Add / use a cheap on-device argmax shortcut for temp=0.** The expensive part
    is the top-k/top-p selection. When `temperature==0`, the sampling op should
@@ -285,8 +300,10 @@ In order of preference:
 
 ## 7. Open items (to reach 100% certainty on mechanism)
 
-- Validate workaround #1 (`sampling_params=None`) on the complete Nov-5 base code
-  -> expect ~35.
+- ~~Validate workaround #1 on the Nov-5 base~~ DONE: host sampling = 31.19 t/s/u
+  (vs 21.3 on-device). Confirms on-device sampling is the dominant cost.
+- Identify the smaller ~4 ms/token secondary regression between `ca3c90` (35.5)
+  and the Nov-5 base host-sampling (31.2) — separate, lower-priority.
 - Get a per-op device time for the sampling op (needs a working profiler path on
   BH; the standard `process_device_log.py` is broken here — see the existing
   `DEVICE_PROFILING_LIMITATIONS.md` / `PROFILER_BUFFER_OVERFLOW_FIX.md` notes).
