@@ -415,3 +415,46 @@ overflows and drops ALL custom zones even at num_layers=1 / 1 generated token (t
 same ceiling the prior study hit). The crossover location for >8 is therefore
 extrapolated from the 1->8 trend. It is also ctx-dependent: longer context = more
 KV read per chunk = earlier (lower-batch) crossover.
+
+---
+
+## 10. Isolated-SDPA batch sweep — pinning the crossover past the overflow ceiling
+
+The full-model sweep (§9) could not measure batch 16/32 (profiler buffer overflow
+drops all zones). To beat that, profiled the SDPA-decode op **in isolation**: a
+standalone pytest (`tests/ttnn/unit_tests/operations/sdpa/test_sdpa_decode_batch_sweep.py`)
+calling `run_test_sdpa_decode_single_iter` at the Llama-3.1-8B shape (nh=32, nkv=8,
+d=128, grid (8,8)), s=1024 KV cache, all users at fixed `cur_pos=895` (7 chunks of
+128), one SDPA invocation per run. Only SDPA cores emit markers, so the buffer
+never overflows — every batch 1..32 captured cleanly. Raw profiler
+(`TT_METAL_DEVICE_PROFILER=1` + mid-run dump), `analyze_zones.py`.
+
+Results (per-chunk average, µs; compute = max-TRISC CMP_CHUNK):
+
+| batch | compute µs/chunk | read µs/chunk | compute/read | read hidden |
+|-------|------------------|---------------|--------------|-------------|
+| 1     | 10.04            | 7.80          | 1.29x        | 100%        |
+| 2     | 9.02             | 7.59          | 1.19x        | 100%        |
+| 4     | 7.96             | 7.18          | 1.11x        | 100%        |
+| 8     | 7.35             | 6.96          | 1.06x        | 100%        |
+| 16    | 6.73             | 6.62          | 1.02x        | 98.9%       |
+| 32    | 6.51             | 6.52          | 1.00x        | 98.5%       |
+
+Finding: both compute and read per-chunk DECREASE with batch (fixed per-chunk
+overhead amortizes over more rows/users), but compute falls faster, so the ratio
+converges toward 1.0. The **crossover — read reaching compute and starting to be
+exposed — is at batch 16-32 at ctx 896**: read-hidden drops below 100% at batch 16
+(98.9%) and read marginally exceeds compute at batch 32 (ratio 1.00, hidden 98.5%).
+
+Important nuance: at ctx 896 the crossover is SHALLOW — even at batch 32 read is
+only ~1.5% exposed (compute and read are near-balanced at ~6.5 µs/chunk). So at
+this context length, L1 KV's decode-latency win is modest even at max batch; its
+larger lever is LONGER context (more KV read per chunk pushes the crossover to
+lower batch and makes read dominate). This refines the L1-KV thesis: the payoff is
+long-context and/or high-batch, and grows with context.
+
+Caveats: this isolated run uses the NON-paged read path (`read_kv_mask_chunks`),
+so absolute read µs differ from the full-model PAGED sweep in §9 (paged read was
+cheaper per chunk); the crossover *trend* is the robust takeaway, not the absolute
+batch number, which depends on read path and context. The temporary test file and
+SDPA zone edits on main were removed/reverted after capture.
