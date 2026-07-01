@@ -9,6 +9,12 @@ latency config. Demo: `models/tt_transformers/demo/simple_text_demo.py -k
 - The decode throughput regression on Blackhole P150 (Llama-3.1-8B, batch-1) from
   ~35 t/s/u to ~21 t/s/u is caused by upstream commit **`58ac27a9125`
   "[TT-Transformers] Support on-device sampling" (#31046)**.
+- **FIX FOUND & VALIDATED (2026-07-01): enable `allow_force_argmax` for single-chip
+  P150.** On current `main`, flipping it (in `model_config.py`, currently
+  Galaxy-only) took decode from ~22 to **38.77 t/s/u (+76%)** — faster than the
+  pre-regression baseline. See §6.2. Caveat: the force_argmax fast-path exists only
+  on `main` (added after the l1-kv base `e47fe9a`), so the l1-kv branch must port it
+  or rebase to use it; otherwise use host sampling.
 - It is **not** the user's L1-KV work, not the clock, not the host, not PCIe, not
   the LLK uplift. Those were all measured and ruled out.
 - Measured on the same P150: parent commit `ca3c90bbb73` (#31750) = **35.49
@@ -19,14 +25,19 @@ latency config. Demo: `models/tt_transformers/demo/simple_text_demo.py -k
   (+47%). This confirms the on-device sampling op is the dominant cost
   (~15 ms/token). The residual gap to ~35 (the pre-#31046 level) is ~4 ms/token
   from other Sept5->Nov5 commits — a small secondary effect, not the main story.
-- Mechanism (now corroborated by the host-vs-device A/B above): #31046 moves
-  the per-token token-selection step from the host onto the device, but the
-  on-device sampling op runs the full top-k/top-p machinery over the entire
-  128,256-entry vocabulary **every decode step, even for greedy (temperature=0)
-  decoding**. On Blackhole at the fixed 800 MHz AICLK that on-device op costs more
-  per token (~18 ms) than the host round-trip it was meant to eliminate. Because
-  decode runs as a single on-device trace, that op adds directly to per-token
-  latency.
+- Mechanism (CORRECTED — see the correction note below; the earlier "greedy runs
+  the full top-k/top-p over 128k vocab" wording was wrong): #31046 moves per-token
+  token-selection from host to device. The demo uses temperature 0, which
+  `format_sampling_params` (models/common/sampling/generator.py:507) rewrites to
+  the greedy representation `k=1, p=0, temp=1` (overriding the demo's top_k=32 /
+  top_p=0.08) — so it IS argmax, not a top-k/top-p search. The cheap argmax
+  fast-path (`_is_force_argmax_sampling`) additionally requires
+  `allow_force_argmax=True`, which `model_config.py:1102-1116` enables ONLY on
+  Galaxy; on single-chip P150 it falls back to `allow_force_argmax=False`. So P150
+  runs the **full on-device sampling op even for k=1 argmax** (top-k op + several
+  CCL all-gathers over the padded ~128k-vocab logits + softmax + RNG), and that op
+  costs ~10-15 ms/token more than a host logits-readback + host argmax. Decode is a
+  single on-device trace, so the op adds directly to per-token latency.
 
 ---
 
@@ -129,20 +140,20 @@ delta_per_token  =  (device cost of the on-device sampling op)
 On this configuration that delta is **positive (~+18 ms/token)**, i.e. the device
 op is more expensive than the round-trip it eliminated. The reasons:
 
-1. **The sampling op operates over the full 128,256-vocab logits on-device.**
-   Top-k=32 + top-p selection requires (partial) sorting / repeated max-reductions
-   across 4008 tiles. On the host this is microseconds of optimized C/torch; on
-   the Tensix grid at a **fixed 800 MHz** AICLK (Blackhole P150 runs decode at 800
-   MHz by firmware design, not throttling) an unoptimized full-vocab selection
-   kernel is expensive. Blackhole bring-up software is explicitly "under active
-   development", and this op was not yet tuned for BH.
+1. **temp=0 IS rewritten to argmax, but P150 can't use the cheap argmax path.**
+   `format_sampling_params` (models/common/sampling/generator.py:507) rewrites the
+   demo's `{temp:0, k:32, p:0.08}` to `k=1, p=0, temp=1` — greedy. A dedicated cheap
+   argmax fast-path exists (`_is_force_argmax_sampling`: single all-gather + argmax),
+   but it also requires `allow_force_argmax=True`, which `model_config.py:1102-1116`
+   sets only on Galaxy. On single-chip P150 it is `False`, so even the k=1 argmax
+   goes through the **full on-device sampling op**.
 
-2. **Greedy (temp=0) still pays for the full machinery.** Because the demo passes
-   `sampling_params` with `top_k=32, top_p=0.08`, the on-device path runs the
-   top-k/top-p selection even though temperature 0 is mathematically just an
-   argmax. A direct on-device argmax would be a single reduction; the top-k/top-p
-   path is far heavier. So the "greedy latency benchmark" is actually exercising
-   the expensive sampling kernel.
+2. **The full op is expensive on-device.** It runs the top-k op + several CCL
+   all-gathers (values, indices, sampled tokens) over the padded ~128k-vocab logits
+   + a softmax + RNG, on the Tensix grid at a **fixed 800 MHz** AICLK (BH P150 runs
+   decode at 800 MHz by firmware design, not throttling). On the host, argmax over
+   the same logits is microseconds of optimized C/torch. Blackhole bring-up software
+   is "under active development" and this path was not tuned for single-chip BH.
 
 3. **Decode is trace-bound, so the op adds directly to latency.** Earlier in the
    investigation we established that this decode runs as a single on-device trace
@@ -157,9 +168,21 @@ op is more expensive than the round-trip it eliminated. The reasons:
    and the sync overhead, while real, was smaller than the ~18 ms the on-device op
    now costs. So trading the round-trip for the op was a net loss on BH.
 
-Net: the change is a good idea in principle (and likely a win on Wormhole or with a
-tuned BH kernel, or at large batch where the round-trip dominates), but on BH P150
-batch-1 with an untuned full-vocab top-k/top-p kernel it regressed decode ~1.6x.
+Net: the change is a good idea in principle (and a win on Galaxy, where the argmax
+fast-path is enabled, or at large batch where the host round-trip dominates), but on
+single-chip BH P150 batch-1 — where `allow_force_argmax=False` forces the full
+sampling op — it regressed decode ~1.6x. The likely direct fix is enabling
+`allow_force_argmax` for single-chip P150 (see §6.2).
+
+### Correction note (2026-07-01)
+An earlier version of this doc said the slowdown was because "greedy (temp=0) runs
+the full top-k=32 / top-p=0.08 machinery over the 128k vocab." That was wrong on two
+counts: (a) temp=0 is rewritten to `k=1` argmax (not top-k/top-p), and (b)
+temperature is applied as multiply-by-reciprocal (`values * (1/T)`, with 1/T
+precomputed on host at generator.py:514), i.e. correct division semantics, and
+temp=0 is guarded (generator.py:507 rewrites it, so `1/0` is never computed — that
+is why there is no divide-by-zero). The real cause is the `allow_force_argmax=False`
+fallback on single-chip forcing the full sampling op, as described above.
 
 > Confidence: the **attribution** to #31046 is certain (bisected + isolation, see
 > §4). The **mechanism** in this section is a high-confidence inference from the
@@ -274,15 +297,23 @@ In order of preference:
    un-regress L1-KV benchmarks** (recovers most of the gap; the last ~4 ms/token to
    35 is a separate small regression).
 
-2. **Add / use a cheap on-device argmax shortcut for temp=0.** The expensive part
-   is the top-k/top-p selection. When `temperature==0`, the sampling op should
-   short-circuit to a single argmax reduction instead of running top-k=32 +
-   top-p=0.08 over the full vocab. Worth checking whether the current sampling op
-   already has such a path and why the demo config (which sets top_k/top_p) doesn't
-   hit it.
+2. **Enable `allow_force_argmax` for single-chip P150 — VALIDATED, this is the fix.**
+   The cheap argmax fast-path exists but `model_config.py:1102-1116` enables it only
+   on Galaxy. temp=0 already rewrites to `k=1` greedy, so flipping
+   `allow_force_argmax=True` for the P150 path routes it to the single all-gather +
+   argmax instead of the full sampling op. Tested on current `main` (2026-07-01):
+   activation confirmed (all users k=1/p=0/temp=1, `_force_argmax_sampling=True`),
+   and decode jumped **~22 -> 38.77 t/s/u (25.79 ms/tok), +76%** — faster than host
+   sampling (31), v0.64 (34), and ca3c90 (35.5). The argmax fast-path delivers the
+   in-trace on-device benefit #31046 intended. NOTE: `force_argmax` was added to
+   `main` AFTER the l1-kv base (`e47fe9a`); e47fe9a has no such path, so applying
+   this fix on the l1-kv branch requires porting it from main (or rebasing).
+   (Earlier I speculated force_argmax "wouldn't help on single chip because the
+   all-gathers are trivial there" — that was wrong; the full sampling op's on-device
+   top-k/softmax/RNG cost is what the fast-path removes.)
 
-3. **Optimize the on-device sampling kernel for Blackhole** (the real upstream
-   fix): parallelize the full-vocab top-k/top-p reduction across the Tensix grid.
+3. **Optimize the on-device sampling op / argmax path for single-chip BH** (upstream
+   fix) if force_argmax is not directly usable on one chip.
 
 4. **For L1-KV benchmarking specifically:** baseline against `ca3c90bbb73` or the
    v0.64 line (both ~35), or disable on-device sampling, so the L1-vs-DRAM KV
@@ -307,5 +338,9 @@ In order of preference:
 - Get a per-op device time for the sampling op (needs a working profiler path on
   BH; the standard `process_device_log.py` is broken here — see the existing
   `DEVICE_PROFILING_LIMITATIONS.md` / `PROFILER_BUFFER_OVERFLOW_FIX.md` notes).
-- Confirm whether a temp=0 argmax fast-path exists in the current sampling op and
-  why the demo's `{temp:0, top_k:32, top_p:0.08}` config does not take it.
+- ~~Confirm whether a temp=0 argmax fast-path exists and why the demo doesn't take
+  it~~ RESOLVED: it exists (`_is_force_argmax_sampling`), temp=0 IS rewritten to
+  `k=1` greedy by `format_sampling_params`, but the fast-path also needs
+  `allow_force_argmax=True` which `model_config.py:1102-1116` enables only on Galaxy
+  → single-chip P150 runs the full op. Fix candidate: enable it for P150 (§6.2,
+  under test).
