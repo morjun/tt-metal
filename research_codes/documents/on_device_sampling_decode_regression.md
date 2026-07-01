@@ -458,3 +458,43 @@ so absolute read µs differ from the full-model PAGED sweep in §9 (paged read w
 cheaper per chunk); the crossover *trend* is the robust takeaway, not the absolute
 batch number, which depends on read path and context. The temporary test file and
 SDPA zone edits on main were removed/reverted after capture.
+
+---
+
+## 11. Context sweep — does long context make read dominate? (No.)
+
+Hypothesis to test: at long context, total KV read grows and could exceed compute
+(DRAM-bandwidth saturation) -> the L1-KV decode-latency win. Isolated SDPA
+(`test_sdpa_decode_ctx_sweep`), Llama-8B shape, cur_pos = s-1, batch 8 across
+ctx 1k..32k and batch 1 across ctx 1k/16k/64k.
+
+Results (compute/read per-chunk ratio; read-hidden % in parens, all 100% unless noted):
+
+|          | ctx 1k | ctx 4k | ctx 8k | ctx 16k | ctx 32k | ctx 64k |
+|----------|--------|--------|--------|---------|---------|---------|
+| batch 1  | 1.29   |        |        | 1.04    |         | 1.01    |
+| batch 8  | 1.05   | 1.02   | 1.01   | 1.00    | 1.00    |         |
+
+Finding: the compute/read ratio is **>= 1.0 everywhere** (read 100% hidden across
+the whole grid) and converges to ~1.0 as EITHER batch or context grows. Read never
+overtakes compute. Per-chunk compute and read both rise together at longer context
+because the adaptive `k_chunk_size` grows with context (bigger chunks, same
+balance) — so long context does NOT expose read. The ratio is governed by fixed
+per-chunk-overhead amortization: low at batch 1 / short ctx (1.29, compute-bound),
+approaching 1.0 (compute≈read, still hidden) as batch or ctx increases.
+
+### Unified conclusion (§9 + §10 + §11)
+Across the full measured space — batch 1..32 x context 1k..64k, on the corrected
+fast baseline (force_argmax) — SDPA decode is **compute-bound or compute/read-
+balanced; KV read is always hidden behind or at parity with compute** (ratio >= 1.0,
+read-hidden 100%, except a marginal ~1.5% exposure at batch 16-32 / short ctx).
+Therefore **L1 KV cannot reduce decode latency by making reads faster** — the read
+advantage stays hidden behind matmul compute. This confirms, now on the corrected
+baseline and across batch AND context, the earlier thesis: SDPA decode is compute-
+bound; L1 == DRAM on decode latency; **the lever is capacity, not layout**. L1 KV's
+value is holding KV that would otherwise spill to DRAM (larger in-L1 context /
+higher batch within L1 capacity) and aggregate DRAM-bandwidth headroom — not
+per-token decode latency.
+
+(Temporary test files `test_sdpa_decode_batch_sweep.py` / `test_sdpa_decode_ctx_sweep.py`
+and the SDPA zone edits on main were removed/reverted after capture.)
