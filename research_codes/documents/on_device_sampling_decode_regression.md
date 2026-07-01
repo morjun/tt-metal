@@ -333,8 +333,10 @@ In order of preference:
 
 - ~~Validate workaround #1 on the Nov-5 base~~ DONE: host sampling = 31.19 t/s/u
   (vs 21.3 on-device). Confirms on-device sampling is the dominant cost.
-- Identify the smaller ~4 ms/token secondary regression between `ca3c90` (35.5)
-  and the Nov-5 base host-sampling (31.2) — separate, lower-priority.
+- ~~Identify the ~4 ms/token secondary regression (ca3c90 host 35.5 vs Nov-5 host
+  31.2)~~ SUPERSEDED/DROPPED: enabling force_argmax on main reaches 38.77 t/s/u,
+  above ca3c90's 35.5, so the ~4 ms host-path delta no longer bounds achievable
+  decode. Not worth root-causing unless needed for its own sake.
 - Get a per-op device time for the sampling op (needs a working profiler path on
   BH; the standard `process_device_log.py` is broken here — see the existing
   `DEVICE_PROFILING_LIMITATIONS.md` / `PROFILER_BUFFER_OVERFLOW_FIX.md` notes).
@@ -342,5 +344,26 @@ In order of preference:
   it~~ RESOLVED: it exists (`_is_force_argmax_sampling`), temp=0 IS rewritten to
   `k=1` greedy by `format_sampling_params`, but the fast-path also needs
   `allow_force_argmax=True` which `model_config.py:1102-1116` enables only on Galaxy
-  → single-chip P150 runs the full op. Fix candidate: enable it for P150 (§6.2,
-  under test).
+  → single-chip P150 runs the full op. FIX VALIDATED on main: enabling it →
+  38.77 t/s/u (§6.2).
+
+---
+
+## 8. Status & next steps (for the PR)
+
+Resolved: the BH P150 Llama-3.1-8B batch-1 decode regression (35 -> 22 t/s/u) is
+caused by #31046's on-device sampling running the full sampling op on single-chip.
+The fix is enabling `allow_force_argmax` for single-chip P150 (currently
+Galaxy-only in `model_config.py:1102-1116`), validated at 38.77 t/s/u on main.
+
+Intended PR: (1) a code change enabling `allow_force_argmax` for single-chip
+Blackhole (P150), and (2) this analysis doc.
+
+Next (in progress): re-profile the DRAM-baseline SDPA **compute time vs KV
+memory-read time** across batch sizes 1..32, on the **upstream/main** branch with
+`allow_force_argmax=True` (the corrected fast baseline) — NOT by rebasing the l1-kv
+branch. This re-establishes the L1-KV "read hidden behind compute" analysis on a
+non-regressed baseline and pushes past the batch-8 ceiling of the prior study
+(which hit profiler buffer overflow). Uses the existing zone methodology
+(`SDPA_PROFILE_ZONES`, `reprofile/run_zones*.sh`, `analyze_gaps2.py`) ported to
+main's sdpa_decode kernels.
