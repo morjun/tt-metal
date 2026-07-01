@@ -367,3 +367,51 @@ non-regressed baseline and pushes past the batch-8 ceiling of the prior study
 (which hit profiler buffer overflow). Uses the existing zone methodology
 (`SDPA_PROFILE_ZONES`, `reprofile/run_zones*.sh`, `analyze_gaps2.py`) ported to
 main's sdpa_decode kernels.
+
+---
+
+## 9. DRAM-baseline SDPA compute-vs-read across batch (on main + force_argmax)
+
+Re-profiled the DRAM KV baseline SDPA **per-chunk compute vs KV-read** across batch
+size on the corrected fast baseline (upstream/main, `allow_force_argmax=True`), to
+re-establish the "read hidden behind compute" analysis and push past the prior
+study's batch-8 ceiling. This was done on main (NOT by rebasing l1-kv).
+
+Method: ported minimal SDPA device zones to main's stock kernels — `CMP_CHUNK`
+(compute per-chunk envelope, TRISC, in `sdpa_flash_decode.cpp`) and `RD_CHUNK`
+(per-chunk KV read, NCRISC). Note the executed path is the **paged** reader
+(`reader_decode_all.cpp`, `is_paged_attention` branch using `read_k`/`read_v`),
+not `read_kv_mask_chunks` — `--paged_attention 0` did not disable it, so RD_CHUNK
+must go in the paged loop. Captured with the **raw** device profiler
+(`TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_MID_RUN_DUMP=1`), NOT `python -m
+tracy -r` (its ops-report post-process asserts `Op ... not present in
+cpp_device_perf_report.csv` at batch>1 due to dropped markers). ctx≈896 (7 chunks,
+prompt replicated x32 for batch), num_layers 2 (1 for batch 8), non-instruct.
+Parsed with `reprofile/analyze_zones.py`. All edits on main were reverted after.
+
+Results (per-chunk average, µs; compute = max-TRISC CMP_CHUNK):
+
+| batch | compute µs/chunk | read µs/chunk | compute/read | read hidden |
+|-------|------------------|---------------|--------------|-------------|
+| 1     | 9.79             | 4.41          | 2.22x        | 100%        |
+| 2     | 7.42             | 4.63          | 1.60x        | 99.2% (min 82%) |
+| 4     | 6.50             | 5.40          | 1.20x        | 100%        |
+| 8     | 6.11             | 5.66          | 1.08x        | 100% (per-core margin ~163us, ~0) |
+
+Finding: compute-per-chunk FALLS with batch (the QK/PV matmuls amortize the fixed
+per-chunk overhead over more Q rows), while read-per-chunk RISES (more users' KV
+per chunk). The compute/read ratio collapses 2.22x -> 1.08x by batch 8; the margin
+by which compute covers read is essentially gone at batch 8. So the **crossover**
+where KV read stops being hidden behind compute is right around **batch 8-16** at
+ctx 896. Below it, decode is compute-bound and read is fully hidden (consistent
+with the batch-1 "L1 == DRAM parity" result — L1 can't help when read is already
+hidden). At/above it, read becomes exposed and decode turns memory-read-bound,
+which is exactly where L1 KV's lower read latency/higher effective bandwidth would
+help. This supports the thesis that L1 KV's value is at higher batch / longer
+context (capacity + bandwidth), not single-user batch-1 latency.
+
+Caveat: batch 16 and 32 could NOT be measured — the on-device profiler buffer
+overflows and drops ALL custom zones even at num_layers=1 / 1 generated token (the
+same ceiling the prior study hit). The crossover location for >8 is therefore
+extrapolated from the 1->8 trend. It is also ctx-dependent: longer context = more
+KV read per chunk = earlier (lower-batch) crossover.
