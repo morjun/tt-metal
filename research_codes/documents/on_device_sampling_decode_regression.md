@@ -56,28 +56,55 @@ Which runs used the greedy (`allow_force_argmax`) fix:
   sampling, so force_argmax is N/A / not applied. It does not affect the SDPA
   compute-vs-read measurement (sampling is a separate end-of-pipeline op).
 
-Command used for the isolated SDPA zone measurement (§10/§11), one (batch, ctx) per run:
+Commands used for the isolated SDPA zone measurement (§10/§11). These use a
+TEMPORARY unit test that was deleted after the runs — recreate it to reproduce.
+
+Step 1 — add zones to main's STOCK sdpa kernels (temporary), then wipe JIT cache.
+In `.../sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp` and
+`.../dataflow/dataflow_common.hpp` add, after the includes:
+```cpp
+#include "tools/profiler/kernel_profiler.hpp"
+#define SDPA_ZONE(name) DeviceZoneScopedN(name)
 ```
-# 1. Temporarily add zones to main's STOCK sdpa kernels, then wipe the JIT cache:
-#    - macro in compute/sdpa_flash_decode.cpp and dataflow/dataflow_common.hpp:
-#        #include "tools/profiler/kernel_profiler.hpp"
-#        #define SDPA_ZONE(name) DeviceZoneScopedN(name)
-#    - SDPA_ZONE("CMP_CHUNK") at top of the compute per-chunk loop (sdpa_flash_decode.cpp)
-#    - SDPA_ZONE("RD_CHUNK") at top of the read per-chunk loop in BOTH the paged branch
-#      (reader_decode_all.cpp) and read_kv_mask_chunks (dataflow_common.hpp)
-#    rm -rf ~/.cache/tt-metal-cache
-# 2. Run the isolated SDPA-decode op via the unit-test helper (Llama-3.1-8B shape):
-TT_VISIBLE_DEVICES=0 MESH_DEVICE=P150 \
-TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_MID_RUN_DUMP=1 \
-  ./python_env/bin/pytest <tmp_test>::test_...[b=<B>-s=<S>] -s
-#    where the test body is:
-#      run_test_sdpa_decode_single_iter(device, b, 32, 8, s, 128, ttnn.bfloat8_b,
-#          (8,8), ttnn.bfloat16, cur_pos_tensor=True, start_indices=[s-1]*b)
-# 3. Parse (NOT `python -m tracy -r`, which asserts at batch>1):
+Then wrap the per-chunk loops: `SDPA_ZONE("CMP_CHUNK");` at the top of the compute
+`for (k_chunk...)` loop in `sdpa_flash_decode.cpp`, and `SDPA_ZONE("RD_CHUNK");` at
+the top of the read `for (k_chunk...)` loop in BOTH the `is_paged_attention` branch
+of `reader_decode_all.cpp` AND `read_kv_mask_chunks` in `dataflow_common.hpp`. Then:
+```
+rm -rf ~/.cache/tt-metal-cache
+```
+
+Step 2 — create the temporary test file
+`tests/ttnn/unit_tests/operations/sdpa/test_sdpa_decode_batch_sweep.py`:
+```python
+import pytest
+import ttnn
+from tests.ttnn.unit_tests.operations.sdpa.sdpa_test_utils import run_test_sdpa_decode_single_iter
+
+@pytest.mark.parametrize("b", [1, 2, 4, 8, 16, 32])          # §10 batch sweep (ctx fixed)
+def test_sdpa_decode_batch_sweep(device, b):
+    # Llama-3.1-8B shape: nh=32, nkv=8, d=128, grid (8,8); s=1024 KV cache; all users cur_pos=895 (~ctx896)
+    run_test_sdpa_decode_single_iter(
+        device, b, 32, 8, 1024, 128, ttnn.bfloat8_b, (8, 8), ttnn.bfloat16,
+        cur_pos_tensor=True, start_indices=[895] * b, sharded_in=False, sharded_out=False)
+```
+For §11 (context sweep) parametrize `(b, s)` instead and use `start_indices=[s-1]*b`.
+
+Step 3 — run one (batch[, ctx]) per invocation (env vars are inline for that one command):
+```
+TT_VISIBLE_DEVICES=0 MESH_DEVICE=P150 TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_MID_RUN_DUMP=1 \
+  ./python_env/bin/pytest \
+  "tests/ttnn/unit_tests/operations/sdpa/test_sdpa_decode_batch_sweep.py::test_sdpa_decode_batch_sweep[b=8]" -s
+```
+(param id is `[b=8]`, pytest-8 style; the `-s` shows output. Do NOT use `python -m
+tracy -r` — its ops-report post-process asserts at batch>1.)
+
+Step 4 — parse the raw device log (bypasses the broken tracy ops-report):
+```
 ./python_env/bin/python research_codes/documents/l1_kv_cache_cache/reprofile/analyze_zones.py \
-    generated/profiler/.logs/profile_log_device.csv
+  generated/profiler/.logs/profile_log_device.csv
 ```
-The temporary kernel zones and unit-test files were reverted/removed after capture;
+The temporary kernel zones and the test file were reverted/removed after capture;
 main is clean.
 
 Is the isolated measurement valid? Yes, with one caveat. It uses the SAME kernels,
