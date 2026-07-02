@@ -1163,13 +1163,17 @@ def test_demo_text(
 
         # Use device sampling for all cases when supported
 
+        # FORCE_HOST_SAMPLING=1 forces host-side sampling (device_sampling_params=None),
+        # the max-perf baseline on this branch (no force_argmax fast-path). Used for the
+        # L1-vs-DRAM A/B so both arms run identical, fastest sampling. Default: unchanged.
+        _force_host_sampling = os.environ.get("FORCE_HOST_SAMPLING", "0") == "1"
         device_sampling_params = (
             SamplingParams(
                 temperature=sampling_params["temperature"],
                 top_k=sampling_params["top_k"],
                 top_p=sampling_params["top_p"],
             )
-            if model[0]._supports_on_device_sampling
+            if model[0]._supports_on_device_sampling and not _force_host_sampling
             else None
         )
         if device_sampling_params is None and isinstance(sampling_params["temperature"], List):

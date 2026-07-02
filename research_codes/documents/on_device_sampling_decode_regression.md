@@ -538,6 +538,19 @@ cheaper per chunk); the crossover *trend* is the robust takeaway, not the absolu
 batch number, which depends on read path and context. The temporary test file and
 SDPA zone edits on main were removed/reverted after capture.
 
+**Measurement caveat — the ratio saturating at exactly 1.00 is partly an artifact.**
+The coarse `CMP_CHUNK` / `RD_CHUNK` zones wrap the *whole* CB-gated loop bodies:
+`matmul_blocks` internally calls `cb_in0.wait_front` / `cb_mask.wait_front`
+(`compute_common.hpp:46,62`) and the reader calls `cb_reserve_back`, so each RISC's
+zone measures the pipeline PERIOD (compute time + time spent blocked on the CB),
+not its own active work. Once compute and read are pipelined, both zones converge to
+the same period and the ratio is clamped toward 1.00 *by construction* — it cannot
+report which side is truly the bottleneck. So the "ratio → 1.00 at high batch/ctx"
+rows do NOT by themselves establish "compute ≈ read"; the DIRECTION (read stays
+hidden) comes from the lower-batch/short-ctx points where the ratio is still well
+above 1.0 and from finer active-only zones, and the *decisive* evidence is the
+end-to-end L1-vs-DRAM A/B in §12 (no zones → no artifact).
+
 ---
 
 ## 11. Context sweep — does long context make read dominate? (No.)
@@ -562,7 +575,7 @@ balance) — so long context does NOT expose read. The ratio is governed by fixe
 per-chunk-overhead amortization: low at batch 1 / short ctx (1.29, compute-bound),
 approaching 1.0 (compute≈read, still hidden) as batch or ctx increases.
 
-### Unified conclusion (§9 + §10 + §11)
+### Unified conclusion (§9 + §10 + §11; end-to-end confirmation in §12)
 Across the full measured space — batch 1..32 x context 1k..64k, on the corrected
 fast baseline (force_argmax) — SDPA decode is **compute-bound or compute/read-
 balanced; KV read is always hidden behind or at parity with compute** (ratio >= 1.0,
@@ -577,3 +590,65 @@ per-token decode latency.
 
 (Temporary test files `test_sdpa_decode_batch_sweep.py` / `test_sdpa_decode_ctx_sweep.py`
 and the SDPA zone edits on main were removed/reverted after capture.)
+
+---
+
+## 12. End-to-end batch-32 L1-vs-DRAM A/B (the decisive, zone-free test)
+
+The §9–§11 sweeps use device zones, whose coarse variant clamps the ratio to ~1.0
+(see the §10 measurement caveat). To settle "does on-chip KV cut decode latency at
+high batch" without any zone artifact, run the full demo end-to-end and compare
+tokens/s directly. Done on the **l1-kv-cache branch** (worktree
+`/home/masterjunmo/codes/tt-metal-l1kv`, built `ninja -C build_Release -j4 ttnn`),
+`simple_text_demo.py -k "batch-32 and performance"`, **host sampling**
+(`FORCE_HOST_SAMPLING=1`, the max-perf baseline on this branch since it predates
+force_argmax), `DECODE_WARMUP_ITERS=2` (absorb JIT + L1 alloc/seed before timing).
+
+**Setup note:** L1 KV allocation is silently disabled under paged attention
+(`allocate_l1_kv_cache` early-returns on `paged_attention_config`; ring-write gated
+on `not page_table`). The batch-32 preset ships `paged_attention=True`, so both arms
+run `--paged_attention 0`. Non-paged batch-32 KV is `[32,8,1024,128]` bfp8 ≈ 2.3 GB
+total — fits P150 DRAM comfortably. `l1_only` mode is NOT used (at batch 32 its
+StreamingLLM clamp would drop most of the context → wrong output); the realistic
+`interleaved` mode keeps full context (recent window in L1, older tail in DRAM).
+
+### DRAM baseline (batch 32, non-paged, host sampling) — runs cleanly
+- **Average: 214.8 ms/iter → 4.66 tok/s/user, 148.97 tok/s aggregate.**
+- 1st-token decode 245.66 ms [4.07 t/s/u]; 128th-token 292.83 ms [3.41 t/s/u].
+
+### L1 interleaved arm (batch 32) — DOES NOT RUN
+The adaptive allocator (`_post_compile_allocate_l1_kv`, live headroom scan, 110
+cores, `min_viable_tokens=64`) sizes one interleaved tier per layer, but at batch 32
+it cannot co-fit all layers' KV tiers AND the decode circular buffers:
+
+| `--l1_kv_window_size` | tier size | layers that fit L1 | outcome |
+|-----------------------|-----------|--------------------|---------|
+| 128 | 160 tok (5 tile-rows, 40 KiB/core) | 14 / 32 (rest OOM) | crash |
+| 64  | 64 tok (2 tile-rows) | 24 / 32 (rest OOM) | crash |
+| 64 + `--l1_kv_safety_margin 98304` (96 KiB) | 64 tok | 24 / 32 | crash (identical addr) |
+
+Every configuration crashes at trace capture on the first decode op (`ttnn.embedding`):
+```
+program.cpp:981: Statically allocated circular buffers in program N clash with
+L1 buffers on core range [(0,0)-(10,1)]. L1 buffer at 106240, static CB region ends at 110976.
+```
+Mechanism (certain): the interleaved L1 KV buffer is placed at a fixed low L1 address
+(106240), bottom-up in the same region the compute circular buffers use. At batch 32
+the decode CBs are large enough to grow to 110976 — past the KV buffer — so they
+collide. This is a **placement** conflict, not a capacity-tuning one: it is
+independent of window size (w128→14 layers, w64→24 layers, both crash) and
+independent of the safety margin (96 KiB gave the identical clash address — the
+margin controls the headroom-scan token count, not the buffer offset). Any
+batch-32-sized CB set overruns the low KV buffer. Making it run would require an
+allocator change (place L1 KV buffers high in L1, or reserve the CB region first) or
+a different placement mode (`sharded`, untested at b32).
+
+### Conclusion (§12)
+At batch 32 the realistic hybrid L1 KV mode is **not merely no-faster — it cannot
+execute**: the interleaved KV buffer hard-clashes with the batch-scaled decode CBs.
+Combined with batch-1 parity (L1 20.95 vs DRAM 20.97 t/s/u) and the §9–§11 finding
+that KV reads stay hidden behind compute, the end-to-end evidence is unambiguous:
+**L1 KV provides no decode-latency benefit, and its capacity lever is unreachable at
+high batch** — exactly where extra KV capacity would matter, the tier no longer fits
+alongside the compute buffers. The value of L1 KV, if any, is confined to
+low-batch / long-context regimes where the window fits without displacing the CBs.
