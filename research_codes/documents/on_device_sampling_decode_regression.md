@@ -41,6 +41,58 @@ latency config. Demo: `models/tt_transformers/demo/simple_text_demo.py -k
 
 ---
 
+## Experiment environment & reproducibility
+
+All runs were done on branch **`upstream`** (= current tt-metal main), commit
+`82ca47adc7c`, in the `/home/masterjunmo/codes/tt-metal` checkout, single P150
+(Blackhole), Python 3.10. The `l1-kv-cache` branch was NOT used for any run — it
+only holds this document.
+
+Which runs used the greedy (`allow_force_argmax`) fix:
+- End-to-end decode t/s/u (§4-§6) and the §9 full-model SDPA sweep: force_argmax
+  ENABLED (`model_config.py` ~L1074 `False->True`). This is the fix that yields
+  38.77 t/s/u.
+- §10 (isolated batch sweep) and §11 (context sweep): the isolated SDPA op has no
+  sampling, so force_argmax is N/A / not applied. It does not affect the SDPA
+  compute-vs-read measurement (sampling is a separate end-of-pipeline op).
+
+Command used for the isolated SDPA zone measurement (§10/§11), one (batch, ctx) per run:
+```
+# 1. Temporarily add zones to main's STOCK sdpa kernels, then wipe the JIT cache:
+#    - macro in compute/sdpa_flash_decode.cpp and dataflow/dataflow_common.hpp:
+#        #include "tools/profiler/kernel_profiler.hpp"
+#        #define SDPA_ZONE(name) DeviceZoneScopedN(name)
+#    - SDPA_ZONE("CMP_CHUNK") at top of the compute per-chunk loop (sdpa_flash_decode.cpp)
+#    - SDPA_ZONE("RD_CHUNK") at top of the read per-chunk loop in BOTH the paged branch
+#      (reader_decode_all.cpp) and read_kv_mask_chunks (dataflow_common.hpp)
+#    rm -rf ~/.cache/tt-metal-cache
+# 2. Run the isolated SDPA-decode op via the unit-test helper (Llama-3.1-8B shape):
+TT_VISIBLE_DEVICES=0 MESH_DEVICE=P150 \
+TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_MID_RUN_DUMP=1 \
+  ./python_env/bin/pytest <tmp_test>::test_...[b=<B>-s=<S>] -s
+#    where the test body is:
+#      run_test_sdpa_decode_single_iter(device, b, 32, 8, s, 128, ttnn.bfloat8_b,
+#          (8,8), ttnn.bfloat16, cur_pos_tensor=True, start_indices=[s-1]*b)
+# 3. Parse (NOT `python -m tracy -r`, which asserts at batch>1):
+./python_env/bin/python research_codes/documents/l1_kv_cache_cache/reprofile/analyze_zones.py \
+    generated/profiler/.logs/profile_log_device.csv
+```
+The temporary kernel zones and unit-test files were reverted/removed after capture;
+main is clean.
+
+Is the isolated measurement valid? Yes, with one caveat. It uses the SAME kernels,
+shapes (nh=32/nkv=8/d=128/grid 8x8), and dtypes (bfp8 KV, bf16 Q) as in-model
+decode, and the unit test PCC-checks the output (the op computed real attention,
+not garbage). It is **cross-validated against the full-model paged sweep (§9)**: on
+the overlapping batch range 1-8, both converge to compute/read ~1.06-1.08 with read
+fully hidden, so the isolated batch-16/32 extension is trustworthy. Caveat: the
+isolated run uses the NON-paged read path (`read_kv_mask_chunks`), cheaper per chunk
+than the full-model paged read (batch-1 ratio 1.29 isolated vs 2.22 paged), so
+absolute read µs differ between §9 and §10 — the compute-vs-read TREND and the "read
+stays hidden" conclusion transfer, not the exact crossover batch.
+
+---
+
 ## 1. Background: where sampling sits in LLM inference
 
 LLM text generation has two phases:
