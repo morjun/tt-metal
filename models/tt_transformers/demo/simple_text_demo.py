@@ -1163,9 +1163,11 @@ def test_demo_text(
 
         # Use device sampling for all cases when supported
 
-        # FORCE_HOST_SAMPLING=1 forces host-side sampling (device_sampling_params=None),
-        # the max-perf baseline on this branch (no force_argmax fast-path). Used for the
-        # L1-vs-DRAM A/B so both arms run identical, fastest sampling. Default: unchanged.
+        # FORCE_HOST_SAMPLING=1 forces host-side sampling (device_sampling_params=None).
+        # Default (unset/0) = on-device sampling when supported. NOTE: on THIS l1-kv build
+        # host sampling is ~2.4x SLOWER than on-device (b1: 8.67 vs 21.26 t/s/u) — a host-path
+        # regression on this branch — so on-device (the default) is the max-perf path here.
+        # See research_codes/documents/on_device_sampling_decode_regression.md §6/§12.
         _force_host_sampling = os.environ.get("FORCE_HOST_SAMPLING", "0") == "1"
         device_sampling_params = (
             SamplingParams(

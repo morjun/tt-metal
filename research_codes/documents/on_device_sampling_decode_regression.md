@@ -376,6 +376,13 @@ In order of preference:
    un-regress L1-KV benchmarks** (recovers most of the gap; the last ~4 ms/token to
    35 is a separate small regression).
 
+   > ⚠️ **DOES NOT hold on the l1-kv-cache build (measured 2026-07-03).** On this
+   > branch host sampling is ~2.4× *slower* than on-device (batch-1: 8.67 vs
+   > 21.26 t/s/u; batch-32: 4.66 vs 20.25 t/s/u), the INVERSE of the Nov-5 base.
+   > The l1-kv branch regressed the host-sampling decode path specifically. **On the
+   > l1-kv build, use on-device sampling (the default) for max perf; do NOT use host
+   > sampling.** See §12. Root cause of the host-path regression is not yet isolated.
+
 2. **Enable `allow_force_argmax` for single-chip P150 — VALIDATED, this is the fix.**
    The cheap argmax fast-path exists but `model_config.py:1102-1116` enables it only
    on Galaxy. temp=0 already rewrites to `k=1` greedy, so flipping
@@ -405,6 +412,38 @@ In order of preference:
    t/s/u), so it was never fixed. Report against #31046: "BH P150 Llama-3.1-8B
    batch-1 decode regressed 35 -> 21 t/s/u; on-device sampling op dominates
    per-token latency for greedy decode."
+
+### 6.1 How to toggle host vs on-device sampling (l1-kv-cache build)
+
+There is **no CLI flag** for this — the demo picks on-device sampling whenever
+`model._supports_on_device_sampling` is True. This branch adds an **env-var override**
+in `simple_text_demo.py` (~L1169):
+
+```python
+_force_host_sampling = os.environ.get("FORCE_HOST_SAMPLING", "0") == "1"
+device_sampling_params = (
+    SamplingParams(temperature=..., top_k=..., top_p=...)
+    if model[0]._supports_on_device_sampling and not _force_host_sampling
+    else None            # None => host-side sampling (sample_host in the decode loop)
+)
+```
+
+Toggle it per run via the environment (no code edit needed):
+
+| sampling mode | how | l1-kv batch-1 perf |
+|---------------|-----|--------------------|
+| **on-device** (default, FAST here) | unset `FORCE_HOST_SAMPLING` (or `=0`) | **21.26 t/s/u** |
+| **host** (SLOW on this build) | `FORCE_HOST_SAMPLING=1 ./python_env/bin/pytest ...` | 8.67 t/s/u |
+
+Example (on-device, the recommended max-perf path on l1-kv):
+```
+TT_METAL_HOME=/home/masterjunmo/codes/tt-metal-l1kv TT_VISIBLE_DEVICES=0 MESH_DEVICE=P150 \
+  ./python_env/bin/pytest -q -s models/tt_transformers/demo/simple_text_demo.py \
+    -k "batch-1 and performance"
+```
+Prefix with `FORCE_HOST_SAMPLING=1` to force the host path instead. (If you had not
+applied this branch's env-gate edit, the equivalent manual lever is setting
+`device_sampling_params = None` directly, or `model._supports_on_device_sampling = False`.)
 
 ---
 
