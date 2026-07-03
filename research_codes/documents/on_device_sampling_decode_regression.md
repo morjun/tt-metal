@@ -600,9 +600,9 @@ The §9–§11 sweeps use device zones, whose coarse variant clamps the ratio to
 high batch" without any zone artifact, run the full demo end-to-end and compare
 tokens/s directly. Done on the **l1-kv-cache branch** (worktree
 `/home/masterjunmo/codes/tt-metal-l1kv`, built `ninja -C build_Release -j4 ttnn`),
-`simple_text_demo.py -k "batch-32 and performance"`, **host sampling**
-(`FORCE_HOST_SAMPLING=1`, the max-perf baseline on this branch since it predates
-force_argmax), `DECODE_WARMUP_ITERS=2` (absorb JIT + L1 alloc/seed before timing).
+`simple_text_demo.py -k "batch-32 and performance"`, **on-device sampling** (see the
+sampling caveat below), `DECODE_WARMUP_ITERS=2` (absorb JIT + L1 alloc/seed before
+timing). All numbers are post real device reset (`tt-smi -r`; AICLK confirmed 800 MHz).
 
 **Setup note:** L1 KV allocation is silently disabled under paged attention
 (`allocate_l1_kv_cache` early-returns on `paged_attention_config`; ring-write gated
@@ -612,9 +612,26 @@ total — fits P150 DRAM comfortably. `l1_only` mode is NOT used (at batch 32 it
 StreamingLLM clamp would drop most of the context → wrong output); the realistic
 `interleaved` mode keeps full context (recent window in L1, older tail in DRAM).
 
-### DRAM baseline (batch 32, non-paged, host sampling) — runs cleanly
-- **Average: 214.8 ms/iter → 4.66 tok/s/user, 148.97 tok/s aggregate.**
-- 1st-token decode 245.66 ms [4.07 t/s/u]; 128th-token 292.83 ms [3.41 t/s/u].
+**Sampling caveat (IMPORTANT — corrected 2026-07-03).** An earlier version of this
+section used HOST sampling (`FORCE_HOST_SAMPLING=1`) as the "max-perf baseline" and
+reported batch-32 DRAM at 4.66 t/s/u / 149 tok/s. That was WRONG: on the l1-kv build,
+**host sampling is ~2.4× SLOWER than on-device** (batch-1: 8.67 vs 21.26 t/s/u) — the
+inverse of the nov5-base behavior in §6 (where host 31 > on-device 21). So the l1-kv
+branch regressed the host-sampling decode path specifically (on-device path healthy,
+= base). Isolation (all batch-1, post real reset, 800 MHz): nov5-base on-device
+21.53; l1-kv on-device 21.26 (build FINE, = base); l1-kv host 8.67 (broken). Device,
+tt_llk (1078754→9929191 diff is a 1-line Wormhole-only matmul typo, irrelevant to
+Blackhole), and batch-division all ruled out. **Baselines below therefore use
+on-device sampling.** Also fixed a real bug that blocked on-device batch-32:
+`generator.py:62` `split_list` did `start = end` (`end` undefined → NameError at any
+multi-user split) — corrected to `start += chunk_size`. This bug is likely why the
+original methodology reached for host sampling at batch 32 in the first place.
+
+### DRAM baseline (batch 32, non-paged, ON-DEVICE sampling) — runs cleanly
+- **Average: 49.39 ms/iter → 20.25 tok/s/user, 647.94 tok/s aggregate.**
+- 1st-token decode 48.85 ms [20.47 t/s/u]; 128th-token 49.50 ms [20.2 t/s/u].
+- Per-user at batch 32 (20.25) ≈ batch-1 on-device (21.26) → near-flat per-user
+  scaling, ~648 tok/s aggregate. (The earlier 4.66 t/s/u was the broken host path.)
 
 ### L1 interleaved arm (batch 32) — DOES NOT RUN
 The adaptive allocator (`_post_compile_allocate_l1_kv`, live headroom scan, 110
@@ -641,7 +658,9 @@ independent of the safety margin (96 KiB gave the identical clash address — th
 margin controls the headroom-scan token count, not the buffer offset). Any
 batch-32-sized CB set overruns the low KV buffer. Making it run would require an
 allocator change (place L1 KV buffers high in L1, or reserve the CB region first) or
-a different placement mode (`sharded`, untested at b32).
+a different placement mode (`sharded`, untested at b32). The crash is at trace
+CAPTURE (first decode op), before any sampling runs, so it is sampling-independent —
+the L1 arm won't execute at batch 32 under host OR on-device sampling.
 
 ### Conclusion (§12)
 At batch 32 the realistic hybrid L1 KV mode is **not merely no-faster — it cannot

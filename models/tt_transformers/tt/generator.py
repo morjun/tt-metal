@@ -59,7 +59,7 @@ def split_list(lst, n):
     start = 0
     for i in range(n):
         chunks.append(list(lst[start : start + chunk_size]))  # Convert to list explicitly
-        start = end
+        start = start + chunk_size
     return chunks
 
 
