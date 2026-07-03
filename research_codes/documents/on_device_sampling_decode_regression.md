@@ -428,6 +428,29 @@ device_sampling_params = (
 )
 ```
 
+**Why host sampling is slow on this build (phase breakdown, `TT_L1_KV_PERF=1`).**
+Per-token cost is entirely host-side output handling, OUTSIDE the trace (in-trace
+timers fire only during warmup, so `model_forward`/`sdpa`/`output_to_dram` show
+count≈2 and are NOT per-token). The count≈202 per-token phases:
+
+| phase | avg/token | what |
+|-------|-----------|------|
+| `decode.output_postprocess` | **105 ms** | `process_output_decode` → `ttnn.to_torch()` on the FULL `[1,1,32,128256]` vocab logits (host untilize + float cast) |
+| `decode.output_readback` | **30 ms** | `.cpu()` device→host copy of those logits |
+| `decode.prepare_inputs_host` | 0.9 ms | (negligible) |
+| `decode.host_to_device` | 0.1 ms | (negligible) |
+
+So host sampling hauls the ENTIRE vocab logits to host and converts them every
+token (~135 ms), while on-device sampling argmaxes in-trace and returns one token
+index — skipping all 135 ms. That is the whole 8.67-vs-21 t/s/u gap; the forward,
+input prep, and copy are all fine. NOTE: `process_output_decode` and the LM-head
+DRAM-move (`if not is_galaxy`, model.py:586) are byte-identical to the base, so
+whether this is a true regression vs the base's documented 31 t/s/u (§6 rec #1) or
+the base's 31 was measured without this per-token full-logits conversion in its
+timed window is UNRESOLVED — it needs the base re-run with the same `TT_L1_KV_PERF`
+instrumentation to compare `output_postprocess` head-to-head. Either way, the
+actionable conclusion holds: on the l1-kv build, on-device sampling is the fast path.
+
 Toggle it per run via the environment (no code edit needed):
 
 | sampling mode | how | l1-kv batch-1 perf |
