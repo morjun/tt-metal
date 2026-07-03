@@ -364,8 +364,16 @@ does not carry this cost.)
 
 In order of preference:
 
-1. **Use host-side sampling.** VALIDATED on the Nov-5 base: forcing
-   `device_sampling_params = None` recovers **21.3 -> 31.19 t/s/u (+47%)**.
+1. **~~Use host-side sampling.~~ RETRACTED (2026-07-03) — does NOT reproduce.**
+   A fresh re-measure of the Nov-5 base with host sampling gives **7.4 t/s/u**
+   (batch-1), NOT 31 — and l1-kv host = 8.67, i.e. host sampling is ~7-8 t/s/u on
+   BOTH builds, SLOWER than on-device (~21). The earlier "21.3 -> 31.19 (+47%)"
+   figure is not reproducible; host sampling pays ~135 ms/token converting the full
+   128256-vocab logits to torch on the host every token (`process_output_decode`;
+   see §6.1 breakdown). **Do NOT use host sampling as a workaround.** Use on-device
+   sampling (~21 t/s/u, both builds) or force_argmax (rec #2, ~38, main only). The
+   ORIGINAL (pre-2026-07-03) claim, kept for the record but SUPERSEDED:
+   ~~forcing `device_sampling_params = None` recovers 21.3 -> 31.19 t/s/u (+47%).~~
    Note the right lever is `device_sampling_params`, not the demo's
    `sampling_params` dict: the demo builds `device_sampling_params` from the dict
    whenever `model._supports_on_device_sampling` is True (simple_text_demo.py
@@ -376,12 +384,13 @@ In order of preference:
    un-regress L1-KV benchmarks** (recovers most of the gap; the last ~4 ms/token to
    35 is a separate small regression).
 
-   > ⚠️ **DOES NOT hold on the l1-kv-cache build (measured 2026-07-03).** On this
-   > branch host sampling is ~2.4× *slower* than on-device (batch-1: 8.67 vs
-   > 21.26 t/s/u; batch-32: 4.66 vs 20.25 t/s/u), the INVERSE of the Nov-5 base.
-   > The l1-kv branch regressed the host-sampling decode path specifically. **On the
-   > l1-kv build, use on-device sampling (the default) for max perf; do NOT use host
-   > sampling.** See §12. Root cause of the host-path regression is not yet isolated.
+   > ⚠️ **Host sampling is SLOW on BOTH builds (measured 2026-07-03), NOT an l1-kv
+   > regression.** Batch-1 host sampling: nov5-base 7.4 t/s/u, l1-kv 8.67 — both far
+   > below on-device (~21). Earlier I mis-framed this as an "l1-kv host-path
+   > regression" by comparing l1-kv's measured host number to the base's
+   > documented-but-unreproducible "31"; a fresh base re-measure gives 7.4, so host
+   > sampling was simply always ~7-8 t/s/u. **Use on-device sampling (the default,
+   > ~21) for max perf; do NOT use host sampling on any build.** See §6.1/§12.
 
 2. **Enable `allow_force_argmax` for single-chip P150 — VALIDATED, this is the fix.**
    The cheap argmax fast-path exists but `model_config.py:1102-1116` enables it only
@@ -443,13 +452,15 @@ count≈2 and are NOT per-token). The count≈202 per-token phases:
 So host sampling hauls the ENTIRE vocab logits to host and converts them every
 token (~135 ms), while on-device sampling argmaxes in-trace and returns one token
 index — skipping all 135 ms. That is the whole 8.67-vs-21 t/s/u gap; the forward,
-input prep, and copy are all fine. NOTE: `process_output_decode` and the LM-head
-DRAM-move (`if not is_galaxy`, model.py:586) are byte-identical to the base, so
-whether this is a true regression vs the base's documented 31 t/s/u (§6 rec #1) or
-the base's 31 was measured without this per-token full-logits conversion in its
-timed window is UNRESOLVED — it needs the base re-run with the same `TT_L1_KV_PERF`
-instrumentation to compare `output_postprocess` head-to-head. Either way, the
-actionable conclusion holds: on the l1-kv build, on-device sampling is the fast path.
+input prep, and copy are all fine. **RESOLVED (2026-07-03): this is NOT an l1-kv
+regression.** `process_output_decode` and the LM-head DRAM-move (`if not is_galaxy`,
+model.py:586) are byte-identical to the base, and a fresh re-measure of the base
+(nov5-base) with host sampling gives **7.4 t/s/u** — essentially the same as l1-kv's
+8.67. So host sampling is inherently ~7-8 t/s/u on BOTH builds (the per-token
+full-vocab logits→torch conversion), and the base's documented "31 t/s/u" (§6 rec #1)
+does NOT reproduce — it was a mismeasurement (likely its timed window excluded
+`process_output_decode`). Actionable conclusion: on-device sampling (~21, both
+builds) is the fast path; host sampling is not a viable workaround.
 
 Toggle it per run via the environment (no code edit needed):
 
@@ -676,13 +687,15 @@ StreamingLLM clamp would drop most of the context → wrong output); the realist
 
 **Sampling caveat (IMPORTANT — corrected 2026-07-03).** An earlier version of this
 section used HOST sampling (`FORCE_HOST_SAMPLING=1`) as the "max-perf baseline" and
-reported batch-32 DRAM at 4.66 t/s/u / 149 tok/s. That was WRONG: on the l1-kv build,
-**host sampling is ~2.4× SLOWER than on-device** (batch-1: 8.67 vs 21.26 t/s/u) — the
-inverse of the nov5-base behavior in §6 (where host 31 > on-device 21). So the l1-kv
-branch regressed the host-sampling decode path specifically (on-device path healthy,
-= base). Isolation (all batch-1, post real reset, 800 MHz): nov5-base on-device
-21.53; l1-kv on-device 21.26 (build FINE, = base); l1-kv host 8.67 (broken). Device,
-tt_llk (1078754→9929191 diff is a 1-line Wormhole-only matmul typo, irrelevant to
+reported batch-32 DRAM at 4.66 t/s/u / 149 tok/s. That was WRONG: **host sampling is
+~2.4× SLOWER than on-device** (batch-1: 8.67 vs 21.26 t/s/u) because it converts the
+full 128256-vocab logits to torch on the host every token (~135 ms; see §6.1). This
+is NOT an l1-kv regression — a fresh re-measure of nov5-base with host sampling gives
+7.4 t/s/u (≈ l1-kv's 8.67), so host sampling is inherently ~7-8 t/s/u on BOTH builds;
+the base's documented "31" (§6 rec #1) does not reproduce. Isolation (all batch-1,
+post real reset, 800 MHz): nov5-base on-device 21.53 / host 7.4; l1-kv on-device
+21.26 / host 8.67 → builds match, on-device is the fast path on both. Device, tt_llk
+(1078754→9929191 diff is a 1-line Wormhole-only matmul typo, irrelevant to
 Blackhole), and batch-division all ruled out. **Baselines below therefore use
 on-device sampling.** Also fixed a real bug that blocked on-device batch-32:
 `generator.py:62` `split_list` did `start = end` (`end` undefined → NameError at any
