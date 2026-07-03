@@ -371,8 +371,16 @@ In order of preference:
    figure is not reproducible; host sampling pays ~135 ms/token converting the full
    128256-vocab logits to torch on the host every token (`process_output_decode`;
    see §6.1 breakdown). **Do NOT use host sampling as a workaround.** Use on-device
-   sampling (~21 t/s/u, both builds) or force_argmax (rec #2, ~38, main only). The
-   ORIGINAL (pre-2026-07-03) claim, kept for the record but SUPERSEDED:
+   sampling (~21 t/s/u, both builds) or force_argmax (rec #2, ~38, main only).
+
+   VENV RULED OUT (2026-07-03): to test whether the shared venv's drifted libraries
+   caused the slow host number, fresh per-worktree venvs were rebuilt via
+   `create_venv.sh` with Python 3.10.19 (commit-correct pins: transformers 4.53.0,
+   pytest 8.4.2, torch 2.7.1+cpu). Host sampling batch-1 across FOUR configs: l1-kv
+   shared 8.67, l1-kv fresh 8.48, nov5-base own 7.4, **nov5-base (base commit) fresh
+   7.78** — all ~7-8.5, independent of venv and build. So the documented "31" does
+   not reproduce on the exact commit under a clean venv either; it was a
+   mismeasurement. The ORIGINAL (pre-2026-07-03) claim, SUPERSEDED:
    ~~forcing `device_sampling_params = None` recovers 21.3 -> 31.19 t/s/u (+47%).~~
    Note the right lever is `device_sampling_params`, not the demo's
    `sampling_params` dict: the demo builds `device_sampling_params` from the dict
