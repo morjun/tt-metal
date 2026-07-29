@@ -59,6 +59,7 @@ set(TT_METAL_PUBLIC_API
     api/tt-metalium/experimental/lightmetal/lightmetal_capture_utils.hpp
     api/tt-metalium/experimental/lightmetal/lightmetal_replay.hpp
     api/tt-metalium/experimental/mesh_program_descriptor.hpp
+    api/tt-metalium/experimental/blaze/named_kernel_args.hpp
     api/tt-metalium/experimental/metal2_host_api/advanced_options.hpp
     api/tt-metalium/experimental/metal2_host_api/compute_hardware_config.hpp
     api/tt-metalium/experimental/metal2_host_api/data_movement_hardware_config.hpp
@@ -159,6 +160,7 @@ set(TT_METAL_PUBLIC_API
 
 set(TT_METAL_SOURCES
     impl/host_api/tt_metal.cpp
+    impl/experimental/offline_compile/offline_kernel_compile.cpp
     impl/graph/graph_tracking.cpp
     hal.cpp
 )
@@ -222,5 +224,9 @@ set(JITAPI_FILES
     impl/dispatch/kernels/device_print_dispatch.h
     fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
     fabric/impl/kernels/tt_fabric_mux.cpp
+    fabric/impl/kernels/tt_fabric_mux_v2.cpp
+    fabric/impl/kernels/tt_fabric_mux_v2_forwarder.hpp
+    fabric/impl/kernels/tt_fabric_mux_v2_manager.hpp
+    fabric/impl/kernels/tt_fabric_mux_v2_kernel_common.hpp
     sfpi-version
 )
