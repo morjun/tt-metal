@@ -387,6 +387,9 @@ class Gemma4Model:
         # when the explicit kwarg is None — same pattern as the prefill
         # stash above.
         self._decode_pli_combined = None
+        # Cached fp32 casts of the PLI projection weights (see _compute_per_layer_inputs).
+        self._pli_proj_w_fp32 = None
+        self._pli_norm_w_fp32 = None
         self.per_layer_input_weights = {}
         if self.hidden_size_per_layer_input and state_dict:
             pli_size = self.hidden_size_per_layer_input
@@ -619,17 +622,26 @@ class Gemma4Model:
         pli_embed = F.embedding(input_ids_torch.long(), embed_w) * self.per_layer_embed_scale
         pli_embed = pli_embed.reshape(*input_ids_torch.shape, full_n_layers, pli_size)
 
-        # 2. Projection from main embeddings
-        proj_w = w["per_layer_model_projection"]  # [full_n_layers * pli_size, hidden]
-        pli_proj = F.linear(embeds_torch.float(), proj_w.float()) * self.per_layer_model_projection_scale
+        # 2. Projection from main embeddings.
+        # The fp32 casts of these weights are cached: proj_w is [8960, 1536] for
+        # E2B, so casting it per call costs ~6 ms of pure host time (measured) and
+        # this runs once per decode/verify step.
+        proj_w32 = self._pli_proj_w_fp32
+        if proj_w32 is None:
+            proj_w32 = w["per_layer_model_projection"].float()  # [full_n_layers * pli_size, hidden]
+            self._pli_proj_w_fp32 = proj_w32
+        pli_proj = F.linear(embeds_torch.float(), proj_w32) * self.per_layer_model_projection_scale
         pli_proj = pli_proj.reshape(*embeds_torch.shape[:-1], full_n_layers, pli_size)
 
         # 3. Norm the projection
-        norm_w = w["per_layer_projection_norm"]  # [pli_size]
+        norm_w = self._pli_norm_w_fp32
+        if norm_w is None:
+            norm_w = w["per_layer_projection_norm"].float()  # [pli_size]
+            self._pli_norm_w_fp32 = norm_w
         eps = self.hf_config.rms_norm_eps
         pli_proj_f = pli_proj.float()
         var = pli_proj_f.pow(2).mean(-1, keepdim=True)
-        pli_proj = (pli_proj_f * torch.rsqrt(var + eps) * norm_w.float()).to(pli_proj.dtype)
+        pli_proj = (pli_proj_f * torch.rsqrt(var + eps) * norm_w).to(pli_proj.dtype)
 
         # 4. Combine: (projection + embed) * scale
         per_layer_inputs = (pli_proj + pli_embed.float()) * self.per_layer_input_scale
@@ -1064,8 +1076,49 @@ class Gemma4Model:
         """
         return {lt: self.tt_kv_cache[idx] for lt, idx in self.last_kv_layer_by_type.items()}
 
+    def _verify_pli_device_tensors(self, token_ids_host, pli_device_tensors):
+        """Build the per-layer PLI tensors a speculative verify needs, if any.
+
+        Both verify flavours (candidates in the batch dim, and packed-query
+        candidates in the row dim) present P candidates along the row dim, so both
+        need one ``[1,1,P,pli_size]`` tensor per layer. Returns
+        ``pli_device_tensors`` unchanged when already supplied, and ``None`` for
+        targets without per-layer inputs (12B/31B).
+        """
+        if pli_device_tensors is not None:
+            return pli_device_tensors
+        if not (self.hidden_size_per_layer_input and self.per_layer_input_weights):
+            return None
+        if token_ids_host is None:
+            raise ValueError(
+                "This target uses per-layer inputs (E2B/E4B), so the speculative verify needs the "
+                "candidate token ids on host to build PLI. Pass token_ids_host= (or pli_device_tensors=). "
+                "Note the fully on-device fused iteration cannot satisfy this: its draft tokens never "
+                "reach the host, so it requires an on-device PLI implementation."
+            )
+        pli_host = self.compute_host_pli_batch(token_ids_host)  # [n_layers, 1, P, pli_size]
+        # One upload, then hand each layer a dim-0 slice. dims 0/1 are not tiled,
+        # so slicing there is free regardless of how P aligns to a tile.
+        pli_all = ttnn.from_torch(
+            pli_host,
+            device=self.mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._replicate_to_mesh_mapper(),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        return [pli_all[i : i + 1] for i in range(pli_host.shape[0])]
+
     def ttnn_verify_forward(
-        self, x, current_pos, current_pos_cache=None, page_table=None, kv_cache=None, page_tables_per_layer=None
+        self,
+        x,
+        current_pos,
+        current_pos_cache=None,
+        page_table=None,
+        kv_cache=None,
+        page_tables_per_layer=None,
+        token_ids_host=None,
+        pli_device_tensors=None,
     ):
         """Multi-token speculative *verify* forward (batch holds the candidates).
 
@@ -1084,12 +1137,21 @@ class Gemma4Model:
             current_pos: [1,32] uint32 padded positions (first K = p+1..p+K).
             page_table: [K, num_blocks] int32 (the user's row replicated K times).
             kv_cache: optional KV cache override (defaults to self.tt_kv_cache).
+            token_ids_host: host list/tensor of the same K candidate ids as ``x``.
+                REQUIRED for per-layer-input models (E2B/E4B): PLI is computed on
+                CPU, and the candidates sit in the row dim, so each layer needs its
+                own [1,1,K,pli_size] tensor (see ``compute_host_pli_batch``). Not
+                needed for models without PLI (12B/31B).
+            pli_device_tensors: optional pre-built per-layer PLI (e.g. persistent
+                trace buffers), used instead of computing from ``token_ids_host``.
 
         Returns:
             (logits, hidden) — logits [1,1,K,vocab] from the post-norm hidden;
             ``hidden`` is the post-final-norm hidden [1,1,K,hidden], the
             it-assistant drafter's recurrent seed.
         """
+        pli_device_tensors = self._verify_pli_device_tensors(token_ids_host, pli_device_tensors)
+
         if x.dtype in (ttnn.uint32, ttnn.int32):
             input_embeds = self.embed_tokens(x)
             if len(input_embeds.shape) == 3:
@@ -1112,6 +1174,7 @@ class Gemma4Model:
             token_index=token_index,
             position_idx_cache=current_pos_cache if current_pos_cache is not None else current_pos,
             page_tables_per_layer=page_tables_per_layer,
+            pli_device_tensors=pli_device_tensors,
             return_hidden=True,
             # Default True (race-safe). A timing/experiment harness can set
             # `_verify_seq_kv_write=False` to measure the cost of the per-candidate
@@ -1132,6 +1195,8 @@ class Gemma4Model:
         embed_idx_full=None,
         embed_idx_sliding=None,
         hot_pt=None,
+        token_ids_host=None,
+        pli_device_tensors=None,
     ):
         """Packed-query speculative verify — all P candidates in ONE batch=1 pass.
 
@@ -1160,6 +1225,7 @@ class Gemma4Model:
             (logits [1,1,P,vocab], hidden [1,1,P,hidden]) — same contract as
             ``ttnn_verify_forward``.
         """
+        pli_device_tensors = self._verify_pli_device_tensors(token_ids_host, pli_device_tensors)
         input_embeds = self.embed_tokens(x)
         if len(input_embeds.shape) == 3:
             input_embeds = ttnn.unsqueeze_to_4D(input_embeds)
@@ -1194,6 +1260,7 @@ class Gemma4Model:
             token_index=None if self.rope_caches_2d else 0,
             return_hidden=True,
             packed=packed,
+            pli_device_tensors=pli_device_tensors,
         )
         for cos_bp, sin_bp in rope_packed.values():
             cos_bp.deallocate(True)
@@ -1220,6 +1287,33 @@ class Gemma4Model:
         if pli_list is None:
             return None
         return torch.stack(pli_list, dim=2)  # [1, 1, n_layers, pli_size]
+
+    def compute_host_pli_batch(self, token_ids):
+        """Per-layer inputs (PLI) for B tokens -> [n_layers, 1, B, pli_size] bf16.
+
+        ``compute_host_pli`` handles a single decode token and packs the layers
+        into dim 2 (``[1,1,n_layers,pli_size]``), which only works when the row
+        dim is 1: a layer consumes PLI as ``ttnn.mul(gated, per_layer_input)``
+        against a ``[1,1,rows,pli_size]`` activation, so rows and layers cannot
+        share a dimension. Speculative verify puts its K+1 candidates in the row
+        dim, so it needs one ``[1,1,B,pli_size]`` tensor PER LAYER — which is the
+        ``pli_device_tensors`` contract in ``__call__``. Returning them stacked on
+        dim 0 lets the caller upload once and hand out device slices.
+
+        Returns None when the model has no per-layer inputs (only E2B/E4B do).
+        """
+        if not self.hidden_size_per_layer_input or not self.per_layer_input_weights:
+            return None
+
+        import torch.nn.functional as F
+
+        toks = torch.as_tensor(token_ids, dtype=torch.long).reshape(1, -1)  # [1, B]
+        embeds = F.embedding(toks, self._embed_weight_cpu).float() * self.embed_scale  # [1, B, hidden]
+        pli_list = self._compute_per_layer_inputs(toks.int(), embeds)  # n_layers x [1, B, pli_size]
+        if pli_list is None:
+            return None
+        # [n_layers, 1, B, pli_size]: dim 0 selects the layer, dim 2 the candidate.
+        return torch.stack([t.reshape(1, -1, t.shape[-1]) for t in pli_list], dim=0).to(torch.bfloat16)
 
     def compute_host_embeddings(self, token_id):
         """Host token embedding + PLI (legacy fallback).

@@ -27,8 +27,34 @@ N_GREEDY = int(os.getenv("GEMMA4_SPEC_CEILING_TOKENS", 64))
 DRAFT_LEN = int(os.getenv("GEMMA4_SPEC_DRAFT_LEN", 4))
 
 
+def _hf_classes():
+    """(target_cls, assistant_cls) for this checkpoint pair.
+
+    The 12B/31B pairs are the ``Gemma4Unified*`` architectures; E2B/E4B are the
+    plain ``Gemma4*`` ones (and E2B's assistant is the Centroid-Masked-Embedding
+    variant). Dispatch off the config's declared architecture rather than
+    hard-coding, so the same harness serves every pairing.
+    """
+    import transformers
+    from transformers import AutoConfig
+
+    def _resolve(path, fallback):
+        arch = (getattr(AutoConfig.from_pretrained(path, trust_remote_code=True), "architectures", None) or [None])[0]
+        cls = getattr(transformers, arch, None) if arch else None
+        if cls is None:
+            print(f"  warning: architecture {arch!r} for {path} not found in transformers; using {fallback}")
+            return getattr(transformers, fallback)
+        return cls
+
+    return (
+        _resolve(TARGET, "Gemma4UnifiedForConditionalGeneration"),
+        _resolve(ASSISTANT, "Gemma4UnifiedAssistantForCausalLM"),
+    )
+
+
 def main():
-    from transformers import Gemma4UnifiedAssistantForCausalLM, Gemma4UnifiedForConditionalGeneration
+    target_cls, assistant_cls = _hf_classes()
+    print(f"target class={target_cls.__name__} assistant class={assistant_cls.__name__}")
 
     tok = AutoTokenizer.from_pretrained(TARGET)
     msgs = [{"role": "user", "content": "The capital of France is"}]
@@ -38,12 +64,12 @@ def main():
     print(f"prompt ids shape={list(ids.shape)} last_tokens={ids[0, -6:].tolist()}")
 
     print("loading target (fp32, CPU)...")
-    full = Gemma4UnifiedForConditionalGeneration.from_pretrained(TARGET, dtype=DTYPE).eval()
+    full = target_cls.from_pretrained(TARGET, dtype=DTYPE).eval()
     text_model = full.model.language_model
     lm_head = full.lm_head
     get_embed = full.get_input_embeddings()
     print("loading assistant...")
-    asst = Gemma4UnifiedAssistantForCausalLM.from_pretrained(ASSISTANT, dtype=DTYPE).eval()
+    asst = assistant_cls.from_pretrained(ASSISTANT, dtype=DTYPE).eval()
 
     # DISCRIMINATOR: replay the HF (clean) drafter on TT-exported features vs the
     # TT target greedy chain. Compare to the HF self-ceiling (~1.62) and the TT

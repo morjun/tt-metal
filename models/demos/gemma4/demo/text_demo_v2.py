@@ -772,6 +772,21 @@ def _run_spec_decode(
     # verify fused — avoids the distinct-CCL-trace interleave deadlock). Sampling
     # (temp>0) falls back to the host-readback generate for batch=1.
     use_fused = batch_size == 1 and ((not temperature) or temperature <= 0)
+    # E2B/E4B targets carry per-layer inputs computed on CPU from the token ids, so
+    # they cannot use the fully on-device fused iteration (its drafts never reach
+    # the host) nor the traced verify. Route them to the host loop; GEMMA4_SPEC_FUSED
+    # can also force the choice explicitly for A/B.
+    _fused_env = os.environ.get("GEMMA4_SPEC_FUSED")
+    if _fused_env is not None:
+        use_fused = _fused_env == "1"
+    elif use_fused and getattr(spec, "target_needs_host_pli", False):
+        logger.info(
+            "Target uses per-layer inputs (E2B/E4B): falling back to the host spec-decode loop "
+            "(the fused on-device iteration would need PLI computed on device)."
+        )
+        use_fused = False
+    if getattr(spec, "target_needs_host_pli", False):
+        spec._use_trace = False
     # The fused greedy path is HOST-DISPATCH bound when untraced (~10 tok/s/u —
     # SLOWER than plain decode); the single fused Metal trace removes that
     # overhead (>3x, exceeding plain decode). Default tracing to the demo's

@@ -15,6 +15,11 @@ Device tests require a target (HF_MODEL) + matching drafter
 (GEMMA4_ASSISTANT_MODEL, e.g. google/gemma-4-31B-it-assistant) and are skipped
 otherwise. Use GEMMA4_NUM_LAYERS to shrink the target for a fast wiring check
 (equivalence still holds; acceptance becomes meaningless).
+
+Mesh shapes are ``[(1,1), (1,2), (1,4)]``. 1x2 exists for the E2B pairing, which
+needs TP=2: at TP=1 the packed-verify SDPA's circular buffers grow past L1
+(~2.0 MB vs 1.5 MB). The autouse fixture below skips 1x2 for the wider 12B/31B
+targets, so adding it costs those pairings nothing.
 """
 
 import math
@@ -73,10 +78,15 @@ def _skip_if_target_too_large_for_mesh(request):
     mesh_device = request.getfixturevalue("mesh_device")
     tp = mesh_device.shape[1] if hasattr(mesh_device, "shape") else 1
 
-    if tp == 2:
-        pytest.skip("Gemma4 assistant/spec-decode tests are not supported on 1x2; use 1x1 or 1x4")
-
     text_config = _target_text_config()
+
+    if tp == 2 and getattr(text_config, "hidden_size", 0) > 1536:
+        # 1x2 is unsupported for the 12B/31B pairings (backbone 3840/5376). E2B is
+        # the exception and needs it: its target does NOT fit at tp=1 (the fused
+        # QKV plus the 262144-row lm_head overflows L1), so tp=2 is the only way to
+        # exercise the E2B drafter at all.
+        pytest.skip("Gemma4 assistant/spec-decode tests are not supported on 1x2 above hidden=1536; use 1x1 or 1x4")
+
     if getattr(text_config, "enable_moe_block", False) and tp < 8:
         pytest.skip(f"MoE target model too large for TP={tp} in spec-decode tests")
     if getattr(text_config, "hidden_size", 0) > 4096 and tp < 2:
@@ -110,9 +120,11 @@ def test_assistant_config_loads():
         pytest.skip(f"could not load assistant config: {e}")
     args = Gemma4AssistantArgs.from_hf_config(hf_config)
 
-    assert args.backbone_hidden_size in (3840, 5376), args.backbone_hidden_size
+    # 12B -> 3840, 31B -> 5376, E2B -> 1536. The E2B drafter is also narrower
+    # (hidden 256 vs 1024) and uses the Centroid Masked Embedding output head.
+    assert args.backbone_hidden_size in (1536, 3840, 5376), args.backbone_hidden_size
     assert args.text_args.num_hidden_layers == 4
-    assert args.text_args.hidden_size == 1024
+    assert args.text_args.hidden_size in (256, 1024), args.text_args.hidden_size
     # Every layer KV-shared (drafter cross-attends to the target KV).
     assert args.text_args.num_kv_shared_layers == args.text_args.num_hidden_layers
     assert tuple(args.text_args.layer_types) == (
@@ -121,8 +133,19 @@ def test_assistant_config_loads():
         "sliding_attention",
         "full_attention",
     )
-    assert args.use_ordered_embeddings is False
-    logger.info(f"Assistant: backbone={args.backbone_hidden_size}, text={args.text_args.num_attention_heads}h")
+    # Centroid Masked Embedding: True only for E2B (backbone 1536); the 12B/31B
+    # assistants keep the dense lm_head. When it IS on, the geometry must be
+    # consistent — the head slices the vocab into num_centroids equal blocks.
+    assert args.use_ordered_embeddings == (args.backbone_hidden_size == 1536)
+    if args.use_ordered_embeddings:
+        assert (
+            args.text_args.vocab_size % args.num_centroids == 0
+        ), f"vocab {args.text_args.vocab_size} not divisible by num_centroids {args.num_centroids}"
+        assert args.centroid_intermediate_top_k <= args.num_centroids
+    logger.info(
+        f"Assistant: backbone={args.backbone_hidden_size}, text={args.text_args.num_attention_heads}h, "
+        f"cme={args.use_ordered_embeddings}"
+    )
 
 
 def _plain_greedy(spec, anchor_token, anchor_pos, n):
@@ -162,7 +185,7 @@ def _plain_greedy_bN(spec, anchor_token, anchor_pos, n, pad):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_verify_batched_matches_sequential(mesh_device, reset_seeds):
     """The batched multi-position verify forward must match sequential single
     verify, position-for-position. Guards the paged-cache write path: a single
@@ -346,7 +369,7 @@ def _kv_to_tt(k_torch, mesh_device, num_kv_heads, num_attention_heads, tp, num_d
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_assistant_step_pcc_vs_hf(mesh_device, reset_seeds):
     """Isolated assistant-forward fidelity vs HF.
 
@@ -624,7 +647,7 @@ def _depage(k_cache, page_table_torch, n_pos, block_size, mesh_device, replicate
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_assistant_first_step_vs_hf_realistic(mesh_device, reset_seeds):
     """Faithful first-step check with REAL inputs.
 
@@ -812,7 +835,7 @@ def test_assistant_first_step_vs_hf_realistic(mesh_device, reset_seeds):
 
 @_needs_assistant
 @_assistant_probe
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_export_tt_spec_features(mesh_device, reset_seeds):
     """Export per-step TT drafter inputs + TT target greedy chain (DISCRIMINATOR).
 
@@ -919,7 +942,7 @@ def test_export_tt_spec_features(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_assistant_recurrent_vs_hf_realistic(mesh_device, reset_seeds):
     """Localize the TT drafter (assistant.step) divergence vs HF across ALL K
     recurrent steps on REAL features (the discriminator showed the clean HF
@@ -1097,7 +1120,7 @@ def test_assistant_recurrent_vs_hf_realistic(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_assistant_step_pcc_real(mesh_device, reset_seeds):
     """Per-stage TT-vs-HF fidelity on REAL features (localizes the drafter bug).
 
@@ -1312,7 +1335,7 @@ def test_assistant_step_pcc_real(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_drafter_per_position_tt_vs_hf(mesh_device, reset_seeds):
     """Per-position TT-vs-HF free-running drafts on IDENTICAL seeds (reproduces
     both 1.44 (HF) and 0.17 (TT) in one harness and localizes the divergent
@@ -1455,7 +1478,7 @@ def test_drafter_per_position_tt_vs_hf(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_tt_drafter_greedychain_acceptance(mesh_device, reset_seeds):
     """TT drafter acceptance vs the TRUE greedy chain (TT analog of the HF
     discriminator). DISAMBIGUATES drafter vs verify:
@@ -1555,7 +1578,7 @@ def test_tt_drafter_greedychain_acceptance(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_spec_decode_matches_greedy(mesh_device, reset_seeds):
     """Greedy spec-decode matches plain greedy decode, EXCEPT at target near-ties.
 
@@ -1667,7 +1690,7 @@ def test_spec_decode_matches_greedy(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_verify_batchsize_invariance(mesh_device, reset_seeds):
     """Isolate batch-size numerics from spec accept logic.
 
@@ -1764,7 +1787,7 @@ def test_verify_batchsize_invariance(mesh_device, reset_seeds):
 
 @_needs_assistant
 @_assistant_probe
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
     """Device-time breakdown to project the achievable (traced) spec-decode speedup.
 
@@ -1904,7 +1927,7 @@ def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
 def test_spec_decode_sampling_acceptance(mesh_device, reset_seeds):
     """Measure SAMPLING-mode acceptance (production config: temp/top_p/top_k).
 

@@ -31,6 +31,7 @@ import time
 import torch
 
 import ttnn
+from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
 
 
 def _to_probs(logits_row, temperature, top_p, top_k):
@@ -101,6 +102,19 @@ class SpeculativeDecoder:
         self._tp = target_model.mesh_config.tp if target_model.mesh_config else 1
         # The drafter cross-attends to the target's last full / last sliding KV.
         self._shared_kv = target_model.get_shared_kv_caches()
+        # E2B/E4B targets carry per-layer inputs (PLI) that are computed on CPU
+        # from the token ids. The verify puts its K+1 candidates in the row dim, so
+        # each layer needs its own [1,1,K+1,pli_size] tensor — supplied from the
+        # host candidate ids (see Gemma4Model.compute_host_pli_batch). Any path
+        # whose candidate tokens exist ONLY on device therefore cannot run such a
+        # target: that includes the fully on-device fused iteration and the traced
+        # verify (building PLI inside a capture would be a write during capture).
+        # ``target_needs_host_pli`` gates those paths with an explicit error and
+        # lets the demo route PLI targets to the host loop.
+        self.target_needs_host_pli = bool(
+            getattr(target_model, "hidden_size_per_layer_input", 0)
+            and getattr(target_model, "per_layer_input_weights", None)
+        )
         # Tracing: persistent I/O buffers + execute_trace replace per-op host
         # dispatch (the untraced loop is host-bound: ~77ms/decode vs a few ms
         # traced). Verify traces are keyed by batch (K+1 for verify, 1 for
@@ -313,11 +327,19 @@ class SpeculativeDecoder:
         # default reseed mode.
         return lh, tr["hidden"]
 
+    def _read_replica(self, t):
+        """One device tensor -> host torch (TP: read the device-0 replica)."""
+        return ttnn.to_torch(ttnn.get_device_tensors(t)[0]) if self._tp > 1 else ttnn.to_torch(t)
+
     def _logits_to_host(self, logits):
-        if self._tp > 1:
-            t = ttnn.to_torch(ttnn.get_device_tensors(logits)[0])
-        else:
-            t = ttnn.to_torch(logits)
+        # Centroid Masked Embedding (E2B drafter): the head only ever materializes
+        # the ~4096 selected logits on device. Rebuild the exact HF full-vocab row
+        # on host (fill with min-1, scatter the selected scores) so the host greedy
+        # argmax, _to_probs, and the speculative-sampling acceptance test all keep
+        # working on a plain [.., vocab] tensor. Cheap: one 262144-wide fill per row.
+        if isinstance(logits, CmeLogits):
+            return self.assistant.masked_embedding.to_host_full_vocab(logits, self._read_replica)
+        t = self._read_replica(logits)
         return t[..., : self.target.vocab_size]
 
     # ── packed-query verify ──────────────────────────────────────────────
@@ -451,7 +473,7 @@ class SpeculativeDecoder:
             "hot": self._pv_from_torch(h["hot"], ttnn.int32),
         }
 
-    def _pv_call(self, dev, P):
+    def _pv_call(self, dev, P, tokens=None):
         return self.target.ttnn_packed_verify_forward(
             x=dev["x"],
             position_idx=dev["pos"],
@@ -463,6 +485,8 @@ class SpeculativeDecoder:
             embed_idx_full=dev["embed"].get("full_attention"),
             embed_idx_sliding=dev["embed"].get("sliding_attention"),
             hot_pt=dev["hot"],
+            # E2B/E4B build per-layer inputs on host from the candidate ids.
+            token_ids_host=tokens,
         )
 
     def _verify_packed(self, tokens, positions):
@@ -475,7 +499,7 @@ class SpeculativeDecoder:
         h = self._pv_host_inputs(c, P)
         dev = self._pv_device_inputs(tokens, h)
         dev["pt"] = self._page_table(1)
-        logits, hidden = self._pv_call(dev, P)
+        logits, hidden = self._pv_call(dev, P, tokens)
         self._pv_a_prev = c // self._pv_bs
         lh = self._logits_to_host(logits).reshape(P, -1)
         logits.deallocate(True)
@@ -538,6 +562,15 @@ class SpeculativeDecoder:
     # ── target forwards ───────────────────────────────────────────────────
     def _verify(self, tokens, positions):
         """Batched verify. Returns (logits_host [B,vocab], hidden_device [1,1,B,h])."""
+        # Any traced verify (plain or packed) is unavailable for a per-layer-input
+        # target: PLI is built from the candidate ids on host, and allocating it
+        # inside a trace capture is an illegal write during capture.
+        if self._use_trace and self.target_needs_host_pli:
+            raise NotImplementedError(
+                "Traced verify is not available for a per-layer-input target (E2B/E4B): PLI is built "
+                "from the candidate ids on host, and allocating/writing it inside a trace capture is "
+                "illegal. Run untraced (GEMMA4_SPEC_TRACE=0), or implement on-device PLI."
+            )
         # Packed-query verify: all K+1 candidates in one batch=1 pass (positions
         # packed into the query-heads dim, loop-free staging KV write).
         # Single-token calls (seed/reseed) keep the plain verify.
@@ -558,7 +591,14 @@ class SpeculativeDecoder:
         pos_u, pos_i = self._pos_tensors(positions)
         pt = self._page_table(len(tokens))
         logits, hidden = self.target.ttnn_verify_forward(
-            x=x, current_pos=pos_u, current_pos_cache=pos_i, page_table=pt, kv_cache=self.tt_kv_cache
+            x=x,
+            current_pos=pos_u,
+            current_pos_cache=pos_i,
+            page_table=pt,
+            kv_cache=self.tt_kv_cache,
+            # E2B/E4B targets compute per-layer inputs on host from the candidate
+            # ids; harmless for targets without PLI.
+            token_ids_host=tokens,
         )
         lh = self._logits_to_host(logits).reshape(len(tokens), -1)
         logits.deallocate(True)
@@ -704,7 +744,15 @@ class SpeculativeDecoder:
         returns garbage beyond the first tile). So process the rows in 32-row
         chunks: pad each ≤32-row chunk up to 32, run the multicore untilize +
         argmax, slice back, and concat. Net ~1.6 ms/chunk vs ~9-28 ms bare.
+
+        Under Centroid Masked Embedding the drafter's ``logits`` is a compact
+        ``CmeLogits`` pair instead of a dense vocab row; the head does its own
+        argmax over the ~4096 candidates and maps the winner back to a vocab id on
+        device, returning the same [1,1,rows] uint32 contract. Target verify
+        logits stay dense, so they take the path below.
         """
+        if isinstance(logits, CmeLogits):
+            return self.assistant.masked_embedding.argmax_token_id(logits, rows)
         R32 = 32
         if rows > R32:
             # Batched packed verify (B*P > 32): argmax each 32-row tile separately
@@ -881,6 +929,12 @@ class SpeculativeDecoder:
         forward, so the whole iteration is one device program (this is the eager
         twin of the fused trace). Returns ``(generated_ids, accepts_per_iter)``.
         """
+        if self.target_needs_host_pli:
+            raise NotImplementedError(
+                "The fused on-device iteration cannot run a per-layer-input target (E2B/E4B): its draft "
+                "tokens are argmaxed and re-embedded on device and never reach the host, but PLI is built "
+                "on host from the token ids. Use generate() (the host loop), or implement on-device PLI."
+            )
         if self._use_trace:
             return self._generate_fused_traced(anchor_token, anchor_pos, max_new_tokens)
         self._pv_a_prev = -1  # re-seed packed-verify staging for the new anchor/request
@@ -1135,7 +1189,7 @@ class SpeculativeDecoder:
         pu, pi = self._pos_tensors(positions)  # pu [1,32] (B filled), pi [B]
         pt = self._page_table_users(len(tokens))  # [B, blocks] distinct
         logits, hidden = self.target.ttnn_verify_forward(
-            x=x, current_pos=pu, current_pos_cache=pi, page_table=pt, kv_cache=self.tt_kv_cache
+            x=x, current_pos=pu, current_pos_cache=pi, page_table=pt, kv_cache=self.tt_kv_cache, token_ids_host=tokens
         )
         logits.deallocate(True)
         for t in (x, pu, pi, pt):
