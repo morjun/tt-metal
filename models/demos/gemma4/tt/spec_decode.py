@@ -845,6 +845,23 @@ class SpeculativeDecoder:
         K = self.draft_len
         greedy = not temperature or temperature <= 0
         pos_u, pos_i = self._pos_tensors([anchor_pos])
+        # GEMMA4_SPEC_DRAFT_KVBOUND=1: exclude the anchor's own KV slot from the
+        # drafter's cross-attention.
+        #
+        # The loop drafts BEFORE it verifies. The packed verify writes positions
+        # c..c+K (anchor + ALL K drafts, accepted or not), so after committing m the
+        # new anchor sits at c+m+1 — a slot still holding the REJECTED draft d_{m+1}.
+        # The next verify overwrites it, but the drafter runs first, and the decode
+        # SDPA bounds causally at cur_pos INCLUSIVE, so the drafter reads that stale
+        # key. It is one position out of hundreds, but it is the most recent one and
+        # attention weights recency heavily.
+        #
+        # RoPE position and the attention bound are separate arguments, so this drops
+        # ONLY the bound by one and leaves the drafter's positional encoding intact.
+        # The export-replay harness never hits this: it single-token-verifies at pos
+        # (writing correct KV) before drafting, and scores 0.98 vs the live 0.53.
+        if os.environ.get("GEMMA4_SPEC_DRAFT_KVBOUND") == "1" and anchor_pos > 0:
+            _, pos_i = self._pos_tensors([anchor_pos - 1])
         # Drafter page table: batch=1, this user's blocks for both layer types.
         pt = self._page_table(1, user_idx=user_idx)
         page_tables = {lt: pt for lt in self._shared_kv}
@@ -1083,6 +1100,7 @@ class SpeculativeDecoder:
         sliced = hidden[:, :, row : row + 1, :]
         if not traced:
             h = ttnn.clone(sliced)
+            sliced.deallocate(True)  # was leaked: clone() does not consume the slice
             hidden.deallocate(True)
             return h
         if self._row_buf is None:
@@ -1910,6 +1928,24 @@ class SpeculativeDecoder:
             verify_tokens = [anchor_token] + drafts
             verify_pos = [anchor_pos + j for j in range(len(verify_tokens))]
             verify_logits, hidden = self._verify(verify_tokens, verify_pos)
+
+            # GEMMA4_SPEC_DEBUG_FIRST=1: dump stage fingerprints for the first few
+            # iterations. The demo forks 50/50 between exactly two output
+            # trajectories at token 1, yet every stage is deterministic in isolation
+            # (prefill+single-token verify across processes; packed verify bit-exact
+            # traced vs eager; drafter 8/8 identical). This says WHICH stage differs
+            # between two runs: seed hidden, drafts, or the verify's own logits.
+            if n_iter <= int(os.environ.get("GEMMA4_SPEC_DEBUG_FIRST", "0")):
+                from loguru import logger as _dbg
+
+                _ah = self._read_replica(anchor_hidden).float()
+                _vl = verify_logits.float()
+                _dbg.info(
+                    f"[first{n_iter}] anchor_tok={anchor_token} pos={anchor_pos} "
+                    f"seed_sum={_ah.sum().item():.6f} seed_absmax={_ah.abs().max().item():.6f} "
+                    f"drafts={drafts} "
+                    f"vlog_sum={_vl.sum().item():.4f} vlog_argmax={[int(_vl[j].argmax()) for j in range(_vl.shape[0])]}"
+                )
             if prof:
                 t_acc["verify"] += time.perf_counter() - _t0
                 _t0 = time.perf_counter()

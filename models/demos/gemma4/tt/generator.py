@@ -523,7 +523,41 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
     ):
         tokenizer = _load_text_tokenizer(model_path)
         if not hasattr(tokenizer, "stop_tokens"):
-            tokenizer.stop_tokens = [tokenizer.eos_token_id]
+            # Use every stop id the CHECKPOINT declares, not just tokenizer.eos_token_id.
+            #
+            # Gemma-4-it ends a model turn with the eot token <turn|> (106), not <eos>
+            # (1) — the chat template is "...<turn|>\n<|turn>model\n", and
+            # generation_config declares eos_token_id = [1, 106, 50]. Taking only
+            # tokenizer.eos_token_id kept 106 out of stop_tokens, so generation ran
+            # straight past the end of the model's answer and kept emitting further
+            # "turns" of degenerate text until it hit max_generated_tokens.
+            #
+            # That silently poisoned every acceptance measurement: a prompt whose
+            # natural answer is ~50 tokens was scored over 200-1000, so most of the
+            # measured window was post-EOS continuation — exactly the regime where the
+            # model is maximally uncertain and a drafter looks worst.
+            stop = []
+            try:
+                from transformers import GenerationConfig
+
+                declared = GenerationConfig.from_pretrained(model_path).eos_token_id
+                stop = (
+                    list(declared)
+                    if isinstance(declared, (list, tuple))
+                    else ([declared] if declared is not None else [])
+                )
+            except Exception:  # no/unreadable generation_config — fall back below
+                pass
+            for extra in (tokenizer.eos_token_id, getattr(tokenizer, "eot_token_id", None)):
+                if extra is not None:
+                    stop.append(extra)
+            # eot may only be reachable by name on some checkpoints.
+            eot = (getattr(tokenizer, "special_tokens_map", {}) or {}).get("eot_token")
+            if eot:
+                eot_id = tokenizer.convert_tokens_to_ids(eot)
+                if isinstance(eot_id, int) and eot_id >= 0:
+                    stop.append(eot_id)
+            tokenizer.stop_tokens = sorted({int(t) for t in stop if t is not None})
 
         model_args, model, tt_kv_cache, _ = create_tt_model(
             mesh_device=mesh_device,

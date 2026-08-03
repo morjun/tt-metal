@@ -643,6 +643,17 @@ def test_packed_verify_traced_pli_matches_eager(mesh_device, reset_seeds):
             pos += P
         return argmaxes, hiddens
 
+    # GEMMA4_PV_SEED_FIRST=1 reproduces the demo's prologue: a batch=1 verify at the
+    # anchor (spec.seed) BEFORE the packed chain. The demo forks 50/50 between two
+    # trajectories with bit-identical seed+drafts, while this test — which goes
+    # straight from prefill to packed verify — is byte-stable across processes. That
+    # seed() call is the only identified structural difference, so this isolates it.
+    if os.environ.get("GEMMA4_PV_SEED_FIRST") == "1":
+        _prefill()
+        spec._pv_a_prev = -1
+        _h = spec.seed(anchor_token, anchor_pos)
+        logger.info(f"[seed-first] seed_sum={spec._read_replica(_h).float().sum().item():.6f}")
+
     eager_ids, eager_h = _run_chain(traced=False)
     traced_ids, traced_h = _run_chain(traced=True)
 
@@ -1641,3 +1652,240 @@ def test_packed_verify_context_sweep(mesh_device, reset_seeds):
             "sliding_window_size into _packed_verify_sdpa. Monotone decreasing => bucket padding only. "
             "Flat => cost is the per-layer staging path, not the SDPA."
         )
+
+
+# ─────────────── is the DRAFTER bit-reproducible? (the last untested piece) ────
+#
+# Greedy spec decode diverges at the FIRST generated token across runs with an
+# identical config and a fresh prefill (two distinct trajectories, sampled roughly
+# at random). Everything else has been checked for determinism and is clean:
+#   * single-token verify chain  — byte-identical at 48 and 300 steps, cross-process
+#   * packed verify, fixed input — bit-exact traced vs eager (max|dhidden| = 0.0)
+#   * rejected-draft KV          — commits exact over 120 forced rejections
+#   * partial / varying acceptance — exact for every m
+# The drafter is the one component never tested in isolation, and it is the only
+# thing that can perturb the verify's INPUTS (its drafts become verify rows).
+#
+# This calls _draft twice with byte-identical arguments in ONE process and compares
+# the proposed tokens. Any difference is drafter nondeterminism and explains the
+# whole picture; identical output exonerates it and moves the search to the seed or
+# the prefill.
+
+
+@parametrize_mesh_with_fabric(device_params_extra={"trace_region_size": 256_000_000})
+def test_drafter_is_deterministic(mesh_device, reset_seeds):
+    model_path = os.getenv("HF_MODEL")
+    assistant_path = os.getenv("GEMMA4_ASSISTANT_MODEL")
+    if not model_path or not assistant_path:
+        pytest.skip("set HF_MODEL and GEMMA4_ASSISTANT_MODEL to run")
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.common import create_assistant_model
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size = 1024, 64
+    n_trials = int(os.environ.get("GEMMA4_DRAFTER_TRIALS", 8))
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    target = generator.model[0]
+    _, assistant = create_assistant_model(
+        mesh_device=mesh_device,
+        target_model=target,
+        mesh_config=target.mesh_config,
+        ccl_manager=target.ccl_manager,
+        assistant_path=assistant_path,
+    )
+    page_table = create_tt_page_table(1, pac)
+    prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Tell me about the history of computing in three sentences.")
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    anchor_token = int(encoded[0][prefill_lens[0] - 1])
+    anchor_pos = prefill_lens[0] - 1
+
+    spec = SpeculativeDecoder(
+        target_model=target,
+        assistant_model=assistant,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        stop_tokens=tokenizer.stop_tokens,
+        draft_len=3,
+    )
+    spec._use_trace = False
+    generator.prefill_forward_text(
+        in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+    )
+    # One seed hidden, reused verbatim for every trial, so the inputs are identical.
+    anchor_hidden = spec.seed(anchor_token, anchor_pos)
+
+    runs = []
+    for _ in range(n_trials):
+        drafts, _ = spec._draft(anchor_token, anchor_hidden, anchor_pos)
+        runs.append(list(drafts))
+        logger.info(f"  drafts = {drafts}")
+
+    uniq = {tuple(r) for r in runs}
+    logger.info(
+        f"=== DRAFTER DETERMINISM: {len(uniq)} distinct result(s) over {n_trials} identical calls ===\n"
+        f"  {'DETERMINISTIC — drafter exonerated; look at the seed or prefill' if len(uniq) == 1 else 'NONDETERMINISTIC — this is the root cause of the trajectory fork'}\n"
+        f"  distinct: {sorted(uniq)}"
+    )
+    assert (
+        len(uniq) == 1
+    ), f"drafter is NONDETERMINISTIC: {len(uniq)} distinct draft sets from identical inputs: {sorted(uniq)}"
+
+
+# ───────────── does the PACKED verify write the KV cache correctly? ────────────
+#
+# The drafter scores 0.98 when driven from a single-token-verify chain (export
+# replay) but 0.02 in the live loop, at the SAME max_seq_len=1024, with the same
+# weights, prompt and drafter. Seed source is not the cause (reseed, which is
+# structurally identical to the export replay, gives 0.04) and neither is the read
+# bound (KVBOUND=1 gives 0.03). What remains is the KV cache CONTENT.
+#
+# The two paths write KV differently:
+#   single-token verify : paged_update_cache at one position
+#   packed verify       : persistent staging + a loop-free embedding-gather merge,
+#                         then paged_fill_cache of whole hot blocks
+#
+# A bug in the packed write path would be INVISIBLE to the target — it re-reads the
+# hot block through staging — but fatal to the DRAFTER, which cross-attends to the
+# committed cache. That matches every observation, including why
+# test_rejected_draft_kv_does_not_corrupt_commit passes (it checks committed TOKENS,
+# not cache bytes).
+#
+# This drives both paths over the SAME committed token sequence and diffs the cache.
+
+
+@parametrize_mesh_with_fabric(device_params_extra={"trace_region_size": 256_000_000})
+def test_packed_verify_writes_correct_kv(mesh_device, reset_seeds):
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    from .test_spec_decode import _depage
+
+    max_seq_len, block_size = 1024, 64
+    n_steps = int(os.environ.get("GEMMA4_KVCHECK_STEPS", 24))
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    target = generator.model[0]
+    page_table = create_tt_page_table(1, pac)
+    prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Tell me about the history of computing in three sentences.")
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    anchor_token = int(encoded[0][prefill_lens[0] - 1])
+    anchor_pos = prefill_lens[0] - 1
+
+    spec = SpeculativeDecoder(
+        target_model=target,
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        stop_tokens=tokenizer.stop_tokens,
+        draft_len=3,
+    )
+    K = spec.draft_len
+    spec._use_trace = False
+
+    def _prefill():
+        generator.prefill_forward_text(
+            in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+        )
+
+    def _snapshot(n_pos):
+        """De-page the SHARED KV caches (what the drafter cross-attends to)."""
+        out = {}
+        for lt, idx in target.last_kv_layer_by_type.items():
+            kc, vc = target.tt_kv_cache[idx]
+            rep = lt == "full_attention"
+            out[lt] = (
+                _depage(kc, page_table, n_pos, block_size, mesh_device, rep),
+                _depage(vc, page_table, n_pos, block_size, mesh_device, rep),
+            )
+        return out
+
+    # ── reference: single-token verify per committed token ────────────────
+    _prefill()
+    spec._pv_a_prev = -1
+    ref_tokens, tok, pos = [], anchor_token, anchor_pos
+    for _ in range(n_steps):
+        lh, h = spec._verify([tok], [pos])
+        h.deallocate(True)
+        tok = int(torch.argmax(lh[0]))
+        ref_tokens.append(tok)
+        pos += 1
+    n_pos = anchor_pos + n_steps + 1
+    ref_kv = _snapshot(n_pos)
+
+    # ── packed: same committed chain, advancing ONE token per iteration with
+    # junk drafts (m=0) — exactly the live loop's dominant case at 0.02 accept.
+    _prefill()
+    spec._pv_a_prev = -1
+    JUNK = [1, 2, 3][:K]
+    tok, pos = anchor_token, anchor_pos
+    for step in range(n_steps):
+        try:
+            lh, h = spec._verify([tok] + JUNK, [pos + j for j in range(K + 1)])
+        except RuntimeError as e:
+            if _is_l1_cb_overflow(e):
+                pytest.skip(_L1_OVERFLOW_REASON)
+            raise
+        h.deallocate(True)
+        tok = int(torch.argmax(lh[0]))  # row 0 = the committed token
+        assert tok == ref_tokens[step], f"step {step}: packed committed {tok}, reference {ref_tokens[step]}"
+        pos += 1
+    packed_kv = _snapshot(n_pos)
+
+    logger.info(f"=== KV cache: packed-verify writes vs single-token writes ({n_pos} positions) ===")
+    worst = 0.0
+    for lt in ref_kv:
+        for name, a, b in (("K", ref_kv[lt][0], packed_kv[lt][0]), ("V", ref_kv[lt][1], packed_kv[lt][1])):
+            d = (a - b).abs()
+            per_pos = d.amax(dim=(0, 1, 3))  # [n_pos]
+            bad = (per_pos > 1e-3).nonzero().flatten().tolist()
+            worst = max(worst, float(d.max()))
+            logger.info(
+                f"  {lt:18s} {name}: max|diff|={float(d.max()):.6f}  "
+                f"positions differing >1e-3: {len(bad)}/{n_pos}" + (f"  first={bad[:8]}" if bad else "")
+            )
+    logger.info(
+        "  VERDICT: "
+        + (
+            "cache IDENTICAL — packed write path is correct; look elsewhere"
+            if worst <= 1e-3
+            else f"PACKED VERIFY WRITES A DIFFERENT CACHE (max|diff|={worst:.4f}) — "
+            "invisible to the target (re-reads via staging) but fatal to the drafter"
+        )
+    )
+    assert worst <= 1e-3, f"packed verify's KV cache differs from single-token writes: max|diff|={worst:.6f}"

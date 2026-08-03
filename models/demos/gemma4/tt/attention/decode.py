@@ -475,8 +475,47 @@ def _packed_verify_sdpa(
     # logit systematic offset and tells you nothing).
     _dev = k.device()
     _num_dev = getattr(_dev, "get_num_devices", lambda: 1)()
-    _force_fp32 = os.environ.get("GEMMA4_PV_SDPA_FP32") == "1"
-    if _num_dev > 1 and not _force_fp32:
+    # GEMMA4_PV_SDPA_FP32: "1" forces the fp32 config on, "0" forces the op DEFAULT
+    # on, unset keeps the historical per-device-count behaviour.
+    #
+    # Why "0" must be reachable at 1x1: the fp32 config is unconditional on single
+    # device, and it is MEASURABLY WRONG. At 1x1 the packed verify's row-0 argmax
+    # disagrees with the single-token verify from step 0 on a fresh prefill
+    # (13513 vs 131416) — the same comparison passes exactly at 1x2, where this
+    # config is NOT applied. It also measured harmful when forced at 1x2
+    # (packed-vs-single-token p50 0.79 -> 27.68 logits). That broken verify is what
+    # drives live acceptance to 0.02 while the drafter alone reaches 0.98.
+    #
+    # The stated reason for it here is the MUL_BCAST_GRANULARITY power-of-2
+    # assertion, but that only bites when PNHt is odd. At H_local=8, P=4:
+    # PNHt = H*P/32 = 1, so min(PNHt*Sk_chunk_t, dst_size) = min(2, 8) = 2, already
+    # a power of two — the workaround is not needed for this shape.
+    # Apply the fp32 workaround ONLY for the shape that actually needs it.
+    #
+    # It exists to satisfy ttnn's assertion that
+    #     MUL_BCAST_GRANULARITY = min(PNHt * Sk_chunk_t, dst_size)
+    # is a power of 2. With bf16 dst_size=8 and Sk_chunk_t = k_chunk(64)/32 = 2 that
+    # fails at exactly ONE value, PNHt == 3 (min(6,8)=6); every other PNHt gives
+    # 2, 4 or the capped 8. fp32_dest_acc_en halves dst_size to 4, making it 2 or 4.
+    #
+    # It used to be applied to EVERY single-device call, and that is a correctness
+    # bug, not just wasted precision. Measured at 1x1, H_local=8, P=4 (PNHt=1, so the
+    # assertion was never at risk):
+    #     fp32 on   packed row-0 argmax disagrees with the single-token verify at
+    #               step 0 on a fresh prefill (13513 vs 131416);
+    #               live acceptance 0.02/3,  8.3 tok/s/u
+    #     fp32 off  argmax agrees; acceptance 1.16/3, ~17.7 tok/s/u
+    # 1.16 exceeds both the export replay (0.98) and the HF ceiling (1.12). The same
+    # config measured harmful when forced at 1x2 (packed-vs-single-token p50
+    # 0.79 -> 27.68 logits), which was the first hint and was mis-filed at the time
+    # as "fp32 is not a win" rather than "fp32 is broken and 1x1 always runs it".
+    #
+    # GEMMA4_PV_SDPA_FP32 = "1"/"0" forces on/off for A/B.
+    _pnht = (H_local * P) // 32
+    _needs_fp32 = _pnht == 3  # the only PNHt where the power-of-2 assertion fails
+    _fp32_env = os.environ.get("GEMMA4_PV_SDPA_FP32")
+    _use_fp32 = _needs_fp32 if _fp32_env is None else (_fp32_env == "1")
+    if not _use_fp32:
         compute_kernel_config = None
     else:
         _fid = getattr(ttnn.MathFidelity, os.environ.get("GEMMA4_PV_SDPA_FIDELITY", "HiFi2"))

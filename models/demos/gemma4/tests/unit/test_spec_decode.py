@@ -598,11 +598,27 @@ def test_assistant_step_pcc_vs_hf(mesh_device, reset_seeds):
         )
         tf_caps[f"layer{i}"] = _dev0(h_tf, mesh_device)
         h_tf.deallocate(True)
-    logits = ttnn.linear(normed, assistant.lm_head)
-    if assistant.mesh_config is not None and assistant.mesh_config.tp > 1:
-        logits = ccl_allgather(logits, assistant.mesh_config, assistant.ccl_manager)
+    # CME drafters (E2B/E4B) have NO dense lm_head — tt/assistant/model.py builds
+    # the Gemma4TTMaskedEmbedder instead, since building both would waste 134 MB.
+    # This test predates CME and used to TypeError here on those checkpoints.
+    # Reconstruct the full-vocab row from the compact head so the stage comparison
+    # below works for both drafter flavours.
+    if getattr(assistant, "lm_head", None) is None:
+        pack = assistant.masked_embedding.forward(normed)
+        logits_full = assistant.masked_embedding.to_host_full_vocab(pack, lambda t: _dev0(t, mesh_device))
+        pack.deallocate(True)
+        logits = None
+    else:
+        logits_full = None
+        logits = ttnn.linear(normed, assistant.lm_head)
+        if assistant.mesh_config is not None and assistant.mesh_config.tp > 1:
+            logits = ccl_allgather(logits, assistant.mesh_config, assistant.ccl_manager)
     next_hidden = ttnn.linear(normed, assistant.post_projection)
-    logits_tt = _dev0(logits, mesh_device).reshape(-1)[: text_args.vocab_size].float()
+    logits_tt = (
+        logits_full.reshape(-1)[: text_args.vocab_size].float()
+        if logits_full is not None
+        else _dev0(logits, mesh_device).reshape(-1)[: text_args.vocab_size].float()
+    )
     hidden_tt = _dev0(next_hidden, mesh_device).reshape(-1).float()
 
     # ── Report per-stage PCC ─────────────────────────────────────────
@@ -916,7 +932,8 @@ def test_export_tt_spec_features(mesh_device, reset_seeds):
     K = spec.draft_len
     for _ in range(n_steps + K):
         logits, hidden = spec._verify([tok], [pos])
-        seed = _dev0(hidden[:, :, 0:1, :], mesh_device).reshape(1, 1, -1).float()
+        seed_dev = ttnn.clone(hidden[:, :, 0:1, :])  # device copy for the TT drafter below
+        seed = _dev0(seed_dev, mesh_device).reshape(1, 1, -1).float()
         hidden.deallocate(True)
         nxt = int(torch.argmax(logits[0]))
         n_pos = pos + 1
@@ -927,7 +944,51 @@ def test_export_tt_spec_features(mesh_device, reset_seeds):
             k_d = _depage(kc, page_table, n_pos, block_size, mesh_device, replicated).float()
             v_d = _depage(vc, page_table, n_pos, block_size, mesh_device, replicated).float()
             shared[lt] = (k_d, v_d)
-        steps.append({"token": int(tok), "hidden": seed, "shared": shared, "pos": int(pos)})
+        # Also run the TT DRAFTER on these exact features and record its K drafts.
+        #
+        # Without this the dump only supports "HF drafter on TT features" (0.95).
+        # Recording TT's drafts on the SAME features makes the comparison
+        # apples-to-apples and localises the remaining 0.95 -> 0.50 gap: if TT's
+        # FIRST draft already disagrees with HF's on most steps, the divergence is in
+        # the drafter's token SELECTION (the CME head), not in the 4 layers
+        # compounding — the layers were measured at ~0.998 intrinsic PCC each.
+        # Also keeps the drafter's own recurrent hidden so the layer stack can be
+        # scored separately from the head.
+        tt_drafts, tt_hiddens = [], []
+        if assistant is not None:
+            _pu, _pi = spec._pos_tensors([int(pos)])
+            _pt = spec._page_table(1)
+            _pts = {lt: _pt for lt in spec._shared_kv}
+            h_rec, owns = seed_dev, False
+            t_cur = int(tok)
+            for _ in range(K):
+                _x = spec._tokens_tensor([t_cur])
+                _lg_d, _h_next = assistant.step(_x, h_rec, spec._shared_kv, _pts, _pu, _pi)
+                _x.deallocate(True)
+                _lh = spec._logits_to_host(_lg_d).reshape(-1)
+                _lg_d.deallocate(True)
+                t_cur = int(torch.argmax(_lh))
+                tt_drafts.append(t_cur)
+                tt_hiddens.append(_dev0(_h_next, mesh_device).reshape(-1).float().clone())
+                if owns:
+                    h_rec.deallocate(True)
+                h_rec, owns = _h_next, True
+            if owns:
+                h_rec.deallocate(True)
+            for _t in (_pu, _pi, _pt):
+                _t.deallocate(True)
+        seed_dev.deallocate(True)
+
+        steps.append(
+            {
+                "token": int(tok),
+                "hidden": seed,
+                "shared": shared,
+                "pos": int(pos),
+                "tt_drafts": tt_drafts,
+                "tt_hiddens": tt_hiddens,
+            }
+        )
         greedy.append(nxt)
         tok, pos = nxt, pos + 1
         if tok in spec.stop_tokens:
@@ -1281,10 +1342,26 @@ def test_assistant_step_pcc_real(mesh_device, reset_seeds):
         tt_caps[f"layer{i}"] = _dev0(h, mesh_device)
     normed = assistant.norm.forward(h)
     tt_caps["norm"] = _dev0(normed, mesh_device)
-    logits = ttnn.linear(normed, assistant.lm_head)
-    if assistant.mesh_config is not None and assistant.mesh_config.tp > 1:
-        logits = ccl_allgather(logits, assistant.mesh_config, assistant.ccl_manager)
-    logits_tt = _dev0(logits, mesh_device).reshape(-1)[: text_args.vocab_size].float()
+    # CME drafters (E2B/E4B) have NO dense lm_head — tt/assistant/model.py builds
+    # the Gemma4TTMaskedEmbedder instead, since building both would waste 134 MB.
+    # This test predates CME and used to TypeError here on those checkpoints.
+    # Reconstruct the full-vocab row from the compact head so the stage comparison
+    # below works for both drafter flavours.
+    if getattr(assistant, "lm_head", None) is None:
+        pack = assistant.masked_embedding.forward(normed)
+        logits_full = assistant.masked_embedding.to_host_full_vocab(pack, lambda t: _dev0(t, mesh_device))
+        pack.deallocate(True)
+        logits = None
+    else:
+        logits_full = None
+        logits = ttnn.linear(normed, assistant.lm_head)
+        if assistant.mesh_config is not None and assistant.mesh_config.tp > 1:
+            logits = ccl_allgather(logits, assistant.mesh_config, assistant.ccl_manager)
+    logits_tt = (
+        logits_full.reshape(-1)[: text_args.vocab_size].float()
+        if logits_full is not None
+        else _dev0(logits, mesh_device).reshape(-1)[: text_args.vocab_size].float()
+    )
 
     # ── Teacher-forced per-layer (feed HF prev output into TT layer) ──
     def _to_dev(t):
