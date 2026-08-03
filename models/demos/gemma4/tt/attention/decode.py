@@ -432,29 +432,64 @@ def _packed_verify_sdpa(
     additive mask on the packed query-head dim. Does NOT free its inputs.
     Returns [1, B, H_local*P, head_dim]."""
 
-    # Single-device (TP=1) only: the packed layout folds P candidates into the
-    # query-heads dim, so with all heads on one device the SDPA decode's
-    # padded-heads-per-core (PNHt) can be odd (e.g. 3). ttnn asserts
+    # fp32 destination accumulation, on EVERY device count.
+    #
+    # Single-device (TP=1) needs it for a shape reason: the packed layout folds P
+    # candidates into the query-heads dim, so with all heads on one device the SDPA
+    # decode's padded-heads-per-core (PNHt) can be odd (e.g. 3). ttnn asserts
     # MUL_BCAST_GRANULARITY = min(PNHt * Sk_chunk_t, dst_size) is a power of 2; with
     # the op-default dst_size=8 and Sk_chunk_t=2 that leaves PNHt*2=6 and aborts.
-    # Match the op's default compute config (HiFi2) but flip fp32_dest_acc_en=True so
-    # dst_size=4 ⇒ min(2*PNHt, 4) is always 2 or 4 (power of 2), no k_chunk/L1
-    # increase, and fp32 accumulation is strictly higher precision. On multi-device
-    # meshes heads split so PNHt is already power-of-2 — leave the op default (None)
-    # there so the packed path stays identical to upstream.
+    # fp32_dest_acc_en=True gives dst_size=4 ⇒ min(2*PNHt, 4) is 2 or 4, no k_chunk/L1
+    # increase.
+    #
+    # Multi-device used to fall through to the op default (None) on the reasoning
+    # that heads already split to a power-of-2 PNHt, so nothing forced the issue.
+    # That left the packed verify accumulating in bf16 at TP>1, and it is measurably
+    # not accurate enough. Measured at 1x2 against the batch=1 verify at the same
+    # position (test_varying_acceptance_matches_greedy):
+    #     top-2 decision margin            0.1875  (3 bf16 ULP at magnitude ~13.9)
+    #     packed-vs-batch1, contended tok  0.6875  (11 ULP)
+    #     max|packed - batch1| over the row 1.1250 (18 ULP)
+    # The error is ~6x the margin, so the packed argmax deviates from greedy at any
+    # position whose top-2 gap is under ~1.0 logit. Since `_accept_greedy` compares
+    # drafts against the PACKED logits, that silently commits tokens plain greedy
+    # would never emit — speculative decoding's core guarantee. Accuracy, not the
+    # PNHt shape constraint, is why this is now unconditional.
+    #
+    # MEASURED AND REVERTED: forcing fp32_dest_acc_en at TP>1 made things WORSE, not
+    # better. Against the batch=1 verify over valid-context rows at 1x2:
+    #     default (bf16 accum)  p50 disagreement 1.06 logits (17 ULP), 59 rows,
+    #                           first divergence at row 1 of iteration 25
+    #     fp32_dest_acc_en=True p50 disagreement 27.68 logits (443 ULP),
+    #                           first divergence at row 0 of iteration 1
+    # A 26x jump is not a precision effect — it is a functional change, most likely
+    # the fp32 dst_size=4 interacting with the head-split path or the program config.
+    # So the multi-device default stays the op default, and fp32 is now OPT-IN
+    # (GEMMA4_PV_SDPA_FP32=1) rather than opt-out, purely for further investigation.
+    #
+    # The underlying accuracy problem is NOT fixed: even at the default, the packed
+    # verify disagrees with batch=1 by ~17 ULP at p50 while the argmax decision
+    # margin is ~3 ULP. Whether packed or batch=1 is the WRONG one still needs a
+    # correct ground truth (see GEMMA4_PV_HF_REF, which must apply the model's
+    # final_logit_softcapping=30 — comparing against raw lm_head output is a ~40
+    # logit systematic offset and tells you nothing).
     _dev = k.device()
     _num_dev = getattr(_dev, "get_num_devices", lambda: 1)()
-    compute_kernel_config = (
-        ttnn.init_device_compute_kernel_config(
+    _force_fp32 = os.environ.get("GEMMA4_PV_SDPA_FP32") == "1"
+    if _num_dev > 1 and not _force_fp32:
+        compute_kernel_config = None
+    else:
+        _fid = getattr(ttnn.MathFidelity, os.environ.get("GEMMA4_PV_SDPA_FIDELITY", "HiFi2"))
+        compute_kernel_config = ttnn.init_device_compute_kernel_config(
             _dev.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
-            math_approx_mode=True,
+            math_fidelity=_fid,
+            # Approximate exp in the softmax is a second precision lever; keep the
+            # historical True as the default so this change moves ONE variable, and
+            # expose it for the A/B that follows.
+            math_approx_mode=os.environ.get("GEMMA4_PV_SDPA_APPROX", "1") == "1",
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
-        if _num_dev == 1
-        else None
-    )
 
     def _call(q, m):
         if layer_page_table is not None:

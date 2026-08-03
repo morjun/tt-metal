@@ -154,7 +154,13 @@ def _plain_greedy(spec, anchor_token, anchor_pos, n):
     tok, pos = anchor_token, anchor_pos
     for _ in range(n):
         logits, hidden = spec._verify([tok], [pos])
-        hidden.deallocate(True)
+        # In TRACED mode _verify returns the PERSISTENT trace output, which
+        # _verify_traced's docstring says the caller "MUST NOT deallocate" —
+        # freeing it destroys the trace's output buffer and the next seed()'s
+        # ttnn.clone(hidden) SEGFAULTS. This went unnoticed because a control-flow
+        # bug in generate() meant this test never actually ran traced.
+        if not spec._use_trace:
+            hidden.deallocate(True)
         tok = int(torch.argmax(logits[0]))
         out.append(tok)
         pos += 1
@@ -1578,7 +1584,16 @@ def test_tt_drafter_greedychain_acceptance(mesh_device, reset_seeds):
 
 
 @_needs_assistant
-@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2), (1, 4)])
+# trace_region_size is REQUIRED here now. This test drives generate(), and with
+# GEMMA4_SPEC_TRACE=1 that genuinely captures traces — it did not used to, because a
+# control-flow bug in generate() routed greedy per-layer-input targets into the
+# sampling fallback and silently ran untraced. With the fix, capturing against the
+# default trace_region_size=0 (dynamic allocation, per
+# models.demos.utils.trace_region_sizes) SEGFAULTS in seed(). The demo already
+# configures 256 MB; match it so the traced path is actually exercisable here.
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 1), (1, 2), (1, 4)], device_params_extra={"trace_region_size": 256_000_000}
+)
 def test_spec_decode_matches_greedy(mesh_device, reset_seeds):
     """Greedy spec-decode matches plain greedy decode, EXCEPT at target near-ties.
 
@@ -1860,9 +1875,20 @@ def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
         x = spec._tokens_tensor(tokens)
         pos_u, pos_i = spec._pos_tensors(positions)
         pt = spec._page_table(len(tokens))
+        # PLI targets (E2B/E4B) need per-layer inputs or the forward raises. Build
+        # them ONCE, outside the timing loop: the tokens are identical every rep,
+        # and this probe is documented to measure on-device time, so folding the
+        # host-side PLI build into the loop would inflate every reading. None for
+        # targets without per-layer inputs (12B/31B), which changes nothing there.
+        pli = spec._pli_dev(tokens)
         for _ in range(3):  # warmup
             lo, hi = target.ttnn_verify_forward(
-                x=x, current_pos=pos_u, current_pos_cache=pos_i, page_table=pt, kv_cache=spec.tt_kv_cache
+                x=x,
+                current_pos=pos_u,
+                current_pos_cache=pos_i,
+                page_table=pt,
+                kv_cache=spec.tt_kv_cache,
+                pli_stacked=pli,
             )
             lo.deallocate(True)
             hi.deallocate(True)
@@ -1870,7 +1896,12 @@ def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
         t0 = time.perf_counter()
         for _ in range(reps):
             lo, hi = target.ttnn_verify_forward(
-                x=x, current_pos=pos_u, current_pos_cache=pos_i, page_table=pt, kv_cache=spec.tt_kv_cache
+                x=x,
+                current_pos=pos_u,
+                current_pos_cache=pos_i,
+                page_table=pt,
+                kv_cache=spec.tt_kv_cache,
+                pli_stacked=pli,
             )
             lo.deallocate(True)
             hi.deallocate(True)
@@ -1878,6 +1909,8 @@ def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
         dt = (time.perf_counter() - t0) / reps
         for t in (x, pos_u, pos_i, pt):
             t.deallocate(True)
+        if pli is not None:
+            pli.deallocate(True)
         return dt
 
     def _time_draft():

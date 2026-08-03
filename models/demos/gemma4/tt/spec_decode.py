@@ -94,7 +94,10 @@ class SpeculativeDecoder:
         if self.draft_len < 1:
             raise ValueError("draft_len must be >= 1")
         # Recurrent drafter-seed strategy across verify rounds (see generate()).
-        self._seed_mode = os.environ.get("GEMMA4_SPEC_SEED_MODE", "reseed")
+        # "cur" is the default because it reproduces HF's reference MTP contract
+        # exactly (feature lags the token by one step) at zero cost — no extra
+        # target forward, unlike "reseed". See the block comment in generate().
+        self._seed_mode = os.environ.get("GEMMA4_SPEC_SEED_MODE", "cur")
         if page_table_torch is None:
             raise ValueError("Speculative decoding requires paged attention (page_table_torch is None).")
         self._is_mesh = hasattr(mesh_device, "shape")
@@ -105,12 +108,18 @@ class SpeculativeDecoder:
         # E2B/E4B targets carry per-layer inputs (PLI) that are computed on CPU
         # from the token ids. The verify puts its K+1 candidates in the row dim, so
         # each layer needs its own [1,1,K+1,pli_size] tensor — supplied from the
-        # host candidate ids (see Gemma4Model.compute_host_pli_batch). Any path
-        # whose candidate tokens exist ONLY on device therefore cannot run such a
-        # target: that includes the fully on-device fused iteration and the traced
-        # verify (building PLI inside a capture would be a write during capture).
-        # ``target_needs_host_pli`` gates those paths with an explicit error and
-        # lets the demo route PLI targets to the host loop.
+        # host candidate ids (see Gemma4Model.compute_host_pli_batch).
+        #
+        # This does NOT prevent tracing. Host-computed PLI enters a trace exactly
+        # the way tokens and positions do: a persistent device buffer allocated once
+        # out-of-trace and refreshed per replay with copy_host_to_device_tensor
+        # (_pli_dev / _pli_refresh). The plain traced decode path has always done
+        # this with pli_combined, which is why plain E2B decode traces fine.
+        #
+        # The one path that genuinely cannot is the fully on-device FUSED iteration:
+        # its draft tokens are argmaxed and re-embedded on device and never reach the
+        # host, so there is no id to build PLI from. ``target_needs_host_pli`` gates
+        # that path (and routes the demo to the traced host loop instead).
         self.target_needs_host_pli = bool(
             getattr(target_model, "hidden_size_per_layer_input", 0)
             and getattr(target_model, "per_layer_input_weights", None)
@@ -120,6 +129,22 @@ class SpeculativeDecoder:
         # traced). Verify traces are keyed by batch (K+1 for verify, 1 for
         # seed/reseed). Captured lazily on first call at real inputs.
         self._use_trace = os.environ.get("GEMMA4_SPEC_TRACE", "0") == "1"
+        # Trace the drafter too? Off by default: a traced drafter alternating with a
+        # traced verify replays two distinct CCL traces per iteration, the
+        # mesh-deadlock case described in generate(). Only the PLI host-loop path
+        # consults this (every other traced path fuses draft+verify into one trace).
+        self._trace_draft = os.environ.get("GEMMA4_SPEC_TRACE_DRAFT", "0") == "1"
+        # Drain the queue when switching between distinct traces (see _trace_barrier).
+        self._trace_sync = os.environ.get("GEMMA4_SPEC_TRACE_SYNC", "0") == "1"
+        # On-device argmax for greedy drafting instead of to_host_full_vocab.
+        # OFF by default: MEASURED HARMFUL with an eager drafter. argmax_token_id is
+        # ~9 device ops (pad/untilize/argmax/slice/reshape/to_layout/gather/...), and
+        # while the drafter runs eager each carries untraced host dispatch. At 1x2,
+        # 129 tokens: draft 86.19 -> 158.72 ms/iter, 9.87 -> 6.62 tok/s/u. The
+        # to_host_full_vocab path it replaces is only 2 small reads + host torch.
+        # This becomes a win only once the drafter is TRACED (ops free under replay),
+        # which currently deadlocks — so keep it available but off.
+        self._draft_dev_argmax = os.environ.get("GEMMA4_SPEC_DRAFT_DEV_ARGMAX", "0") == "1"
         self._verify_traces = {}
         # Single batch=1 drafter-step trace, replayed K times. The recurrent
         # hidden is kept ON DEVICE: between trace replays, ttnn.copy(next_hidden
@@ -159,6 +184,10 @@ class SpeculativeDecoder:
         # scratch and corrupt it (manifests as a hang on a *re*-replay). seed()
         # writes into this buffer via ttnn.copy instead of cloning.
         self._anchor_buf = None
+        # Persistent destination for _seed_row in traced mode. Separate from
+        # _anchor_buf on purpose: that one is minted from the single-token verify's
+        # hidden, this one from a packed-verify row, and their padded shapes differ.
+        self._row_buf = None
         # Packed-query verify: all K+1 candidates in the query-heads dim of ONE
         # batch=1 forward (one QKV/norm/RoPE over K+1 rows, one masked SDPA per
         # layer, loop-free staging KV write) instead of K+1 pseudo-users with
@@ -172,6 +201,15 @@ class SpeculativeDecoder:
         self._pv_ready = False
         self._pv_a_prev = -1  # last hot block index (-1 ⇒ staging unseeded)
         self._pv_traces = {}  # (P, S_k) -> persistent trace inputs/outputs
+        # GEMMA4_SPEC_PROFILE=1 also splits the traced packed verify into HOST input
+        # construction (masks, embed indices, PLI) vs device replay + logits readback.
+        # The context sweep showed the packed verify's DEVICE cost is only ~1.1x a
+        # single-token verify and FLAT across a 32x context range, so the 184 ms
+        # verify phase cannot be device compute. This measures how much of it is host
+        # work — which tracing can never remove, explaining the trace null result.
+        self._pv_prof = (
+            {"host": 0.0, "device_and_readback": 0.0, "n": 0} if os.environ.get("GEMMA4_SPEC_PROFILE") == "1" else None
+        )
 
     def _fused_shift_seed_row(self, accepted, K):
         if self._fused_shift_seed == "current":
@@ -259,6 +297,57 @@ class SpeculativeDecoder:
         )
         return pos_uint32, pos_int32
 
+    def _trace_barrier(self):
+        """Drain the queue before switching to a DIFFERENT trace.
+
+        Every ``execute_trace`` here is ``blocking=False``, so a replay of trace B
+        can be enqueued while trace A's collectives are still in flight. With two
+        distinct CCL-bearing traces alternating each iteration (traced drafter +
+        traced verify) that is the documented mesh hang, and it reproduces exactly:
+        iteration 1 completes, then the FIRST pure replay of the verify trace after
+        a draft replay never returns.
+
+        This tests whether the hang is a queue-ordering race (fixable by draining)
+        or something structural in how two CCL traces share the command queue
+        (fixable only by fusing them into one trace, or by giving the drafter its
+        own command queue). Off by default; GEMMA4_SPEC_TRACE_SYNC=1 enables.
+        """
+        if self._trace_sync:
+            ttnn.synchronize_device(self.mesh_device)
+
+    # ── per-layer inputs (PLI) for traced verifies ───────────────────────────
+    def _host_pli(self, tokens):
+        """Host ttnn [n_layers,1,P,pli_size] bf16 TILE PLI tensor, or None.
+
+        None for targets without per-layer inputs (12B/31B). ``device=None`` — the
+        caller either uploads it once (capture) or copies it into a persistent
+        buffer (replay).
+        """
+        pli_host = self.target.compute_host_pli_batch(tokens)
+        if pli_host is None:
+            return None
+        return self._pv_from_torch(pli_host, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=False)
+
+    def _pli_dev(self, tokens):
+        """Persistent device PLI buffer for a traced verify over ``tokens``, or None.
+
+        Allocated ONCE per trace, out-of-trace, so capture binds a stable address;
+        ``_pli_refresh`` overwrites the contents before each replay. This is what
+        makes a traced verify possible for a per-layer-input target: PLI stays a
+        host computation, but it enters the trace as data rather than as an
+        allocation + host write inside the capture.
+        """
+        pli_host = self.target.compute_host_pli_batch(tokens)
+        if pli_host is None:
+            return None
+        return self._pv_from_torch(pli_host, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    def _pli_refresh(self, tokens, dst):
+        """Copy this iteration's host PLI into the persistent buffer (out-of-trace)."""
+        if dst is None:
+            return
+        ttnn.copy_host_to_device_tensor(self._host_pli(tokens), dst)
+
     # ── traced verify ────────────────────────────────────────────────────────
     def _capture_verify_trace(self, tokens, positions):
         """Lazily capture a verify trace at the REAL first-call inputs.
@@ -276,10 +365,19 @@ class SpeculativeDecoder:
         x_dev = self._tokens_tensor(tokens)
         pu_dev, pi_dev = self._pos_tensors(positions)
         pt_dev = self._page_table(batch)
+        # Persistent PLI buffer (E2B/E4B only; None otherwise). Allocated HERE,
+        # out-of-trace, so the capture below binds its address instead of
+        # allocating + host-writing a fresh one per call.
+        pli_dev = self._pli_dev(tokens)
         # Compile run (warm program cache before capture).
         _lg.info(f"[spec-trace] capture verify batch={batch}: compile run")
         logits, hidden = self.target.ttnn_verify_forward(
-            x=x_dev, current_pos=pu_dev, current_pos_cache=pi_dev, page_table=pt_dev, kv_cache=self.tt_kv_cache
+            x=x_dev,
+            current_pos=pu_dev,
+            current_pos_cache=pi_dev,
+            page_table=pt_dev,
+            kv_cache=self.tt_kv_cache,
+            pli_stacked=pli_dev,
         )
         ttnn.synchronize_device(self.mesh_device)
         logits.deallocate(True)
@@ -287,7 +385,12 @@ class SpeculativeDecoder:
         _lg.info(f"[spec-trace] capture verify batch={batch}: begin_trace_capture")
         tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         logits, hidden = self.target.ttnn_verify_forward(
-            x=x_dev, current_pos=pu_dev, current_pos_cache=pi_dev, page_table=pt_dev, kv_cache=self.tt_kv_cache
+            x=x_dev,
+            current_pos=pu_dev,
+            current_pos_cache=pi_dev,
+            page_table=pt_dev,
+            kv_cache=self.tt_kv_cache,
+            pli_stacked=pli_dev,
         )
         _lg.info(f"[spec-trace] capture verify batch={batch}: end_trace_capture")
         ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
@@ -298,6 +401,7 @@ class SpeculativeDecoder:
             "pu": pu_dev,
             "pi": pi_dev,
             "pt": pt_dev,
+            "pli": pli_dev,
             "logits": logits,
             "hidden": hidden,
         }
@@ -316,6 +420,8 @@ class SpeculativeDecoder:
         ttnn.copy_host_to_device_tensor(h_x, tr["x"])
         ttnn.copy_host_to_device_tensor(h_pu, tr["pu"])
         ttnn.copy_host_to_device_tensor(h_pi, tr["pi"])
+        # PLI is a pure function of the candidate ids, so it changes every call.
+        self._pli_refresh(tokens, tr["pli"])
         _lg.info(f"[spec-trace] verify replay batch={batch}: execute")
         ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
         _lg.info(f"[spec-trace] verify replay batch={batch}: read logits")
@@ -462,9 +568,15 @@ class SpeculativeDecoder:
             mesh_mapper=self._mapper,
         )
 
-    def _pv_device_inputs(self, tokens, h):
-        """Device tensors for one packed verify from host dict ``h``."""
-        return {
+    def _pv_device_inputs(self, tokens, h, with_pli=False):
+        """Device tensors for one packed verify from host dict ``h``.
+
+        ``with_pli`` allocates the persistent per-layer-input buffer as well. Only
+        the TRACED path needs it: the eager path lets the forward build PLI inline
+        from ``token_ids_host``, which is cheaper than an extra buffer when there is
+        no capture to keep allocation-free.
+        """
+        dev = {
             "x": self._tokens_tensor(tokens),
             "pos": self._pv_from_torch(h["pos"], ttnn.uint32),
             "mask_full": self._pv_from_torch(h["mask_full"], ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
@@ -472,8 +584,16 @@ class SpeculativeDecoder:
             "embed": {lt: self._pv_from_torch(e, ttnn.uint32) for lt, e in h["embed"].items()},
             "hot": self._pv_from_torch(h["hot"], ttnn.int32),
         }
+        if with_pli:
+            pli = self._pli_dev(tokens)
+            if pli is not None:
+                dev["pli"] = pli
+        return dev
 
     def _pv_call(self, dev, P, tokens=None):
+        # ``dev["pli"]`` (persistent, refreshed out-of-trace) takes precedence over
+        # ``token_ids_host`` (which builds PLI inline — eager path only, since that
+        # allocates and host-writes, both illegal during a capture).
         return self.target.ttnn_packed_verify_forward(
             x=dev["x"],
             position_idx=dev["pos"],
@@ -487,6 +607,7 @@ class SpeculativeDecoder:
             hot_pt=dev["hot"],
             # E2B/E4B build per-layer inputs on host from the candidate ids.
             token_ids_host=tokens,
+            pli_stacked=dev.get("pli"),
         )
 
     def _verify_packed(self, tokens, positions):
@@ -518,11 +639,11 @@ class SpeculativeDecoder:
         c = positions[0]
         if self._pv_a_prev < 0:
             self._pv_seed_staging(c)
+        _t0 = time.perf_counter() if self._pv_prof is not None else 0.0
         h = self._pv_host_inputs(c, P)
         key = (P, h["S_k"])
-        tr = self._pv_traces.get(key)
-        if tr is None:
-            dev = self._pv_device_inputs(tokens, h)
+        if key not in self._pv_traces:
+            dev = self._pv_device_inputs(tokens, h, with_pli=True)
             dev["pt"] = self._page_table(1)
             # Compile run (warm program cache), then capture. Both runs write
             # the SAME tokens to the SAME positions, so KV writes are idempotent.
@@ -535,42 +656,60 @@ class SpeculativeDecoder:
             ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
             dev.update({"id": tid, "logits": logits, "hidden": hidden})
             self._pv_traces[key] = dev
-        else:
-            ttnn.copy_host_to_device_tensor(self._host_tokens(tokens), tr["x"])
-            for src, dst in (
-                (self._pv_from_torch(h["pos"], ttnn.uint32, device=False), tr["pos"]),
-                (
-                    self._pv_from_torch(h["mask_full"], ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=False),
-                    tr["mask_full"],
-                ),
-                (
-                    self._pv_from_torch(h["mask_slide"], ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=False),
-                    tr["mask_slide"],
-                ),
-                (self._pv_from_torch(h["hot"], ttnn.int32, device=False), tr["hot"]),
-            ):
-                ttnn.copy_host_to_device_tensor(src, dst)
-            for lt, e in h["embed"].items():
-                ttnn.copy_host_to_device_tensor(self._pv_from_torch(e, ttnn.uint32, device=False), tr["embed"][lt])
-            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+        # Always refresh + replay, INCLUDING on the capture call. Capture records
+        # the program without running it, so the freshly captured `logits`/`hidden`
+        # are unwritten device buffers — returning them straight from the capture
+        # branch would hand the caller uninitialized memory. The refresh below is a
+        # no-op on the capture call (the persistent inputs were just built from
+        # these same `tokens`/`h`), and the replay's KV writes are idempotent with
+        # the compile run's, so one extra replay is free and correct.
         tr = self._pv_traces[key]
+        ttnn.copy_host_to_device_tensor(self._host_tokens(tokens), tr["x"])
+        for src, dst in (
+            (self._pv_from_torch(h["pos"], ttnn.uint32, device=False), tr["pos"]),
+            (
+                self._pv_from_torch(h["mask_full"], ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=False),
+                tr["mask_full"],
+            ),
+            (
+                self._pv_from_torch(h["mask_slide"], ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=False),
+                tr["mask_slide"],
+            ),
+            (self._pv_from_torch(h["hot"], ttnn.int32, device=False), tr["hot"]),
+        ):
+            ttnn.copy_host_to_device_tensor(src, dst)
+        for lt, e in h["embed"].items():
+            ttnn.copy_host_to_device_tensor(self._pv_from_torch(e, ttnn.uint32, device=False), tr["embed"][lt])
+        # PLI is a pure function of the candidate ids, so it changes every call.
+        self._pli_refresh(tokens, tr.get("pli"))
+        self._trace_barrier()
+        if self._pv_prof is not None:
+            self._pv_prof["host"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+        ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
         self._pv_a_prev = c // self._pv_bs
         lh = self._logits_to_host(tr["logits"]).reshape(P, -1)
+        if self._pv_prof is not None:
+            self._pv_prof["device_and_readback"] += time.perf_counter() - _t0
+            self._pv_prof["n"] += 1
         # Persistent hidden — caller must consume before the next replay.
         return lh, tr["hidden"]
 
     # ── target forwards ───────────────────────────────────────────────────
     def _verify(self, tokens, positions):
-        """Batched verify. Returns (logits_host [B,vocab], hidden_device [1,1,B,h])."""
-        # Any traced verify (plain or packed) is unavailable for a per-layer-input
-        # target: PLI is built from the candidate ids on host, and allocating it
-        # inside a trace capture is an illegal write during capture.
-        if self._use_trace and self.target_needs_host_pli:
-            raise NotImplementedError(
-                "Traced verify is not available for a per-layer-input target (E2B/E4B): PLI is built "
-                "from the candidate ids on host, and allocating/writing it inside a trace capture is "
-                "illegal. Run untraced (GEMMA4_SPEC_TRACE=0), or implement on-device PLI."
-            )
+        """Batched verify. Returns (logits_host [B,vocab], hidden_device [1,1,B,h]).
+
+        A traced verify IS available for a per-layer-input target (E2B/E4B). PLI
+        stays a host computation, but it reaches the trace the same way tokens and
+        positions do: a persistent device buffer allocated once out-of-trace
+        (``_pli_dev``) and refreshed per replay with ``copy_host_to_device_tensor``
+        (``_pli_refresh``). Nothing is allocated or host-written during capture.
+        This mirrors what the plain traced decode path already does with
+        ``pli_combined`` (Gemma4Model.prepare_decode_inputs_host ->
+        copy_host_to_device -> bind_decode_trace_inputs). Only the fully on-device
+        fused iteration genuinely cannot do this, because its draft tokens never
+        reach the host at all — see ``generate_fused``.
+        """
         # Packed-query verify: all K+1 candidates in one batch=1 pass (positions
         # packed into the query-heads dim, loop-free staging KV write).
         # Single-token calls (seed/reseed) keep the plain verify.
@@ -662,6 +801,7 @@ class SpeculativeDecoder:
 
         from loguru import logger as _lg
 
+        self._trace_barrier()
         drafts, draft_logits = [], []
         for step in range(K):
             _lg.info(f"[spec-trace] draft replay step {step}: execute")
@@ -673,11 +813,16 @@ class SpeculativeDecoder:
                 _lg.info(f"[spec-trace] draft replay step {step}: copy h_next->h")
                 ttnn.copy(tr["h_next"], tr["h"])
             _lg.info(f"[spec-trace] draft replay step {step}: read logits")
-            lh = self._logits_to_host(tr["logits"]).reshape(-1)
-            draft_logits.append(lh)
             if greedy:
-                tok = int(torch.argmax(lh))
+                # Same on-device argmax as the eager _draft — read back one uint32
+                # instead of rebuilding a [1, 262144] host tensor per step. Greedy
+                # never consumes draft_logits (only _accept_sampling does).
+                idx = self._argmax_last(tr["logits"], 1)
+                tok = self._id_to_host(idx)
+                idx.deallocate(True)
             else:
+                lh = self._logits_to_host(tr["logits"]).reshape(-1)
+                draft_logits.append(lh)
                 q = _to_probs(lh, temperature, top_p, top_k)
                 tok = int(torch.multinomial(q, 1))
             drafts.append(tok)
@@ -712,14 +857,33 @@ class SpeculativeDecoder:
             tok_tt = self._tokens_tensor([tok])
             logits_d, h_next = self.assistant.step(tok_tt, h_rec, self._shared_kv, page_tables, pos_u, pos_i)
             tok_tt.deallocate(True)
-            lh = self._logits_to_host(logits_d).reshape(-1)
-            logits_d.deallocate(True)
-            draft_logits.append(lh)
-            if greedy:
-                tok = int(torch.argmax(lh))
+            if greedy and self._draft_dev_argmax:
+                # Argmax ON DEVICE and read back one uint32.
+                #
+                # The previous code called _logits_to_host per step, which under CME
+                # routes to to_host_full_vocab and rebuilds a [1, 262144] host tensor
+                # (fill with min-1, then scatter the ~4096 selected scores) purely to
+                # take an argmax of it — discarding the entire point of the compact
+                # head. Measured: the draft phase costs ~86 ms/iter against ~47 ms of
+                # device time (3 x 15.71), i.e. ~39 ms/iter of host overhead, and this
+                # is the bulk of it. Greedy also never reads draft_logits at all —
+                # only _accept_sampling does — so the whole tensor was dead on
+                # arrival.
+                idx = self._argmax_last(logits_d, 1)  # [1,1,1] uint32, exact under CME
+                tok = self._id_to_host(idx)
+                idx.deallocate(True)
             else:
-                q = _to_probs(lh, temperature, top_p, top_k)
-                tok = int(torch.multinomial(q, 1))
+                # Host path: full readback. Needed for sampling's min(1, p(d)/q(d))
+                # acceptance test, and — measured — also FASTER than the on-device
+                # argmax while the drafter is eager (see _draft_dev_argmax).
+                lh = self._logits_to_host(logits_d).reshape(-1)
+                draft_logits.append(lh)
+                if greedy:
+                    tok = int(torch.argmax(lh))
+                else:
+                    q = _to_probs(lh, temperature, top_p, top_k)
+                    tok = int(torch.multinomial(q, 1))
+            logits_d.deallocate(True)
             drafts.append(tok)
             if owns_h:
                 h_rec.deallocate(True)
@@ -898,6 +1062,36 @@ class SpeculativeDecoder:
         return m, committed
 
     # ── main loop ───────────────────────────────────────────────────────────
+    def _seed_row(self, hidden, row, traced):
+        """Extract verify ``hidden`` row ``row`` as the next drafter seed.
+
+        Eager: clone the slice; ``hidden`` is ours to free.
+
+        Traced: ``hidden`` is the PERSISTENT verify output (never deallocate). Keep
+        ONE persistent destination and ``ttnn.copy`` into it, freeing the temporary
+        slice each iteration — bounded, leak-free, and shape-consistent because the
+        buffer is minted from the very same slice on first use.
+
+        Do NOT "optimise" this into ``ttnn.slice(..., output_tensor=self._anchor_buf)``.
+        That was tried and it TT_FATALs:
+            slice_device_operation.cpp:142: out_tensor.padded_shape() == output_shape_required
+        ``seed()`` mints ``_anchor_buf`` from the SINGLE-TOKEN verify's hidden, while
+        this slices the PACKED verify's hidden — different padded shapes, so the
+        caller-supplied output is rejected. It went unnoticed for a long time because
+        a control-flow bug meant the traced path never executed (see generate()).
+        """
+        sliced = hidden[:, :, row : row + 1, :]
+        if not traced:
+            h = ttnn.clone(sliced)
+            hidden.deallocate(True)
+            return h
+        if self._row_buf is None:
+            self._row_buf = ttnn.clone(sliced)
+        else:
+            ttnn.copy(sliced, self._row_buf)
+        sliced.deallocate(True)
+        return self._row_buf
+
     def seed(self, anchor_token, anchor_pos):
         """Compute the target hidden at the anchor (after prefill filled the KV).
 
@@ -1626,9 +1820,31 @@ class SpeculativeDecoder:
         """
         greedy = not temperature or temperature <= 0
         if self._use_trace:
-            if greedy:
+            if greedy and not self.target_needs_host_pli:
                 return self.generate_fused(anchor_token, anchor_pos, max_new_tokens)
+            if greedy:
+                # PLI target (E2B/E4B): the fused iteration is out (its drafts never
+                # reach the host, so PLI cannot be built), but the host loop below
+                # traces fine — the verify's PLI rides in on a persistent buffer.
+                # The DRAFTER stays eager by default: a traced drafter plus a traced
+                # verify means two distinct CCL traces alternating every iteration,
+                # which is the mesh-deadlock case documented below. The verify is
+                # the expensive half anyway (35 layers vs the drafter's 4), so
+                # tracing only it captures most of the win at no risk.
+                # GEMMA4_SPEC_TRACE_DRAFT=1 opts into the traced drafter to A/B it.
+                self._trace_draft = os.environ.get("GEMMA4_SPEC_TRACE_DRAFT", "0") == "1"
 
+        # NOTE the `not greedy` guard below, and why it is load-bearing.
+        #
+        # This block used to be reached by BOTH branches above. A greedy PLI target
+        # set _trace_draft and then fell straight through into it, logged a bogus
+        # "sampling mode" warning, set _use_trace = False, and recursed — so the
+        # traced host loop was NEVER taken for E2B/E4B. Every demo run labelled
+        # "traced" in this investigation actually ran untraced, which is why traced
+        # and untraced measured identically (182.32 vs 181.48 ms/token at 1000
+        # tokens) and why no "[spec-trace]" line ever appeared in a demo log.
+        # The warning was in every one of those logs; it was the tell.
+        if self._use_trace and not greedy:
             # Sampling mode cannot use the single fused greedy trace because the
             # draft/verify token selection is non-deterministic (it depends on the
             # sampled token), so draft and verify must run as two SEPARATE traces
@@ -1673,46 +1889,70 @@ class SpeculativeDecoder:
         owns_anchor_hidden = (anchor_hidden is None) and not traced
         if anchor_hidden is None:
             anchor_hidden = self.seed(anchor_token, anchor_pos)
-        draft_fn = self._draft_traced if self._use_trace else self._draft
+        draft_fn = self._draft_traced if (self._use_trace and self._trace_draft) else self._draft
+        # GEMMA4_SPEC_PROFILE=1 accumulates wall-clock per phase. Worth having
+        # permanently: traced and untraced measured within 0.5% of each other at
+        # 1000 tokens (182.3 vs 181.5 ms/token), which means device DISPATCH is not
+        # where the iteration goes — and a tok/s/u number alone cannot tell you
+        # whether the remainder is device compute, host readback, or host PLI.
+        prof = os.environ.get("GEMMA4_SPEC_PROFILE") == "1"
+        t_acc = {"draft": 0.0, "verify": 0.0, "accept": 0.0, "seed": 0.0}
+        n_iter = 0
         while len(out) < max_new_tokens:
+            _t0 = time.perf_counter() if prof else 0.0
             drafts, draft_logits = draft_fn(
                 anchor_token, anchor_hidden, anchor_pos, temperature=temperature, top_p=top_p, top_k=top_k
             )
+            if prof:
+                t_acc["draft"] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
 
             verify_tokens = [anchor_token] + drafts
             verify_pos = [anchor_pos + j for j in range(len(verify_tokens))]
             verify_logits, hidden = self._verify(verify_tokens, verify_pos)
+            if prof:
+                t_acc["verify"] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
 
             if greedy:
                 m, committed = self._accept_greedy(drafts, verify_logits)
             else:
                 m, committed = self._accept_sampling(drafts, draft_logits, verify_logits, temperature, top_p, top_k)
+            if prof:
+                t_acc["accept"] += time.perf_counter() - _t0
+            n_iter += 1
             accepts.append(m)
 
             # New anchor token = committed[-1] = g[m] at position anchor_pos+m+1.
-            # The drafter seed must be the target hidden for THIS token at THIS
-            # position. The verify (tokens [anchor, d1..dK] at positions P..P+K)
-            # only has hidden at index j = position P+j computed with the draft
-            # token there as input — never g[m] at P+m+1. Seed quality drives the
-            # acceptance rate (the first-step seed() is exact, PCC ~0.98):
-            #   reseed: exact batch=1 verify of (g[m], P+m+1) — best quality, one
-            #           extra small target forward (can be folded into the trace).
-            #   shift : hidden[m+1] = position-aligned but input-approximate
-            #           (computed with the rejected draft); no extra forward.
-            #   cur   : hidden[m] = position P+m (input+position mismatched).
+            # The MTP contract LAGS the feature one step behind the token: the
+            # drafter consumes cat(embed(new_token), target_hidden at the PREVIOUS
+            # position). HF's reference candidate generator
+            # (transformers SinglePositionMultiTokenCandidateGenerator.get_candidates)
+            # does exactly:
+            #     last_hidden_state = hidden_states[-1][:, n_matches : n_matches+1]
+            #     last_token_id     = input_ids[:, -1:]          # == g[m]
+            #     inputs_embeds     = cat(embed(last_token_id), last_hidden_state)
+            # with n_matches = accepted draft count == our `m`. So:
+            #   cur   : hidden[m] — the EXACT reference contract, and free. Row m
+            #           of the verify is committed (drafts[0..m-1] were accepted),
+            #           so it is the true target hidden at position P+m, which is
+            #           precisely the position the new anchor's feature must lag to.
+            #   shift : hidden[m+1] — off by one vs the reference, and computed
+            #           with the REJECTED draft as input. Degrades acceptance.
+            #   reseed: extra batch=1 verify of (g[m], P+m+1). The reference never
+            #           does this; it pairs the token with its OWN position's
+            #           hidden, which is a different (not better) contract, and it
+            #           costs a full extra target forward per iteration.
             new_pos = anchor_pos + m + 1
             new_token = committed[-1]
+            _t0 = time.perf_counter() if prof else 0.0
             # In traced mode `hidden` is the persistent verify output: never
-            # deallocate it, and the default reseed path doesn't read it.
+            # deallocate it, and the reseed path doesn't read it.
             if self._seed_mode == "cur":
-                new_anchor_hidden = ttnn.clone(hidden[:, :, m : m + 1, :])
-                if not traced:
-                    hidden.deallocate(True)
+                new_anchor_hidden = self._seed_row(hidden, m, traced)
             elif self._seed_mode == "shift" and m + 1 <= len(drafts):
-                new_anchor_hidden = ttnn.clone(hidden[:, :, m + 1 : m + 2, :])
-                if not traced:
-                    hidden.deallocate(True)
-            else:  # "reseed" (default) or shift fallback when m == draft_len
+                new_anchor_hidden = self._seed_row(hidden, m + 1, traced)
+            else:  # "reseed" or shift fallback when m == draft_len
                 if not traced:
                     hidden.deallocate(True)
                 new_anchor_hidden = self.seed(new_token, new_pos)
@@ -1721,16 +1961,49 @@ class SpeculativeDecoder:
             anchor_hidden, owns_anchor_hidden = new_anchor_hidden, not traced
             anchor_pos = new_pos
             anchor_token = new_token
+            if prof:
+                t_acc["seed"] += time.perf_counter() - _t0
 
             for tok in committed:
                 out.append(tok)
                 if tok in self.stop_tokens:
                     if owns_anchor_hidden:
                         anchor_hidden.deallocate(True)
+                    self._log_profile(prof, t_acc, n_iter, len(out))
                     return out, accepts
                 if len(out) >= max_new_tokens:
                     break
 
         if owns_anchor_hidden:
             anchor_hidden.deallocate(True)
+        self._log_profile(prof, t_acc, n_iter, len(out))
         return out, accepts
+
+    def _log_profile(self, prof, t_acc, n_iter, n_tok):
+        """Per-phase wall-clock breakdown of the host spec-decode loop.
+
+        ``verify`` and ``draft`` each bundle device time AND the host work wrapped
+        around it (PLI build, mask build, logits readback); ``accept`` is pure host
+        argmax over the returned logits. A large ``accept`` or a ``verify`` that
+        does not shrink under trace both point at host-side cost that tracing
+        cannot reach.
+        """
+        if not prof or not n_iter:
+            return
+        from loguru import logger as _lg
+
+        total = sum(t_acc.values())
+        _lg.info(f"[spec-profile] {n_iter} iters, {n_tok} tokens, {total * 1e3 / max(n_iter, 1):.1f} ms/iter")
+        for k in ("draft", "verify", "accept", "seed"):
+            ms = t_acc[k] * 1e3 / n_iter
+            pct = 100.0 * t_acc[k] / total if total else 0.0
+            _lg.info(f"[spec-profile]   {k:<7} {ms:7.2f} ms/iter  {pct:5.1f}%")
+        pv = self._pv_prof
+        if pv and pv.get("n"):
+            hs = pv["host"] * 1e3 / pv["n"]
+            ds = pv["device_and_readback"] * 1e3 / pv["n"]
+            _lg.info(
+                f"[spec-profile]   verify split over {pv['n']} calls: "
+                f"HOST inputs {hs:7.2f} ms/iter ({100 * hs / (hs + ds):4.1f}%)  |  "
+                f"device replay + readback {ds:7.2f} ms/iter ({100 * ds / (hs + ds):4.1f}%)"
+            )

@@ -773,33 +773,37 @@ def _run_spec_decode(
     # (temp>0) falls back to the host-readback generate for batch=1.
     use_fused = batch_size == 1 and ((not temperature) or temperature <= 0)
     # E2B/E4B targets carry per-layer inputs computed on CPU from the token ids, so
-    # they cannot use the fully on-device fused iteration (its drafts never reach
-    # the host) nor the traced verify. Route them to the host loop; GEMMA4_SPEC_FUSED
-    # can also force the choice explicitly for A/B.
+    # they cannot use the fully on-device FUSED iteration — its drafts never reach
+    # the host, so there is nothing to build PLI from. The traced HOST loop is fine
+    # (PLI enters the trace as data via a persistent buffer; see
+    # SpeculativeDecoder._verify). GEMMA4_SPEC_FUSED can force the choice for A/B.
     _fused_env = os.environ.get("GEMMA4_SPEC_FUSED")
     if _fused_env is not None:
         use_fused = _fused_env == "1"
     elif use_fused and getattr(spec, "target_needs_host_pli", False):
         logger.info(
-            "Target uses per-layer inputs (E2B/E4B): falling back to the host spec-decode loop "
-            "(the fused on-device iteration would need PLI computed on device)."
+            "Target uses per-layer inputs (E2B/E4B): falling back to the traced host "
+            "spec-decode loop (the fused on-device iteration would need PLI on device)."
         )
         use_fused = False
-    if getattr(spec, "target_needs_host_pli", False):
-        spec._use_trace = False
-    # The fused greedy path is HOST-DISPATCH bound when untraced (~10 tok/s/u —
-    # SLOWER than plain decode); the single fused Metal trace removes that
-    # overhead (>3x, exceeding plain decode). Default tracing to the demo's
-    # `enable_trace` so spec-decode is fast out of the box; GEMMA4_SPEC_TRACE
-    # overrides explicitly (=1 force on, =0 force off — e.g. to A/B the cost).
-    if use_fused:
-        _trace_env = os.environ.get("GEMMA4_SPEC_TRACE")
-        spec._use_trace = enable_trace if _trace_env is None else (_trace_env == "1")
+    # Both paths are HOST-DISPATCH bound when untraced (the fused one runs ~10
+    # tok/s/u — SLOWER than plain decode); tracing removes that overhead. Default
+    # tracing to the demo's `enable_trace` so spec-decode is fast out of the box;
+    # GEMMA4_SPEC_TRACE overrides explicitly (=1 force on, =0 force off, e.g. to
+    # A/B the cost).
+    _trace_env = os.environ.get("GEMMA4_SPEC_TRACE")
+    spec._use_trace = enable_trace if _trace_env is None else (_trace_env == "1")
     logger.info(
         f"Spec-decode generate (draft_len={draft_len}, temp={temperature}, "
         f"path={'fused' if use_fused else 'host'}, trace={spec._use_trace}, "
-        f"seed={'reseed' if spec._fused_reseed else 'shift'}, "
-        f"shift_seed={getattr(spec, '_fused_shift_seed', 'n/a')})..."
+        # The two paths read DIFFERENT seed knobs: the fused trace uses
+        # _fused_reseed/_fused_shift_seed, the host loop uses _seed_mode.
+        + (
+            f"seed={'reseed' if spec._fused_reseed else 'shift'}, "
+            f"shift_seed={getattr(spec, '_fused_shift_seed', 'n/a')})..."
+            if use_fused
+            else f"seed_mode={spec._seed_mode}, trace_draft={spec._trace_draft})..."
+        )
     )
     t0 = time.time()
     if use_fused:
