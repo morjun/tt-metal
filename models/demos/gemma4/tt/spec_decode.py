@@ -136,6 +136,26 @@ class SpeculativeDecoder:
         self._trace_draft = os.environ.get("GEMMA4_SPEC_TRACE_DRAFT", "0") == "1"
         # Drain the queue when switching between distinct traces (see _trace_barrier).
         self._trace_sync = os.environ.get("GEMMA4_SPEC_TRACE_SYNC", "0") == "1"
+        # GEMMA4_SPEC_TRACE_VERIFY=0 runs the packed verify EAGERLY while still
+        # allowing a traced drafter. Replaying two distinct traces alternately on one
+        # command queue hangs after ~2 iterations (reproduced at 1x1, where there are
+        # ZERO CCL ops, so it is not the CCL story the old comments tell), and
+        # synchronize_device at BOTH switch points does not fix it. Running exactly one
+        # of the two traced sidesteps the alternation entirely. Which one to trace is an
+        # empirical question: the verify is 35 layers but device-bound, the drafter is 4
+        # layers but host-bound (58 ms wall for ~15 ms of device work).
+        self._trace_verify = os.environ.get("GEMMA4_SPEC_TRACE_VERIFY", "1") == "1"
+        # Command queue for the DRAFT trace. With GEMMA4_NUM_CQ=2 (see the demo's
+        # _device_params) setting this to 1 keeps the draft trace off the queue the
+        # verify trace replays on, which is the last remaining fix for the
+        # two-traces-one-queue hang. Data ordering across the two queues is preserved by
+        # the existing _trace_barrier drain at each switch point.
+        self._draft_cq = int(os.environ.get("GEMMA4_SPEC_DRAFT_CQ", "0"))
+        # GEMMA4_SPEC_TRACE_BLOCKING=1 replays every trace with blocking=True. This is
+        # a DIFFERENT guarantee from the _trace_barrier drain: it waits on that trace's
+        # own completion rather than on the device generally, which is what a
+        # queue-ordering race between two alternating traces would need.
+        self._trace_blocking = os.environ.get("GEMMA4_SPEC_TRACE_BLOCKING", "0") == "1"
         # On-device argmax for greedy drafting instead of to_host_full_vocab.
         # OFF by default: MEASURED HARMFUL with an eager drafter. argmax_token_id is
         # ~9 device ops (pad/untilize/argmax/slice/reshape/to_layout/gather/...), and
@@ -432,7 +452,7 @@ class SpeculativeDecoder:
         # PLI is a pure function of the candidate ids, so it changes every call.
         self._pli_refresh(tokens, tr["pli"])
         _lg.info(f"[spec-trace] verify replay batch={batch}: execute")
-        ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+        ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=self._trace_blocking)
         _lg.info(f"[spec-trace] verify replay batch={batch}: read logits")
         lh = self._logits_to_host(tr["logits"]).reshape(batch, -1)
         # Return the PERSISTENT hidden (no clone). It is overwritten on the next
@@ -695,7 +715,7 @@ class SpeculativeDecoder:
         if self._pv_prof is not None:
             self._pv_prof["host"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
-        ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+        ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=self._trace_blocking)
         self._pv_a_prev = c // self._pv_bs
         lh = self._logits_to_host(tr["logits"]).reshape(P, -1)
         if self._pv_prof is not None:
@@ -723,7 +743,7 @@ class SpeculativeDecoder:
         # packed into the query-heads dim, loop-free staging KV write).
         # Single-token calls (seed/reseed) keep the plain verify.
         if len(tokens) > 1:
-            if self._use_trace:
+            if self._use_trace and self._trace_verify:
                 return self._verify_packed_traced(tokens, positions)
             return self._verify_packed(tokens, positions)
         # Tracing: BOTH the batch=1 verify (seed/reseed) and the batch=K+1
@@ -778,9 +798,25 @@ class SpeculativeDecoder:
         logits.deallocate(True)
         h_next.deallocate(True)
         _lg.info("[spec-trace] capture draft step: begin_trace_capture")
-        tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+        tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=self._draft_cq)
         logits, h_next = self.assistant.step(tok_in, h_in, self._shared_kv, page_tables, pos_u, pos_i)
-        ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        ttnn.end_trace_capture(self.mesh_device, tid, cq_id=self._draft_cq)
+        if os.environ.get("GEMMA4_SPEC_TRACE_DRAFT_PROBE") == "1":
+
+            def _al(nm, t):
+                try:
+                    _lg.info(f"[draft-probe] {nm} allocated={t.is_allocated()} shape={tuple(t.shape)}")
+                except Exception as e:  # noqa: BLE001
+                    _lg.info(f"[draft-probe] {nm} <{type(e).__name__}: {e}>")
+
+            if hasattr(logits, "values"):
+                _al("logits.values", logits.values)
+                _al("logits.ids", logits.ids)
+            else:
+                _al("logits", logits)
+            _al("h_next", h_next)
+            _al("h_in", h_in)
+            _al("tok_in", tok_in)
         _lg.info("[spec-trace] capture draft step: DONE")
         self._draft_trace = {
             "id": tid,
@@ -814,7 +850,7 @@ class SpeculativeDecoder:
         drafts, draft_logits = [], []
         for step in range(K):
             _lg.info(f"[spec-trace] draft replay step {step}: execute")
-            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=self._draft_cq, blocking=self._trace_blocking)
             # Feed the recurrence: next step reads h_in, which the trace does NOT
             # update (in-trace copy is illegal). Copy the fresh output h_next into
             # h_in on-device (no allocation), queued after execute_trace.
@@ -1369,7 +1405,7 @@ class SpeculativeDecoder:
             first = False
 
             _lg.debug(f"[spec-trace] fused replay pos={cur_pos} execute")
-            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=self._trace_blocking)
 
             vx = (
                 ttnn.to_torch(ttnn.get_device_tensors(tr["verify_x"])[0])
@@ -1722,7 +1758,7 @@ class SpeculativeDecoder:
                     wi.deallocate(True)
             first = False
 
-            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=False)
+            ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=self._trace_blocking)
 
             vx = (
                 ttnn.to_torch(ttnn.get_device_tensors(tr["verify_x"])[0])
@@ -1925,6 +1961,30 @@ class SpeculativeDecoder:
         prof = os.environ.get("GEMMA4_SPEC_PROFILE") == "1"
         t_acc = {"draft": 0.0, "verify": 0.0, "accept": 0.0, "seed": 0.0}
         n_iter = 0
+        # ── Pre-capture BOTH traces before replaying EITHER of them ───────────────
+        # The two-traces-one-queue hang is a CAPTURE-AFTER-REPLAY problem, not a
+        # queue-ordering race. The natural loop order makes it happen every time:
+        # draft trace captured -> draft replayed 3x -> verify trace captured -> ...
+        # and the very first PURE replay of the verify trace then never returns.
+        # Capturing a trace while another trace has already been replayed is the
+        # "allocation collision" the interleaving comments below warn about: the
+        # capture re-runs the allocator and can hand the new trace addresses the live
+        # trace already bound. Ruled out as alternatives by measurement:
+        # synchronize_device at both switch points, blocking=True replay, a 900 MB
+        # trace region, and putting the drafter on its own command queue (which made
+        # it hang one iteration EARLIER, since cross-queue data ordering then needs
+        # events rather than a drain).
+        #
+        # Doing both captures up front, before the loop's first replay, leaves the
+        # steady state as pure replay/replay with no capture in between. The verify
+        # pre-capture runs one extra verify over the same positions the first real
+        # verify will write (c..c+K), so its KV writes are overwritten immediately.
+        if self._use_trace and self._trace_draft and self._trace_verify and greedy:
+            _P = self.draft_len + 1
+            if self._draft_trace is None:
+                self._capture_draft_trace(anchor_token, anchor_hidden, anchor_pos)
+            # Capture (and discard) the packed verify at the shape the loop will use.
+            self._verify([anchor_token] * _P, [anchor_pos + j for j in range(_P)])
         while len(out) < max_new_tokens:
             _t0 = time.perf_counter() if prof else 0.0
             drafts, draft_logits = draft_fn(

@@ -73,6 +73,19 @@ class CmeLogits:
         self.ids.deallocate(force)
 
 
+def _same_buffer(a, b):
+    """True if two tensors share device storage (i.e. one is an alias of the other).
+
+    Used to avoid deallocating a tensor that an op returned as a view of its input.
+    Falls back to False when an address is unavailable, which only ever costs a
+    deallocation we skip -- never a use-after-free.
+    """
+    try:
+        return a.buffer_address() == b.buffer_address()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class Gemma4TTMaskedEmbedder:
     """TT implementation of ``Gemma4AssistantMaskedEmbedder``.
 
@@ -327,7 +340,15 @@ class Gemma4TTMaskedEmbedder:
             padded = ttnn.pad(values, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
             src = padded
         u = ttnn.untilize(src, use_multicore=True)
-        if padded is not None:
+        # Only free `padded` if it is genuinely a separate buffer. `values` is
+        # [1,1,rows,N] TILE, so for rows < 32 it ALREADY occupies a full 32-row tile
+        # physically and padding rows -> 32 is a logical no-op that ttnn satisfies by
+        # handing back an ALIAS of the input. Deallocating that alias frees `values`
+        # itself. Eagerly this is invisible (the CmeLogits pack is rebuilt every draft
+        # step and dropped), but the traced drafter's pack is a PERSISTENT trace output
+        # reused on every replay, so step 0's argmax killed it and step 1 died with
+        # TT_THROW storage.cpp:162 "Tensor is not allocated".
+        if padded is not None and not _same_buffer(padded, values):
             padded.deallocate(True)
         idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,32] uint32 RM
         u.deallocate(True)

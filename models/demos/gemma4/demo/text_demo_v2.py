@@ -154,7 +154,12 @@ def _device_params():
         return {
             "fabric_config": ttnn.FabricConfig.FABRIC_1D,
             "trace_region_size": trace_region_size,
-            "num_command_queues": 1,
+            # GEMMA4_NUM_CQ=2 is needed to put the traced drafter on its own command
+            # queue. Replaying two distinct traces alternately on ONE queue hangs after
+            # ~2 iterations (reproduced at 1x1 with zero CCL ops, and unaffected by
+            # synchronize_device at both switch points or by a 900 MB trace region), so
+            # the drafter trace needs a queue the verify trace does not share.
+            "num_command_queues": int(os.environ.get("GEMMA4_NUM_CQ", 1)),
         }
     return {"fabric_config": ttnn.FabricConfig.FABRIC_1D, "trace_region_size": 30_000_000, "num_command_queues": 1}
 
