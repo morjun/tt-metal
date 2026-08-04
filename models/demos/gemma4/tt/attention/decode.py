@@ -9,6 +9,8 @@ Uses HF-style ttnn.experimental.rotary_embedding (no transformation matrices).
 
 import os
 
+from loguru import logger
+
 import ttnn
 
 from .operations import (
@@ -24,6 +26,15 @@ from .operations import (
     split_qkv_heads_prefill,
 )
 from .weights import AttentionWeights
+
+_PV_SDPA_FP = os.environ.get("GEMMA4_PV_SDPA_FP") == "1"
+# Shape/config keys already warmed up this process (see the WARM-UP note in
+# _packed_verify_sdpa). GEMMA4_PV_WARMUP=0 disables it for A/B.
+_PV_WARMED = set()
+# Default 0: the warm-up was MEASURED not to fix the cross-process fork (still 2
+# variants over 6 processes at GEMMA4_PV_WARMUP=3), so it is off by default and
+# kept only as an A/B knob. See the WARM-UP note in _packed_verify_sdpa.
+_PV_WARMUP_ITERS = int(os.environ.get("GEMMA4_PV_WARMUP", "0"))
 
 # Cache for the L1 height-sharded ``MemoryConfig`` that
 # ``nlp_create_qkv_heads_decode`` produces. The spec only depends on shape
@@ -511,6 +522,20 @@ def _packed_verify_sdpa(
     # as "fp32 is not a win" rather than "fp32 is broken and 1x1 always runs it".
     #
     # GEMMA4_PV_SDPA_FP32 = "1"/"0" forces on/off for A/B.
+    # The packed verify folds candidates into the query-head dim as H_local*P rows,
+    # which must be tile-aligned: (H_local*P) % 32 == 0, i.e. P divisible by
+    # 32 // H_local. E2B has 8 query heads so H_local = 8 // tp and the smallest legal
+    # P is 4*tp => draft_len = 4*tp - 1 (3 at tp=1, 7 at tp=2, 15 at tp=4). Without this
+    # check the violation surfaces as "Statically allocated circular buffers ... grow to
+    # 2005952 B which is beyond max L1 size of 1572864 B" (program.cpp:1717), which
+    # names neither draft_len nor the constraint it broke.
+    if (H_local * P) % 32 != 0:
+        _mult = 32 // H_local if H_local <= 32 else 1
+        raise ValueError(
+            f"packed verify needs (H_local*P) % 32 == 0, got H_local={H_local}, P={P} "
+            f"(={H_local * P} rows). P must be a multiple of {_mult}, so use "
+            f"draft_len = {_mult}*n - 1 (e.g. {_mult - 1}, {2 * _mult - 1}, {3 * _mult - 1})."
+        )
     _pnht = (H_local * P) // 32
     _needs_fp32 = _pnht == 3  # the only PNHt where the power-of-2 assertion fails
     _fp32_env = os.environ.get("GEMMA4_PV_SDPA_FP32")
@@ -562,8 +587,112 @@ def _packed_verify_sdpa(
             compute_kernel_config=compute_kernel_config,
         )
 
+    # GEMMA4_PV_SDPA_FP=1: fingerprint the packed SDPA's INPUTS and OUTPUT.
+    # The 50/50 fork was bisected to decoder layer 0 (its input is bit-identical
+    # across runs, its output takes one of two values). Layer 0 is a SLIDING layer
+    # and this op passes sliding_window_size=None, so it reads the whole KV span
+    # and leans entirely on the additive mask. Dumping q/k/v/mask separately from
+    # the result says whether the fork is a bad KV READ or a bad SDPA COMPUTE.
+    def _fp(tag, t):
+        if t is None:
+            logger.info(f"[pv-sdpa] {tag} = None")
+            return
+        import hashlib
+
+        import torch as _t
+
+        raw = ttnn.to_torch(ttnn.get_device_tensors(t)[0])
+        # md5 of the RAW bytes, not a sum. A sum is permutation-invariant AND loses
+        # small per-element deltas in the fp32 accumulation over ~1M elements, so
+        # "identical sums" is far too weak to conclude "identical inputs".
+        digest = hashlib.md5(raw.contiguous().view(_t.uint8).numpy().tobytes()).hexdigest()[:16]
+        h = raw.float()
+        fin = _t.isfinite(h)
+        logger.info(
+            f"[pv-sdpa] {tag} shape={tuple(h.shape)} md5={digest} sum={h[fin].sum().item():+.6f} "
+            f"absmax={h[fin].abs().max().item():.6f} nonfinite={int((~fin).sum())}"
+        )
+
+    if _PV_SDPA_FP:
+        _fp("q", q_packed)
+        _fp("k", k)
+        _fp("v", v)
+        _fp("mask", attn_mask)
+        # The page table is the prime suspect. A SUM over the KV cache is
+        # permutation-invariant, so identical k/v fingerprints do not rule out a
+        # permuted logical->physical block mapping — and a permuted mapping changes
+        # the order SDPA accumulates K chunks, hence its bf16 rounding, from
+        # bit-identical inputs. Dump the mapping itself, not a sum of it.
+        if layer_page_table is not None:
+            _pt = ttnn.to_torch(ttnn.get_device_tensors(layer_page_table)[0]).flatten().tolist()
+            logger.info(f"[pv-sdpa] page_table[:32]={[int(x) for x in _pt[:32]]}")
+        else:
+            logger.info("[pv-sdpa] page_table = None (unpaged)")
+
+        # Buffer ADDRESSES are the last per-process variable left. The standalone
+        # reproducer allocates in a fixed order, so its addresses match in every
+        # process and (once kernels are cached) it is deterministic. The model has a
+        # long allocation history that can differ, so if the two output variants track
+        # the addresses, the op is address-sensitive.
+        def _addr(nm, t):
+            try:
+                logger.info(f"[pv-sdpa] addr {nm}={hex(ttnn.get_device_tensors(t)[0].buffer_address())}")
+            except Exception as e:  # noqa: BLE001
+                logger.info(f"[pv-sdpa] addr {nm}=<unavailable: {type(e).__name__}>")
+
+        for _nm, _t in (("q", q_packed), ("k", k), ("v", v), ("mask", attn_mask)):
+            if _t is not None:
+                _addr(_nm, _t)
+
+    # ── WARM-UP: the packed SDPA reads uninitialised L1 on its first invocations ──
+    # paged_scaled_dot_product_attention_decode in this configuration (is_causal=False
+    # + explicit additive attn_mask) is NOT a pure function of its inputs on the first
+    # few calls after a cold kernel build. Standalone reproducer, 6 processes, inputs
+    # byte-identical by md5, three back-to-back calls each:
+    #     process 1   9a1cb7ee  e4716437  b6d3d5e8   <- all three differ
+    #     process 2   69ad3879  ffff80c7  ffff80c7   <- converges after one call
+    #     process 3-6 ffff80c7  ffff80c7  ffff80c7   <- stable from the start
+    # It converges to a value that is the SAME in every process, so the residue is
+    # what varies, not the arithmetic. Processes 1-2 are the ones that had to JIT-build
+    # kernels, which leaves different L1 behind.
+    #
+    # In the live model the first packed verify of a generation is exactly such a cold
+    # invocation, and that is the whole 50/50 output fork: a ~0.6% delta in layer 0's
+    # attention output amplifies to ~7% by layer 1 and eventually flips a token.
+    # Everything else was eliminated by measurement first: q/k/v/mask byte-identical,
+    # page table the identity, forks just as much at S_k=64 (single K chunk, no masked
+    # tail, no cross-core reduction) as at S_k=1024, and plain decode -- which passes
+    # cur_pos/sliding_window_size instead of an explicit mask -- is deterministic
+    # across processes at every max_seq_len.
+    #
+    # Fix: on the first call for a given shape/config, run the op a few extra times and
+    # throw the results away. SDPA only READS k/v, so repeating it cannot disturb the
+    # KV cache. This runs on the eager compile call, i.e. before any trace capture, so
+    # no extra ops land inside a trace.
+    _wkey = (tuple(q_packed.shape), tuple(attn_mask.shape) if attn_mask is not None else None, n_splits, _use_fp32)
+    if _wkey not in _PV_WARMED:
+        _PV_WARMED.add(_wkey)
+        for _ in range(_PV_WARMUP_ITERS):
+            _w = _call(q_packed, attn_mask) if n_splits <= 1 else None
+            if _w is not None:
+                ttnn.deallocate(_w)
+
     if n_splits <= 1:
-        return _call(q_packed, attn_mask)
+        _o = _call(q_packed, attn_mask)
+        if _PV_SDPA_FP:
+            _fp("out", _o)
+            # GEMMA4_PV_SDPA_TWICE=1: run the SAME op again on the SAME inputs in the
+            # SAME process. The op was shown to return one of two outputs across
+            # processes from bit-identical q/k/v/mask. If out2 == out, the op is
+            # deterministic within a process and the fork is a per-process constant
+            # (core assignment / allocator address / L1 left over from init). If
+            # out2 != out, it is live nondeterminism (arrival-order reduction or
+            # uninitialised L1 read by idle cores).
+            if os.environ.get("GEMMA4_PV_SDPA_TWICE") == "1":
+                _o2 = _call(q_packed, attn_mask)
+                _fp("out2", _o2)
+                ttnn.deallocate(_o2)
+        return _o
     s_k = attn_mask.shape[3] if attn_mask is not None else None
     rows_per = (H_local // n_splits) * P  # packed query rows per sub-op (32-aligned)
     parts = []
@@ -862,12 +991,22 @@ def packed_decode_forward(
     q_packed = ttnn.to_layout(tt_q, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     ttnn.deallocate(tt_q)
 
+    # GEMMA4_PV_KCHUNK / GEMMA4_PV_MAXCORES: knobs for the cross-core flash
+    # reduction. The 50/50 output fork was bisected to THIS op: across processes
+    # q/k/v/mask are byte-identical (md5) and the page table is the identity, yet
+    # the output takes one of two values — while a back-to-back re-run inside one
+    # process always reproduces. num_cores_per_head is 16 here, so a K chunk's
+    # partial softmax is merged across 16 cores. Raising k_chunk_size to S_k
+    # collapses that to a single chunk and removes the cross-core merge entirely,
+    # which is the A/B that isolates the reduction as the source.
+    _kchunk = int(os.environ.get("GEMMA4_PV_KCHUNK", "64"))
+    _maxcores = int(os.environ.get("GEMMA4_PV_MAXCORES", "16"))
     sdpa_program_config = ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=_packed_sdpa_grid(config, mesh_device),
         q_chunk_size=32,
-        k_chunk_size=64,
+        k_chunk_size=_kchunk,
         exp_approx_mode=False,
-        max_cores_per_head_batch=16,
+        max_cores_per_head_batch=_maxcores,
     )
     _grid = sdpa_program_config.compute_with_storage_grid_size
     n_sdpa_splits = _verify_head_splits(B, H_local, nkv_local, P, head_dim, grid=_grid.x * _grid.y)

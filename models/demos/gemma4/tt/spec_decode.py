@@ -197,7 +197,16 @@ class SpeculativeDecoder:
         # S_k (mask key length) is padded to this bucket so the verify trace
         # shape stays stable as the context grows; a new trace is captured when
         # the bucket rolls.
-        self._pv_sk_bucket = 1024
+        # GEMMA4_SPEC_SK_BUCKET overrides the bucket. 1024 means a 44-token context
+        # still builds a 1024-wide mask and runs 1024/k_chunk(64) = 16 K-chunks where
+        # ONE would cover the real keys — ~16x the necessary SDPA work, and the
+        # fully-masked tail chunks are the packed path's only structural difference
+        # from plain decode (which passes cur_pos/sliding_window_size and reads just
+        # the valid prefix). Plain decode is deterministic across processes; the
+        # packed verify is not, so those tail chunks are the prime suspect for the
+        # 50/50 fork as well as for the 4.7x cost. Must stay a multiple of
+        # k_chunk (64). Smaller buckets recapture the trace more often as c grows.
+        self._pv_sk_bucket = int(os.environ.get("GEMMA4_SPEC_SK_BUCKET", "1024"))
         self._pv_ready = False
         self._pv_a_prev = -1  # last hot block index (-1 ⇒ staging unseeded)
         self._pv_traces = {}  # (P, S_k) -> persistent trace inputs/outputs

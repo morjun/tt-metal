@@ -16,6 +16,8 @@ Compatible with tt_transformers Generator interface.
 """
 
 
+import os
+
 import torch
 from loguru import logger
 from tracy import signpost
@@ -27,6 +29,8 @@ from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
+
+_PV_LAYER_FP = os.environ.get("GEMMA4_PV_LAYER_FP") == "1"
 
 # Tracy signpost headers — paired begin/end with the same name. The
 # ``models/tt_transformers/scripts/op_perf_results.py --signpost <NAME>``
@@ -862,6 +866,21 @@ class Gemma4Model:
                     layout=ttnn.TILE_LAYOUT,
                     dtype=ttnn.bfloat16,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device) if is_mesh else None,
+                )
+
+            # GEMMA4_PV_LAYER_FP=1: per-layer fingerprint of the PACKED verify.
+            # The 50/50 output fork has bit-identical inputs (seed hidden + drafts)
+            # and divergent verify logits, so the divergence is born somewhere inside
+            # this layer stack. Dumping a checksum after every layer and diffing two
+            # runs localises it to a single layer — the same fingerprinting that
+            # caught the fp32 workaround. Costs a device->host read per layer, so it
+            # is strictly a debug path.
+            if _PV_LAYER_FP and packed is not None:
+                import loguru
+
+                _t = ttnn.to_torch(ttnn.get_device_tensors(hidden_states)[0]).float()
+                loguru.logger.info(
+                    f"[pv-layer] L{i:02d} pre  sum={_t.sum().item():+.6f} " f"absmax={_t.abs().max().item():.6f}"
                 )
 
             kv_cache = caches[i] if caches else None

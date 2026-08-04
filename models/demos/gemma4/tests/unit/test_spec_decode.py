@@ -922,7 +922,14 @@ def test_export_tt_spec_features(mesh_device, reset_seeds):
         tt_kv_cache=tt_kv_cache,
         page_table_torch=page_table,
         stop_tokens=tokenizer.stop_tokens,
-        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4)),
+        # P = K+1 must keep the packed query rows tile-aligned: the packed verify
+        # builds H_local*P rows and needs (H_local*P) % 32 == 0, i.e. P divisible by
+        # 32 // H_local. E2B has 8 query heads, so H_local = 8 // tp and the smallest
+        # legal P is 4*tp => K = 4*tp - 1 (3 at tp=1, 7 at tp=2, 15 at tp=4).
+        # Hardcoding 4 gave P=5, which is legal at NO mesh shape and blew up at 1x1
+        # with "circular buffers grow to 2005952 B > max L1 1572864 B"
+        # (program.cpp:1717) rather than anything diagnosable.
+        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4 * tuple(mesh_device.shape)[1] - 1)),
     )
 
     generator.prefill_forward_text(in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos)
@@ -1736,7 +1743,11 @@ def test_spec_decode_matches_greedy(mesh_device, reset_seeds):
         tt_kv_cache=tt_kv_cache,
         page_table_torch=page_table,
         stop_tokens=tokenizer.stop_tokens,
-        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4)),
+        # P = K+1 must keep the packed query rows tile-aligned: (H_local*P) % 32 == 0,
+        # i.e. P divisible by 32 // H_local. E2B has 8 query heads so H_local = 8 // tp
+        # and the smallest legal P is 4*tp => K = 4*tp - 1 (3 at tp=1, 7 at tp=2,
+        # 15 at tp=4). The hardcoded 4 gave P=5, legal at NO mesh shape.
+        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4 * tuple(mesh_device.shape)[1] - 1)),
     )
 
     # Reference: prefill, then plain greedy decode.
