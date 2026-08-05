@@ -1639,7 +1639,14 @@ class SpeculativeDecoder:
         um = ttnn.permute(stacked, (0, 1, 3, 2))  # [1,1,B,P]
         stacked.deallocate(True)
         verify_x = ttnn.reshape(um, (1, B * P))
-        um.deallocate(True)
+        # Do NOT deallocate `um`. A ROW_MAJOR reshape is a free VIEW, so verify_x shares
+        # um's storage; freeing um hands that space back to the allocator and the verify's
+        # own allocations reuse it. The verify itself still reads correct data (it consumes
+        # verify_x immediately), which is why the target's argmaxes look sane -- but
+        # verify_x is ALSO a persistent trace OUTPUT, read back after the replay to recover
+        # the anchor + drafts, and by then it reads as zeros. That is the whole 0.00/3:
+        # every draft compared as 0 against a real target id, so nothing ever matched.
+        # Same alias-deallocate bug as the one fixed in masked_embedding._argmax_rows.
         vlogits, vhidden = self.target.ttnn_packed_verify_forward(
             x=verify_x,
             position_idx=tr["v_pos"],
@@ -1811,7 +1818,14 @@ class SpeculativeDecoder:
                 if _FUSED_DBG and len(accepts[b]) < 3:
                     from loguru import logger as _fd
 
-                    _fd.info(f"[fused b{b}] pos={pos[b]} drafts={drafts} target_g={g} m={m}")
+                    # vx[b*P] is the ANCHOR token, which is known non-zero. Printing it
+                    # separates "the drafter produced nothing" from "verify_x assembly or
+                    # readback returns zeros": if the anchor slot is also 0, the whole
+                    # verify_x is zeros and the drafter is not implicated at all.
+                    _fd.info(
+                        f"[fused b{b}] pos={pos[b]} anchor_expected={toks[b]} "
+                        f"vx_row0={int(vx[b * P])} drafts={drafts} target_g={g} m={m}"
+                    )
                 committed = drafts[:m] + [g[m]]
                 # Route through _fused_shift_seed_row instead of hardcoding m+1. The
                 # hardcoded row was the SHIFT seed (hidden at p+m+1) while
