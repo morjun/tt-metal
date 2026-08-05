@@ -151,6 +151,13 @@ class SpeculativeDecoder:
         # two-traces-one-queue hang. Data ordering across the two queues is preserved by
         # the existing _trace_barrier drain at each switch point.
         self._draft_cq = int(os.environ.get("GEMMA4_SPEC_DRAFT_CQ", "0"))
+        # GEMMA4_SPEC_FUSED_PLI_DEV=1 builds PLI on device inside the fused trace,
+        # opting into the 4.38 GiB embed_tokens_per_layer table in DRAM. Off by default
+        # because of that allocation, not because of any correctness doubt.
+        self._fused_pli_device = os.environ.get("GEMMA4_SPEC_FUSED_PLI_DEV", "0") == "1"
+        # GEMMA4_SPEC_PLI_DEV=1: use on-device PLI in the ordinary host-loop packed
+        # verify too (diagnostic / A-B against the host PLI baseline).
+        self._pli_dev_host = os.environ.get("GEMMA4_SPEC_PLI_DEV", "0") == "1"
         # GEMMA4_SPEC_TRACE_BLOCKING=1 replays every trace with blocking=True. This is
         # a DIFFERENT guarantee from the _trace_barrier drain: it waits on that trace's
         # own completion rather than on the device generally, which is what a
@@ -635,8 +642,13 @@ class SpeculativeDecoder:
             embed_idx_sliding=dev["embed"].get("sliding_attention"),
             hot_pt=dev["hot"],
             # E2B/E4B build per-layer inputs on host from the candidate ids.
-            token_ids_host=tokens,
-            pli_stacked=dev.get("pli"),
+            # GEMMA4_SPEC_PLI_DEV=1 instead builds them ON DEVICE from `x`. This is the
+            # same code the fused trace relies on, exercised here in the host loop where
+            # a known-good acceptance baseline exists -- it isolates "is on-device PLI
+            # correct in the real pipeline" from "is the fused body correct".
+            token_ids_host=None if self._pli_dev_host else tokens,
+            pli_stacked=None if self._pli_dev_host else dev.get("pli"),
+            pli_on_device=self._pli_dev_host,
         )
 
     def _verify_packed(self, tokens, positions):
@@ -1186,11 +1198,24 @@ class SpeculativeDecoder:
         forward, so the whole iteration is one device program (this is the eager
         twin of the fused trace). Returns ``(generated_ids, accepts_per_iter)``.
         """
-        if self.target_needs_host_pli:
+        # PLI targets (E2B/E4B) used to be rejected here: the fused iteration argmaxes and
+        # re-embeds its draft tokens on device, so they never reach the host, while PLI is
+        # built on host from the token ids. Gemma4Model.compute_pli_device now builds PLI
+        # ON DEVICE from those same ids (validated to PCC 0.99999 against the host path by
+        # test_pli_device_matches_host), so the fused path is open to them. It is also the
+        # only configuration that avoids the two-traces-one-queue hang by construction --
+        # there is a single trace, so there is nothing to alternate.
+        #
+        # The batch-dim fused body still cannot serve them: only _fused_body_batched routes
+        # through ttnn_packed_verify_forward (which takes pli_on_device); _fused_body uses
+        # ttnn_verify_forward, the batch-dim verify, which we avoid anyway because it
+        # re-loads KV per candidate.
+        if self.target_needs_host_pli and not self._fused_pli_device:
             raise NotImplementedError(
-                "The fused on-device iteration cannot run a per-layer-input target (E2B/E4B): its draft "
-                "tokens are argmaxed and re-embedded on device and never reach the host, but PLI is built "
-                "on host from the token ids. Use generate() (the host loop), or implement on-device PLI."
+                "The fused on-device iteration needs on-device PLI for a per-layer-input target "
+                "(E2B/E4B): its draft tokens are argmaxed and re-embedded on device and never reach "
+                "the host. Set GEMMA4_SPEC_FUSED_PLI_DEV=1 to enable it (costs a 4.38 GiB DRAM table), "
+                "or use generate() (the host loop)."
             )
         if self._use_trace:
             return self._generate_fused_traced(anchor_token, anchor_pos, max_new_tokens)
@@ -1620,6 +1645,10 @@ class SpeculativeDecoder:
             embed_idx_full=None,
             embed_idx_sliding=None,
             hot_pt=None,
+            # The fused trace's candidate ids are produced by the drafter's on-device
+            # argmax and never reach the host, so PLI must be built on device from
+            # `verify_x`. For non-PLI targets this is a no-op.
+            pli_on_device=self.target_needs_host_pli,
         )
         vidx = self._argmax_last(vlogits, rows=B * P)  # [1,1,B*P] uint32 RM
         vlogits.deallocate(True)
@@ -1883,6 +1912,18 @@ class SpeculativeDecoder:
         """
         greedy = not temperature or temperature <= 0
         if self._use_trace:
+            if greedy and self.target_needs_host_pli and self._fused_pli_device:
+                # PLI target with on-device PLI: take the BATCHED fused trace at B=1.
+                # It is the only fused body that routes through
+                # ttnn_packed_verify_forward (the packed verify we require -- the
+                # batch=1 _fused_body uses the batch-dim verify, which re-loads KV per
+                # candidate). One trace, so the two-trace alternation hang cannot occur,
+                # and the K drafter steps chain in-graph with no per-step host
+                # round-trip.
+                outs, accepts = self.generate_batched(
+                    [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
+                )
+                return outs[0], accepts[0]
             if greedy and not self.target_needs_host_pli:
                 return self.generate_fused(anchor_token, anchor_pos, max_new_tokens)
             if greedy:

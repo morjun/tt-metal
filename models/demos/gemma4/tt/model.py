@@ -253,6 +253,8 @@ class Gemma4Model:
     ):
         self.mesh_device = mesh_device
         self.hf_config = hf_config
+        # kept for lazily-built weights (e.g. init_pli_device_weights)
+        self.tensor_cache_path = tensor_cache_path
         self.mesh_config = mesh_config
         self.hidden_size = hf_config.hidden_size
         self.vocab_size = hf_config.vocab_size
@@ -652,6 +654,137 @@ class Gemma4Model:
 
         # Return as list of per-layer tensors
         return [per_layer_inputs[:, :, i, :].to(torch.bfloat16) for i in range(n_layers)]
+
+    # ── on-device per-layer inputs (PLI) ──────────────────────────────────────
+    #
+    # WHY THIS EXISTS. The fully fused speculative iteration (_fused_body /
+    # _fused_body_batched in spec_decode.py) captures the K drafter steps AND the
+    # packed verify in ONE trace: the drafter's argmax/re-embed chain stays on device,
+    # so no draft token ever reaches the host. That is the only configuration measured
+    # to beat plain decode, and it is also immune to the two-traces-one-queue hang
+    # (there is only one trace). It was gated off for E2B/E4B by
+    # ``target_needs_host_pli`` for exactly one reason: PLI is a function of the
+    # candidate token IDS, and host PLI cannot see ids that never leave the device.
+    #
+    # The blocker was assumed to be the 4.38 GiB embed_tokens_per_layer table
+    # ([262144, 35*256] bf16). Measured on a single p150a (32 GB): the table uploads
+    # and ttnn.embedding gathers from it, so the assumption was wrong.
+    #
+    # Mirrors _compute_per_layer_inputs step for step; keep the two in sync.
+
+    def init_pli_device_weights(self):
+        """Upload the PLI weights (incl. the 4.38 GiB embedding table) to DRAM.
+
+        Idempotent. Separate from __init__ because it is a large, opt-in allocation:
+        only the fused on-device iteration needs it.
+        """
+        if getattr(self, "_pli_dev_ready", False):
+            return
+        w = self.per_layer_input_weights
+        if not w:
+            raise ValueError("init_pli_device_weights called on a model without per-layer inputs")
+        pli_size = self.hidden_size_per_layer_input
+        embed_w = w["embed_tokens_per_layer"]  # [vocab_pli, full_n_layers * pli_size]
+        self._pli_full_layers = embed_w.shape[-1] // pli_size
+
+        # ttnn.embedding wants a ROW_MAJOR bf16 weight with leading dims 1.
+        self._pli_embed_tt = ttnn.as_tensor(
+            embed_w.unsqueeze(0).unsqueeze(0),
+            device=self.mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            cache_file_name=get_cache_file_name(self.tensor_cache_path, "pli_embed_table"),
+        )
+        # ttnn.linear(x[..., hidden], w[..., hidden, out]) -> transpose HF's [out, hidden].
+        self._pli_proj_tt = ttnn.as_tensor(
+            w["per_layer_model_projection"].transpose(-2, -1).unsqueeze(0).unsqueeze(0),
+            device=self.mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            cache_file_name=get_cache_file_name(self.tensor_cache_path, "pli_proj_w"),
+        )
+        self._pli_norm_tt = ttnn.as_tensor(
+            w["per_layer_projection_norm"].reshape(1, 1, 1, pli_size),
+            device=self.mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            cache_file_name=get_cache_file_name(self.tensor_cache_path, "pli_norm_w"),
+        )
+        # The host path deliberately does the linear and the norm in fp32; match it,
+        # or the projection drifts (same posture the CME head needed).
+        self._pli_kernel_cfg = ttnn.init_device_compute_kernel_config(
+            self.mesh_device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+        self._pli_dev_ready = True
+
+    def compute_pli_device(self, ids_tt, embeds_tt):
+        """On-device PLI -> [n_layers, 1, rows, pli_size] bf16 TILE (``pli_stacked``).
+
+        Args:
+            ids_tt: [1, rows] uint32 ROW_MAJOR token ids (may be produced in-trace).
+            embeds_tt: [1, 1, rows, hidden] main token embeddings, already on device.
+        """
+        if not getattr(self, "_pli_dev_ready", False):
+            self.init_pli_device_weights()
+        pli_size = self.hidden_size_per_layer_input
+        L = self._pli_full_layers
+        rows = int(embeds_tt.shape[-2])
+        n_layers = len(self.layers)
+
+        # 1. per-layer token embedding, scaled.
+        emb = ttnn.embedding(ids_tt, self._pli_embed_tt, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        if len(emb.shape) == 3:
+            emb = ttnn.unsqueeze_to_4D(emb)  # [1,1,rows,L*pli_size]
+        emb = ttnn.multiply(emb, self.per_layer_embed_scale)
+
+        # 2. projection from the main embeddings, scaled.
+        proj = ttnn.linear(embeds_tt, self._pli_proj_tt, compute_kernel_config=self._pli_kernel_cfg)
+        proj = ttnn.multiply(proj, self.per_layer_model_projection_scale)
+
+        # 3. RMSNorm over each (row, layer)'s pli_size slice. The norm is per layer, so
+        #    fold the layer axis into rows: [1,1,rows,L*pli] -> [1,1,rows*L,pli]. Do the
+        #    reshape in ROW_MAJOR where it is a free view; in TILE it would re-tile.
+        def _fold(t):
+            rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
+            rm = ttnn.reshape(rm, (1, 1, rows * L, pli_size))
+            out = ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(rm)
+            return out
+
+        emb_f, proj_f = _fold(emb), _fold(proj)
+        ttnn.deallocate(emb)
+        ttnn.deallocate(proj)
+        normed = ttnn.rms_norm(
+            proj_f,
+            epsilon=self.hf_config.rms_norm_eps,
+            weight=self._pli_norm_tt,
+            compute_kernel_config=self._pli_kernel_cfg,
+        )
+        ttnn.deallocate(proj_f)
+
+        # 4. combine, then reorder (row, layer) -> (layer, row) to match pli_stacked.
+        combined = ttnn.multiply(ttnn.add(normed, emb_f), self.per_layer_input_scale)
+        ttnn.deallocate(normed)
+        ttnn.deallocate(emb_f)
+        rm = ttnn.to_layout(combined, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(combined)
+        rm = ttnn.reshape(rm, (1, rows, L, pli_size))
+        perm = ttnn.permute(rm, (2, 0, 1, 3))  # [L, 1, rows, pli_size]
+        ttnn.deallocate(rm)
+        if L != n_layers:
+            perm_s = ttnn.slice(perm, [0, 0, 0, 0], [n_layers, 1, rows, pli_size])
+            ttnn.deallocate(perm)
+            perm = perm_s
+        out = ttnn.to_layout(perm, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(perm)
+        return out
 
     def _get_rope_mats(self, layer_idx, seq_len=None, for_decode=False, start_pos=0):
         """Get (cos, sin) for a given layer.
@@ -1249,6 +1382,7 @@ class Gemma4Model:
         token_ids_host=None,
         pli_device_tensors=None,
         pli_stacked=None,
+        pli_on_device=False,
     ):
         """Packed-query speculative verify — all P candidates in ONE batch=1 pass.
 
@@ -1280,12 +1414,25 @@ class Gemma4Model:
             (logits [1,1,P,vocab], hidden [1,1,P,hidden]) — same contract as
             ``ttnn_verify_forward``.
         """
-        if pli_stacked is None:
+        # `pli_on_device` builds PLI below from `x` itself, so the host-ids requirement
+        # this guard enforces does not apply to it.
+        if pli_stacked is None and not pli_on_device:
             pli_device_tensors = self._verify_pli_device_tensors(token_ids_host, pli_device_tensors)
         input_embeds = self.embed_tokens(x)
         if len(input_embeds.shape) == 3:
             input_embeds = ttnn.unsqueeze_to_4D(input_embeds)
         input_embeds = ttnn.to_layout(input_embeds, ttnn.TILE_LAYOUT)
+
+        # pli_on_device: build PLI from `x` right here instead of taking it from host.
+        # This is what unblocks the FUSED single-trace iteration for E2B/E4B: there the
+        # candidate ids are produced by the drafter's on-device argmax and never reach
+        # the host, so host PLI cannot see them. Everything needed is already local --
+        # `x` (the ids) and `input_embeds` (which embed_tokens has ALREADY scaled by
+        # embed_scale, matching what the host path feeds _compute_per_layer_inputs).
+        if pli_on_device and self.hidden_size_per_layer_input:
+            if pli_stacked is not None:
+                raise ValueError("pass either pli_on_device=True or pli_stacked, not both")
+            pli_stacked = self.compute_pli_device(x, input_embeds)
 
         # Pre-gather RoPE once per layer type (identical for all layers of a
         # type — saves 2 embedding gathers per layer).

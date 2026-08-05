@@ -1908,3 +1908,72 @@ def test_packed_verify_writes_correct_kv(mesh_device, reset_seeds):
         )
     )
     assert worst_pcc >= 0.999, f"packed verify's KV cache disagrees with single-token writes: min PCC={worst_pcc:.6f}"
+
+
+def test_pli_device_matches_host(mesh_device, reset_seeds):
+    """On-device PLI must match the host path that currently feeds ``pli_stacked``.
+
+    This is the gate for the FUSED single-trace iteration (_fused_body_batched): that
+    trace keeps the drafter's argmax/re-embed chain on device, so no draft token ever
+    reaches the host and host PLI cannot be built for the verify. On-device PLI is the
+    only thing blocking it -- and the fused trace is the only configuration that both
+    sidesteps the two-traces-one-queue hang (there is nothing to alternate) and is
+    projected to beat plain decode.
+
+    The 4.38 GiB embed_tokens_per_layer table was long assumed to make this impractical;
+    measured on a single p150a it uploads and gathers fine.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+    if not _is_pli_model(model_path):
+        pytest.skip("needs a PLI checkpoint (gemma-4-E2B/E4B)")
+
+    import torch
+
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.tt_transformers.tt.common import PagedAttentionConfig
+
+    max_seq_len, block_size = 1024, 64
+    generator, _, _ = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=PagedAttentionConfig(
+            block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
+        ),
+        bounded_sliding_kv_cache=False,
+    )
+    model = generator.model[0]
+    assert model.hidden_size_per_layer_input and model.per_layer_input_weights
+
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device) if mesh_device.get_num_devices() > 1 else None
+    rows = 4
+    torch.manual_seed(0)
+    ids = torch.randint(0, 1000, (1, rows), dtype=torch.int64)
+    hidden = model.hf_config.hidden_size
+    embeds = torch.randn(1, 1, rows, hidden, dtype=torch.float32) * 0.05
+
+    # Host reference: the exact function that builds pli_stacked today. It returns a
+    # list of [1, rows, pli_size], one per layer.
+    host_list = model._compute_per_layer_inputs(ids, embeds.reshape(1, rows, hidden))
+    host = torch.stack([h.reshape(1, rows, -1).float() for h in host_list], dim=0)
+
+    ids_tt = ttnn.from_torch(
+        ids, device=mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper
+    )
+    emb_tt = ttnn.from_torch(
+        embeds, device=mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper
+    )
+    dev = model.compute_pli_device(ids_tt, emb_tt)
+    got = ttnn.to_torch(ttnn.get_device_tensors(dev)[0]).float()
+
+    logger.info(f"  host={tuple(host.shape)}  device={tuple(got.shape)}")
+    assert tuple(got.shape) == tuple(host.shape), f"shape mismatch: {tuple(got.shape)} vs {tuple(host.shape)}"
+    pcc = torch.corrcoef(torch.stack([host.flatten(), got.flatten()]))[0, 1].item()
+    logger.info(f"  on-device PLI vs host: PCC={pcc:.8f}  max|diff|={(host - got).abs().max().item():.6f}")
+    assert pcc > 0.999, f"on-device PLI disagrees with host: PCC={pcc}"
