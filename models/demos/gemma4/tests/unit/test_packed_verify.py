@@ -122,8 +122,12 @@ def test_packed_verify_matches_sequential(mesh_device, reset_seeds):
     if _is_moe_model(model_path):
         pytest.skip(_MOE_UNSUPPORTED_REASON)
 
-    if _is_pli_model(model_path):
-        pytest.skip(_PLI_UNSUPPORTED_REASON)
+    # NOTE: this used to skip PLI checkpoints, on the grounds that it "calls
+    # ttnn_packed_verify_forward directly, passing neither token_ids_host nor
+    # pli_stacked". That is not what it does -- it goes through spec._verify(), which
+    # supplies PLI for both the single-token and packed paths. The skip meant packed-vs-
+    # sequential equivalence was NEVER checked on E2B, which is exactly where the
+    # generated text was later found to diverge from plain decode.
 
     # Single-device (TP=1) is unsupported for packed verify on the 12B model: the
     # global layers (global_head_dim=512) run the packed SDPA with fp32_dest_acc_en
@@ -132,7 +136,11 @@ def test_packed_verify_matches_sequential(mesh_device, reset_seeds):
     # 1.5 MB L1 (~2.8 MB). Capping the reduction fan-in fits L1 but deadlocks the SDPA
     # kernel on-device. Supported on multi-device (TP) meshes, where TP shrinks the
     # per-core packed-head footprint ~TP×.
-    if mesh_device.get_num_devices() == 1:
+    # The limit above is specific to the 12B/31B global layers (head_dim=512). E2B's
+    # packed verify runs fine at 1x1 -- the whole single-device speculative path depends
+    # on it -- so gating every single-device run behind this was too broad and is what
+    # kept the equivalence check from ever running on E2B.
+    if mesh_device.get_num_devices() == 1 and not _is_pli_model(model_path):
         pytest.skip(
             "single-device L1 limit: 12B global-layer packed SDPA exceeds single-device L1 (use a TP mesh, e.g. 1x4)"
         )
@@ -174,7 +182,10 @@ def test_packed_verify_matches_sequential(mesh_device, reset_seeds):
         tt_kv_cache=tt_kv_cache,
         page_table_torch=page_table,
         stop_tokens=tokenizer.stop_tokens,
-        draft_len=4,
+        # P = draft_len+1 must keep the packed rows tile-aligned: (H_local*P) % 32 == 0
+        # with H_local = 8 // tp, so the smallest legal P is 4*tp => draft_len = 4*tp - 1
+        # (3 at tp=1, 7 at tp=2, 15 at tp=4). Hardcoding 4 gives P=5, legal at NO shape.
+        draft_len=4 * tuple(mesh_device.shape)[1] - 1,
     )
     P = spec.draft_len + 1
 
@@ -1977,3 +1988,106 @@ def test_pli_device_matches_host(mesh_device, reset_seeds):
     pcc = torch.corrcoef(torch.stack([host.flatten(), got.flatten()]))[0, 1].item()
     logger.info(f"  on-device PLI vs host: PCC={pcc:.8f}  max|diff|={(host - got).abs().max().item():.6f}")
     assert pcc > 0.999, f"on-device PLI disagrees with host: PCC={pcc}"
+
+
+def test_decode_forward_matches_verify_forward(mesh_device, reset_seeds):
+    """`generator.decode_forward` (what the vanilla demo runs) must agree token-for-token
+    with `spec._verify` (what the whole spec-decode stack is built on).
+
+    This link was NEVER tested. `test_packed_verify_matches_sequential` proves
+    packed == sequential verify (12/12 exact), and every "plain greedy" reference in the
+    test suite (`_plain_greedy`) is itself `spec._verify` — so the suite compares the
+    verify path against itself. Meanwhile the DEMO's vanilla decode calls
+    `generator.decode_forward` -> `ttnn_decode_forward`, a different implementation.
+
+    Measured end to end, vanilla and spec decode generate identical text for ~197
+    characters and then diverge at exactly the same point on every run. Since the packed
+    fold is exact, the divergence has to live in this untested link.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size, n_tok = 1024, 64, 16
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    page_table = create_tt_page_table(1, pac)
+    spec = SpeculativeDecoder(
+        target_model=generator.model[0],
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=4 * tuple(mesh_device.shape)[1] - 1,
+    )
+
+    prompt = "Write a detailed technical explanation of how a modern CPU instruction pipeline works."
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, n_tok, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    anchor_pos = prefill_lens[0] - 1
+    anchor_token = int(encoded[0][anchor_pos])
+
+    def _prefill():
+        generator.prefill_forward_text(
+            in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+        )
+
+    # ── path A: generator.decode_forward, exactly as the vanilla demo drives it
+    _prefill()
+    dec = []
+    out_tok = torch.tensor([[anchor_token]], dtype=torch.int32)
+    cur = torch.tensor([anchor_pos], dtype=torch.int32)
+    for _ in range(n_tok):
+        # GEMMA4_DV_TRACE=1 runs the TRACED decode, which is what the vanilla demo
+        # actually uses (its parametrization sets enable_trace=True). Untraced vs traced
+        # decode is the last untested difference between the demo's vanilla path and
+        # everything the spec stack is validated against.
+        logits, _ = generator.decode_forward(
+            out_tok,
+            cur,
+            enable_trace=os.environ.get("GEMMA4_DV_TRACE") == "1",
+            page_table=page_table,
+            kv_cache=tt_kv_cache,
+            sampling_params=None,
+        )
+        t = int(torch.argmax(torch.as_tensor(logits).reshape(-1)))
+        dec.append(t)
+        out_tok = torch.tensor([[t]], dtype=torch.int32)
+        cur = cur + 1
+
+    # ── path B: spec._verify (the spec stack's notion of greedy)
+    _prefill()
+    ver = []
+    tok, pos = anchor_token, anchor_pos
+    for _ in range(n_tok):
+        lg, h = spec._verify([tok], [pos])
+        h.deallocate(True)
+        tok = int(torch.argmax(lg[0]))
+        ver.append(tok)
+        pos += 1
+
+    logger.info(f"decode_forward : {dec}")
+    logger.info(f"verify_forward : {ver}")
+    n_match = sum(1 for a, b in zip(dec, ver) if a == b)
+    first = next((i for i, (a, b) in enumerate(zip(dec, ver)) if a != b), None)
+    logger.info(f"match {n_match}/{n_tok}" + (f", first divergence at step {first}" if first is not None else ""))
+    assert dec == ver, f"decode_forward diverges from verify_forward at step {first}: {dec} vs {ver}"
