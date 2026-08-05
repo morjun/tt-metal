@@ -33,6 +33,8 @@ import torch
 import ttnn
 from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
 
+_FUSED_DBG = os.environ.get("GEMMA4_SPEC_FUSED_DEBUG") == "1"
+
 
 def _to_probs(logits_row, temperature, top_p, top_k):
     """torch logits [vocab] -> probability vector [vocab] under temp/top-p/top-k.
@@ -1550,6 +1552,11 @@ class SpeculativeDecoder:
             embed_idx_full=None,
             embed_idx_sliding=None,
             hot_pt=None,
+            # Eager batched verify: PLI on device for PLI targets. (The eager batched
+            # DRAFTER round-trips its per-step argmax through the host, so this path
+            # could also use host PLI, but keeping one PLI source avoids a second
+            # divergence while debugging the fused body.)
+            pli_on_device=self.target_needs_host_pli,
         )
         lh = self._logits_to_host(logits).reshape(B * P, -1)
         logits.deallocate(True)
@@ -1801,8 +1808,23 @@ class SpeculativeDecoder:
                 drafts = [int(vx[b * P + 1 + j]) for j in range(K)]
                 g = [gids[b * P + j] for j in range(P)]
                 m = next((i for i in range(K) if drafts[i] != g[i]), K)
+                if _FUSED_DBG and len(accepts[b]) < 3:
+                    from loguru import logger as _fd
+
+                    _fd.info(f"[fused b{b}] pos={pos[b]} drafts={drafts} target_g={g} m={m}")
                 committed = drafts[:m] + [g[m]]
-                rows_b.append(min(m + 1, K))
+                # Route through _fused_shift_seed_row instead of hardcoding m+1. The
+                # hardcoded row was the SHIFT seed (hidden at p+m+1) while
+                # _fused_shift_seed already defaults to "current" (row m) -- so this
+                # loop silently ignored the setting and used the one seed contract the
+                # MTP reference says is misaligned. HF's
+                # SinglePositionMultiTokenCandidateGenerator pairs
+                # hidden_states[-1][:, n_matches:n_matches+1] with input_ids[:, -1:],
+                # i.e. the feature LAGS the token by one, making row m exact. Feeding
+                # row m+1 hands the drafter a feature for a token it was not given,
+                # which is why the fused path accepted 0.00/3 while the host loop
+                # (seed_mode=cur, the same contract) accepted ~1.1/3.
+                rows_b.append(self._fused_shift_seed_row(m, K))
                 if done[b]:
                     continue
                 accepts[b].append(m)
@@ -1920,6 +1942,25 @@ class SpeculativeDecoder:
                 # candidate). One trace, so the two-trace alternation hang cannot occur,
                 # and the K drafter steps chain in-graph with no per-step host
                 # round-trip.
+                # Force the PLI weight upload BEFORE any trace capture. It is lazy in
+                # compute_pli_device, and the first call happens inside the fused
+                # capture -- a 4.38 GiB host write during capture, which is illegal and
+                # fails silently rather than loudly.
+                self.target.init_pli_device_weights()
+                # GEMMA4_SPEC_FUSED_EAGER=1 runs the SAME on-device drafter chain +
+                # packed verify without a trace. Discriminates "the on-device CME
+                # drafter chain is broken" from "it is broken only under trace capture".
+                # CME + fused has never been exercised: the fused path was gated off for
+                # PLI targets, and E2B is the only CME model.
+                if os.environ.get("GEMMA4_SPEC_FUSED_EAGER") == "1":
+                    _saved, self._use_trace = self._use_trace, False
+                    try:
+                        outs, accepts = self.generate_batched(
+                            [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
+                        )
+                    finally:
+                        self._use_trace = _saved
+                    return outs[0], accepts[0]
                 outs, accepts = self.generate_batched(
                     [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
                 )
