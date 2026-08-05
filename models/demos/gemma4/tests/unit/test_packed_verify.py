@@ -2332,7 +2332,14 @@ def test_junk_chain_kv_matches_reference_chain(mesh_device, reset_seeds):
         draft_len=K,
     )
 
-    prompt = "Write a detailed technical explanation of how a modern CPU instruction pipeline works."
+    # Prompt is overridable so this can be bisected against
+    # test_rejected_draft_kv_does_not_corrupt_commit, which fails at step 27 and uses a
+    # DIFFERENT default prompt. Same draft_len (3); its n_steps is 40 vs 30 here, but 27
+    # falls inside both.
+    prompt = os.environ.get(
+        "GEMMA4_XCHAIN_PROMPT",
+        "Write a detailed technical explanation of how a modern CPU instruction pipeline works.",
+    )
     in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
         [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
     )
