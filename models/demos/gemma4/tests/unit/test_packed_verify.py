@@ -2195,3 +2195,86 @@ def test_junk_draft_write_does_not_touch_committed_kv(mesh_device, reset_seeds):
         f"a junk-draft packed verify MODIFIED committed KV (below the row-0 mask bound) "
         f"first at step {first_bad_step}"
     )
+
+
+def test_row0_logits_independent_of_junk_drafts(mesh_device, reset_seeds):
+    """Row 0 of the packed verify must not depend on what sits in rows 1..K.
+
+    Row 0's additive mask bounds it at j <= pos, and the junk drafts occupy pos+1..pos+K,
+    so row 0 is mathematically isolated from them. Committed KV was measured unchanged by
+    junk writes over 30 steps, and the packed fold is exact (12/12 vs sequential), so if
+    row 0 still moves when the junk CONTENT changes, the mask is not isolating it at
+    compute time -- which is the remaining candidate for the demo divergence.
+
+    Compares three calls at the same position over the same KV:
+      ref = _verify([tok])                      single-token (no packing)
+      p1  = _verify([tok, 1, 2, 3])             junk set A
+      p2  = _verify([tok, 900, 901, 902])       junk set B
+    p1 vs p2 is the sharp one: same row 0, same KV, only the junk differs.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size = 1024, 64
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    page_table = create_tt_page_table(1, pac)
+    K = 4 * tuple(mesh_device.shape)[1] - 1
+    spec = SpeculativeDecoder(
+        target_model=generator.model[0],
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=K,
+    )
+
+    prompt = "Write a detailed technical explanation of how a modern CPU instruction pipeline works."
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    pos = prefill_lens[0] - 1
+    tok = int(encoded[0][pos])
+    generator.prefill_forward_text(
+        in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+    )
+
+    def _row0(tokens):
+        lh, h = spec._verify(tokens, [pos + j for j in range(len(tokens))])
+        h.deallocate(True)
+        return torch.as_tensor(lh[0]).float().clone()
+
+    ref = _row0([tok])
+    p1 = _row0([tok] + [1, 2, 3][:K])
+    p2 = _row0([tok] + [900, 901, 902][:K])
+
+    for name, a, b in (("ref vs junkA", ref, p1), ("ref vs junkB", ref, p2), ("junkA vs junkB", p1, p2)):
+        d = (a - b).abs()
+        logger.info(
+            f"  {name:15s} max|diff|={d.max().item():.6f}  argmax {int(a.argmax())} vs {int(b.argmax())}"
+            f"  {'SAME' if int(a.argmax()) == int(b.argmax()) else 'DIFFER'}"
+        )
+    dj = (p1 - p2).abs().max().item()
+    assert dj == 0.0, (
+        f"row 0 depends on the JUNK in rows 1..K (max|diff|={dj}) — the additive mask is not "
+        "isolating row 0 from positions pos+1..pos+K at compute time"
+    )
