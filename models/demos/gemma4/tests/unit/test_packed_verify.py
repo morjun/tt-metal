@@ -2091,3 +2091,107 @@ def test_decode_forward_matches_verify_forward(mesh_device, reset_seeds):
     first = next((i for i, (a, b) in enumerate(zip(dec, ver)) if a != b), None)
     logger.info(f"match {n_match}/{n_tok}" + (f", first divergence at step {first}" if first is not None else ""))
     assert dec == ver, f"decode_forward diverges from verify_forward at step {first}: {dec} vs {ver}"
+
+
+def test_junk_draft_write_does_not_touch_committed_kv(mesh_device, reset_seeds):
+    """A packed verify carrying REJECTED drafts must not disturb committed KV.
+
+    test_rejected_draft_kv_does_not_corrupt_commit fails at step 27 even though every
+    forward path is now proven exactly equivalent (packed vs sequential 12/12,
+    decode vs verify 16/16) and no drafter is involved. Row 0 of the packed verify is
+    masked to j <= pos, so junk written at pos+1..pos+K should be unreachable. Either the
+    mask does not exclude it, or the WRITE reaches positions <= pos.
+
+    This snapshots the de-paged KV for every committed position before and after a single
+    junk-carrying packed verify and reports exactly which positions changed.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tests.unit.test_spec_decode import _depage
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size = 1024, 64
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    target = generator.model[0]
+    page_table = create_tt_page_table(1, pac)
+    K = 4 * tuple(mesh_device.shape)[1] - 1
+    spec = SpeculativeDecoder(
+        target_model=target,
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=K,
+    )
+
+    prompt = "Write a detailed technical explanation of how a modern CPU instruction pipeline works."
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    pos = prefill_lens[0] - 1
+    tok = int(encoded[0][pos])
+    generator.prefill_forward_text(
+        in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+    )
+
+    def _snap(n):
+        out = {}
+        for lt, idx in target.last_kv_layer_by_type.items():
+            kc, vc = target.tt_kv_cache[idx]
+            rep = lt == "full_attention"
+            out[lt] = (
+                _depage(kc, page_table, n, block_size, mesh_device, rep),
+                _depage(vc, page_table, n, block_size, mesh_device, rep),
+            )
+        return out
+
+    # A SINGLE junk write was measured clean (0 committed positions changed), so the mask
+    # and the write are each correct in isolation. The corruption only shows at step 27,
+    # i.e. it is CUMULATIVE. Walk the chain and report the first step at which any
+    # committed position (strictly below the row-0 mask bound) changes.
+    n_steps = int(os.environ.get("GEMMA4_KVDUMP_STEPS", "30"))
+    first_bad_step = None
+    for step in range(n_steps):
+        before = _snap(pos)
+        lh, h = spec._verify([tok] + [1, 2, 3][:K], [pos + j for j in range(K + 1)])
+        h.deallocate(True)
+        after = _snap(pos)
+        hits = []
+        for lt in before:
+            for name, b, a in (("K", before[lt][0], after[lt][0]), ("V", before[lt][1], after[lt][1])):
+                d = (a - b).abs()
+                per_pos = d.amax(dim=(0, 1, 3)) if d.dim() == 4 else d.reshape(d.shape[-2], -1).amax(-1)
+                ch = (per_pos > 0).nonzero().flatten().tolist()
+                if ch:
+                    hits.append((lt, name, ch[:8], d.max().item()))
+        if hits and first_bad_step is None:
+            first_bad_step = step
+            logger.info(f"  >>> FIRST committed-KV change at step {step} (pos={pos}): {hits}")
+        # advance one token exactly as the failing test does: commit row 0's argmax
+        tok = int(torch.argmax(lh[0]))
+        pos += 1
+    if first_bad_step is None:
+        logger.info(f"  committed KV never changed over {n_steps} steps")
+    assert first_bad_step is None, (
+        f"a junk-draft packed verify MODIFIED committed KV (below the row-0 mask bound) "
+        f"first at step {first_bad_step}"
+    )
