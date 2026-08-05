@@ -90,7 +90,18 @@ def load_and_cache_context(context_url, cache_dir, max_length=None):
 
 
 def load_inputs(user_input, batch, instruct):
-    """Load prompts from a json file (optionally fetching a gutenberg context), repeated to `batch`."""
+    """Load prompts from a json file (optionally fetching a gutenberg context), repeated to `batch`.
+
+    GEMMA4_PROMPT overrides the file entirely. This exists so plain decode and
+    speculative decode can be run on the SAME prompt: the spec-decode entry point takes
+    GEMMA4_SPEC_PROMPT, but test_demo_text had no override at all and always used its
+    parametrized json, so the two were never a matched comparison. Greedy speculative
+    decode is supposed to emit exactly what plain greedy emits, and that is only
+    checkable on identical input.
+    """
+    _override = os.getenv("GEMMA4_PROMPT")
+    if _override:
+        user_input = [{"prompt": _override} for _ in range(max(batch, 1))]
     if isinstance(user_input, str):
         with open(user_input, "r") as f:
             user_input = json.load(f)
