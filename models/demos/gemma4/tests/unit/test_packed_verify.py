@@ -2278,3 +2278,115 @@ def test_row0_logits_independent_of_junk_drafts(mesh_device, reset_seeds):
         f"row 0 depends on the JUNK in rows 1..K (max|diff|={dj}) — the additive mask is not "
         "isolating row 0 from positions pos+1..pos+K at compute time"
     )
+
+
+def test_junk_chain_kv_matches_reference_chain(mesh_device, reset_seeds):
+    """CROSS-CHAIN KV comparison — the check nothing else does.
+
+    Every within-chain and single-step comparison passes exactly (fold 12/12,
+    decode-vs-verify 16/16, row 0 bit-identical under differing junk, committed KV below
+    the write range untouched). But the earlier within-chain KV test only inspected
+    positions 0..pos-1 while the verify writes pos..pos+K, so it excluded position `pos`
+    itself — the one the previous step wrote as JUNK (row 1) and this step rewrites as the
+    committed token (row 0).
+
+    Here both chains are run separately over their own prefill, snapshotting KV for all
+    committed positions after every step, and compared step by step. If the junk chain's
+    KV at `pos` ever differs from the reference chain's, that is the step-27 divergence.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tests.unit.test_spec_decode import _depage
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size = 1024, 64
+    n_steps = int(os.environ.get("GEMMA4_XCHAIN_STEPS", "30"))
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    target = generator.model[0]
+    page_table = create_tt_page_table(1, pac)
+    K = 4 * tuple(mesh_device.shape)[1] - 1
+    spec = SpeculativeDecoder(
+        target_model=target,
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=K,
+    )
+
+    prompt = "Write a detailed technical explanation of how a modern CPU instruction pipeline works."
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    p0 = prefill_lens[0] - 1
+    t0 = int(encoded[0][p0])
+
+    def _prefill():
+        generator.prefill_forward_text(
+            in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+        )
+
+    def _snap(n):
+        out = {}
+        for lt, idx in target.last_kv_layer_by_type.items():
+            kc, vc = target.tt_kv_cache[idx]
+            rep = lt == "full_attention"
+            out[lt] = (
+                _depage(kc, page_table, n, block_size, mesh_device, rep),
+                _depage(vc, page_table, n, block_size, mesh_device, rep),
+            )
+        return out
+
+    def _run(junk):
+        _prefill()
+        spec._pv_a_prev = -1
+        snaps, toks, tok, pos = [], [], t0, p0
+        for _ in range(n_steps):
+            tokens = [tok] + ([1, 2, 3][:K] if junk else [])
+            lh, h = spec._verify(tokens, [pos + j for j in range(len(tokens))])
+            h.deallocate(True)
+            tok = int(torch.argmax(torch.as_tensor(lh[0])))
+            toks.append(tok)
+            snaps.append(_snap(pos + 1))  # committed positions 0..pos INCLUSIVE
+            pos += 1
+        return snaps, toks
+
+    ref_s, ref_t = _run(False)
+    jnk_s, jnk_t = _run(True)
+
+    first_kv, first_tok = None, None
+    for i in range(n_steps):
+        for lt in ref_s[i]:
+            for nm in (0, 1):
+                d = (ref_s[i][lt][nm] - jnk_s[i][lt][nm]).abs()
+                if d.max().item() > 0 and first_kv is None:
+                    per = d.amax(dim=(0, 1, 3)) if d.dim() == 4 else d.reshape(d.shape[-2], -1).amax(-1)
+                    ch = (per > 0).nonzero().flatten().tolist()
+                    first_kv = (i, lt, "K" if nm == 0 else "V", ch[:8], d.max().item())
+        if ref_t[i] != jnk_t[i] and first_tok is None:
+            first_tok = (i, ref_t[i], jnk_t[i])
+
+    logger.info(f"  first KV difference : {first_kv}")
+    logger.info(f"  first token difference: {first_tok}")
+    assert (
+        first_kv is None and first_tok is None
+    ), f"junk chain diverges from the single-token reference chain: KV={first_kv}, token={first_tok}"
