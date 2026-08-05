@@ -769,6 +769,28 @@ def _packed_fill_kv_loopfree_embed(cache, staging, new_seq, embed_idx, hot_pt):
     merged = ttnn.to_memory_config(merged, dram)  # [1, nkv, S2, hd]
 
     # ② persist updated hot blocks for next step, then ③ one fill launch.
+    if os.environ.get("GEMMA4_KV_MERGE_FP") == "1":
+        # Is the loop-free merge value-PRESERVING? Every step is nominally data movement
+        # (embedding row-gather, assign, paged_fill_cache) and copies do not round. Note
+        # ttnn.embedding above is called WITHOUT an explicit dtype=, so its output dtype is
+        # whatever the op defaults to -- if that differs from new_seq's dtype, the merge
+        # casts and THAT is the 1-ULP source. If instead the new rows survive exactly, the
+        # divergence comes from the P-row projection/RoPE upstream, not from the write.
+        pass
+
+        _rn = ttnn.to_torch(ttnn.get_device_tensors(new_seq)[0])
+        _rm = ttnn.to_torch(ttnn.get_device_tensors(merged)[0])
+        _n_new = new_seq.shape[2]
+        _tail = _rn.reshape(-1, _rn.shape[-1])[-_n_new:].float()
+        _mflat = _rm.reshape(-1, _rm.shape[-1]).float()
+        _res = [float((_mflat - _tail[i]).abs().amax(-1).min()) for i in range(_n_new)]
+        logger.info(
+            f"[kv-merge] dtypes new_seq={new_seq.dtype} merged={merged.dtype} "
+            f"staging={staging.dtype} cache={cache.dtype} | "
+            f"new-row residuals={['%.8f' % r for r in _res]} "
+            f"-> {'EXACT (pure copy)' if max(_res) == 0.0 else 'ROUNDED (cast inside the merge)'}"
+        )
+
     ttnn.assign(merged, staging)
     ttnn.experimental.paged_fill_cache(cache, merged, hot_pt, batch_idx=0)
     ttnn.deallocate(merged)
