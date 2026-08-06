@@ -2487,3 +2487,109 @@ def test_pli_device_row_count_invariant(mesh_device, reset_seeds):
         f"differ (max {d.max().item()}). Plain decode computes PLI with 1 row and the packed "
         f"verify with P, so they disagree even using the same function."
     )
+
+
+def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
+    """Cross-chain against the FUSED path — the configuration the demo actually runs.
+
+    Every existing cross-chain test drives ``spec._verify()``, i.e. the HOST-loop packed
+    verify. The demo's spec run uses the fused path (generate_batched ->
+    _fused_body_batched), which no test covers and which differs in three concrete ways: it
+    writes KV with paged_update_cache per position instead of the loop-free staging merge, it
+    chains the drafter on device, and it assembles at B=1 batched.
+
+    This runs plain decode and the fused path over the SAME prefill in ONE process and
+    reports the first differing token, so the residual char-197 divergence can be bisected
+    with GEMMA4_STAGE_AT at the right iteration.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+    if not _is_pli_model(model_path):
+        pytest.skip("needs a PLI checkpoint (gemma-4-E2B/E4B)")
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.common import create_assistant_model
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    max_seq_len, block_size = 1024, 64
+    n_new = int(os.environ.get("GEMMA4_FUSED_XCHAIN_TOKENS", "60"))
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    page_table = create_tt_page_table(1, pac)
+    _target = generator.model[0]
+    _, assistant = create_assistant_model(
+        mesh_device=mesh_device,
+        target_model=_target,
+        mesh_config=_target.mesh_config,
+        ccl_manager=_target.ccl_manager,
+        assistant_path=os.getenv("GEMMA4_ASSISTANT_MODEL"),
+    )
+    spec = SpeculativeDecoder(
+        target_model=generator.model[0],
+        assistant_model=assistant,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=4 * tuple(mesh_device.shape)[1] - 1,
+    )
+
+    prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Tell me about the history of computing in three sentences.")
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, n_new, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    p0 = prefill_lens[0] - 1
+    t0 = int(encoded[0][p0])
+
+    def _prefill():
+        generator.prefill_forward_text(
+            in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+        )
+
+    # A: plain decode, exactly as the vanilla demo drives it
+    _prefill()
+    plain, tok, cur = [], torch.tensor([[t0]], dtype=torch.int32), torch.tensor([p0], dtype=torch.int32)
+    for _ in range(n_new):
+        lg, _ = generator.decode_forward(
+            tok, cur, enable_trace=False, page_table=page_table, kv_cache=tt_kv_cache, sampling_params=None
+        )
+        t = int(torch.argmax(torch.as_tensor(lg).reshape(-1)))
+        plain.append(t)
+        tok = torch.tensor([[t]], dtype=torch.int32)
+        cur = cur + 1
+        if t in spec.stop_tokens:
+            break
+
+    # B: the FUSED path
+    _prefill()
+    spec._pv_a_prev = -1
+    outs, _acc = spec.generate_batched([t0], [p0], n_new, max_seq_len)
+    fused = outs[0]
+
+    n = min(len(plain), len(fused))
+    i = next((k for k in range(n) if plain[k] != fused[k]), None)
+    logger.info(f"  plain={len(plain)} tokens  fused={len(fused)} tokens")
+    logger.info(f"  plain[:12] = {plain[:12]}")
+    logger.info(f"  fused[:12] = {fused[:12]}")
+    if i is None:
+        logger.info(f"  IDENTICAL over the {n} shared tokens")
+    else:
+        logger.info(f"  FIRST differing token at index {i}: plain={plain[i]} fused={fused[i]}")
+        logger.info(f"    plain[{max(0,i-3)}:{i+3}] = {plain[max(0,i-3):i+3]}")
+        logger.info(f"    fused[{max(0,i-3)}:{i+3}] = {fused[max(0,i-3):i+3]}")
+    assert i is None, f"fused path diverges from plain decode at token {i}: {plain[i]} vs {fused[i]}"
