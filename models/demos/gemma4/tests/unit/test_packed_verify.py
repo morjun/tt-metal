@@ -2153,6 +2153,11 @@ def test_junk_draft_write_does_not_touch_committed_kv(mesh_device, reset_seeds):
         in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
     )
 
+    # GEMMA4_XCHAIN_ALL_LAYERS=1 snapshots EVERY layer's KV, not just the last of each
+    # type. The narrow version reported "first KV difference at step 22", but the K handed
+    # to the write was measured to diverge at step 22 layer-slot 11 -- i.e. layer 11's
+    # INPUT already differed, so some earlier layer's KV had drifted at an earlier step and
+    # was simply never sampled. Only an all-layer sweep finds the true origin.
     def _snap(n):
         out = {}
         for lt, idx in target.last_kv_layer_by_type.items():
@@ -2352,8 +2357,20 @@ def test_junk_chain_kv_matches_reference_chain(mesh_device, reset_seeds):
             in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
         )
 
+    _all_layers = os.environ.get("GEMMA4_XCHAIN_ALL_LAYERS") == "1"
+
     def _snap(n):
         out = {}
+        if _all_layers:
+            for li in range(len(target.tt_kv_cache)):
+                kc, vc = target.tt_kv_cache[li]
+                lt = next((t for t, i in target.last_kv_layer_by_type.items() if i == li), None)
+                rep = lt == "full_attention" if lt else (li % 6 == 5)
+                out[f"L{li:02d}"] = (
+                    _depage(kc, page_table, n, block_size, mesh_device, rep),
+                    _depage(vc, page_table, n, block_size, mesh_device, rep),
+                )
+            return out
         for lt, idx in target.last_kv_layer_by_type.items():
             kc, vc = target.tt_kv_cache[idx]
             rep = lt == "full_attention"

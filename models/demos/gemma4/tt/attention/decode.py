@@ -14,6 +14,7 @@ from loguru import logger
 import ttnn
 
 from .operations import (
+    _stage_fp,
     apply_allreduce,
     apply_output_projection,
     apply_per_head_norm,
@@ -341,6 +342,7 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    _stage_fp("6:sdpa_out", tt_sdpa)
     tt_q.deallocate(True)
 
     # 7. Concat heads + output projection + allreduce
@@ -791,6 +793,34 @@ def _packed_fill_kv_loopfree_embed(cache, staging, new_seq, embed_idx, hot_pt):
             f"-> {'EXACT (pure copy)' if max(_res) == 0.0 else 'ROUNDED (cast inside the merge)'}"
         )
 
+    if os.environ.get("GEMMA4_STAGING_DBG") == "1":
+        # The staging invariant. embed_idx decides, per destination slot j, whether the
+        # merged hot block COPIES FROM STAGING (idx < S2, i.e. keeps last step's bytes) or
+        # PULLS FROM new_seq (idx >= S2, i.e. this step's freshly computed K/V).
+        #
+        # Compute and the write are both proven bit-exact, and the divergence only appears
+        # at step 22 — so it has to be state carried across iterations, and staging is the
+        # only such state. If any of the P positions the verify is writing is mapped to
+        # STAGING rather than new_seq, that position silently keeps the PREVIOUS step's
+        # value, which for a rejected-draft slot is junk.
+        #
+        # Invariant: the set of new_seq rows actually pulled must be exactly {0..n_new-1},
+        # each used once. A missing row = a position never refreshed.
+        import torch as _t
+        from loguru import logger as _lg
+
+        _idx = ttnn.to_torch(ttnn.get_device_tensors(embed_idx)[0]).flatten().to(_t.int64)
+        _n_new = new_seq.shape[2]
+        _h0 = _idx[:S2]  # head 0 slots; per-head offset is h*(S2+n_new), zero for h=0
+        _from_new = (_h0 >= S2).nonzero().flatten().tolist()
+        _rows = sorted({int(_h0[j]) - S2 for j in _from_new})
+        _ok = _rows == list(range(_n_new))
+        _lg.info(
+            f"[staging] S2={S2} n_new={_n_new} slots_from_new={_from_new[:8]} "
+            f"n_slots={len(_from_new)} rows_used={_rows[:8]} "
+            f"{'OK' if _ok else 'ANOMALY: new_seq rows not all pulled exactly once'}"
+        )
+
     ttnn.assign(merged, staging)
     ttnn.experimental.paged_fill_cache(cache, merged, hot_pt, batch_idx=0)
     ttnn.deallocate(merged)
@@ -1049,6 +1079,7 @@ def packed_decode_forward(
         eff_bs_sdpa,
         nkv_local,
     )
+    _stage_fp("6:sdpa_out", tt_sdpa)
     ttnn.deallocate(q_packed)
 
     # ── ⑦ Unpack head-major SDPA output → concat heads + o_proj + AR ────────

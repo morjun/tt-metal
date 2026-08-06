@@ -47,10 +47,17 @@ PREFILL_SLIDING_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_SLIDING_CHUNK_SI
 # position in both, so its bytes must match; the first stage where they do not is where
 # the 1 ULP is introduced.
 _STAGE_FP = os.environ.get("GEMMA4_STAGE_FP") == "1"
+# Restrict to one stage: the readback is per-layer-per-step, so fingerprinting all five
+# stages over 25 steps x 2 chains is far too slow. "5" = the RoPE output, i.e. the K
+# handed to the KV write -- identical there means the compute is fine and the drift is in
+# the write/staging; different means the compute diverged.
+_STAGE_ONLY = os.environ.get("GEMMA4_STAGE_ONLY")
 
 
 def _stage_fp(tag, t):
     if not _STAGE_FP or t is None:
+        return
+    if _STAGE_ONLY and not tag.startswith(_STAGE_ONLY):
         return
     import hashlib
 
