@@ -2061,6 +2061,25 @@ class Gemma4Model:
         if pli_combined is None:
             pli_combined = self._decode_pli_combined
 
+        # GEMMA4_DECODE_PLI_DEV=1: compute PLI ON DEVICE here, the same way the fused
+        # speculative path does, instead of uploading a host-computed pli_combined.
+        #
+        # This exists for PARITY. Spec decode's fused path must use device PLI (its candidate
+        # ids never reach the host), while plain decode used host PLI, and the two differ by
+        # ~1 bf16 ULP -- enough to flip a committed token ~17 steps later. Making the two
+        # implementations agree bit-for-bit is not achievable (device and host matmuls use
+        # different reduction orders; forcing fp32 weights closed only half the gap and cost
+        # 36% throughput). Having BOTH paths run the SAME device computation makes them
+        # identical by construction instead, at no throughput cost.
+        _pli_stacked = None
+        if os.environ.get("GEMMA4_DECODE_PLI_DEV") == "1" and self.hidden_size_per_layer_input:
+            _ids = x if x.dtype in (ttnn.uint32, ttnn.int32) else None
+            if _ids is not None:
+                if len(_ids.shape) == 4:
+                    _ids = ttnn.reshape(_ids, (1, _ids.shape[-1]))
+                _pli_stacked = self.compute_pli_device(_ids, input_embeds)
+                pli_combined = None
+
         logits = self(
             hidden_states=input_embeds,
             position_idx=current_pos,
@@ -2070,6 +2089,7 @@ class Gemma4Model:
             token_index=token_index,
             position_idx_cache=position_idx_cache,
             pli_combined=ttnn.to_layout(pli_combined, ttnn.TILE_LAYOUT) if pli_combined is not None else None,
+            pli_stacked=_pli_stacked,
             page_tables_per_layer=page_tables_per_layer,
         )
 
