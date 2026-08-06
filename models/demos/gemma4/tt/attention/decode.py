@@ -342,6 +342,20 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    _log_sdpa_call(
+        "PLAIN",
+        is_causal=True,
+        q=tt_q,
+        k=k_cache,
+        cur_pos=cache_pos,
+        sliding_window=sliding_window,
+        grid=f"{sdpa_grid.x}x{sdpa_grid.y}",
+        q_chunk=32,
+        k_chunk=64,
+        exp_approx=False,
+        max_cores="(default)",
+        mask="(internal)",
+    )
     _stage_fp("7:sdpa_q", tt_q)
     _stage_fp("6:sdpa_out", tt_sdpa)
     tt_q.deallocate(True)
@@ -434,6 +448,25 @@ def _verify_head_splits(B, H_local, nkv_local, P, head_dim, grid=None):
         if per_core_tiles(d) <= BUDGET_TILES:
             return d
     return valid[-1]
+
+
+def _log_sdpa_call(tag, **kw):
+    """GEMMA4_SDPA_ARGS=1: log the ACTUAL arguments each path passes to the SDPA op.
+
+    Every synthetic harness built for this investigation produced a false lead because it
+    could not replicate the model's real configuration. This logs the real thing from both
+    call sites so the two can be diffed directly, with no reconstruction.
+    """
+    if os.environ.get("GEMMA4_SDPA_ARGS") != "1":
+        return
+    from loguru import logger as _l
+
+    parts = []
+    for k, v in kw.items():
+        if hasattr(v, "shape"):
+            v = f"shape{tuple(v.shape)}"
+        parts.append(f"{k}={v}")
+    _l.info(f"[sdpa-args] {tag}: " + " ".join(parts))
 
 
 def _packed_verify_sdpa(
@@ -1079,6 +1112,21 @@ def packed_decode_forward(
         head_dim,
         eff_bs_sdpa,
         nkv_local,
+    )
+    _log_sdpa_call(
+        "PACKED",
+        is_causal=False,
+        q=q_packed,
+        k=k_cache_use,
+        cur_pos="(none)",
+        sliding_window=None,
+        grid=f"{_grid.x}x{_grid.y}",
+        q_chunk=32,
+        k_chunk=_kchunk,
+        exp_approx=False,
+        max_cores=_maxcores,
+        mask=attn_mask,
+        n_splits=n_sdpa_splits,
     )
     _stage_fp("7:sdpa_q", q_packed)
     _stage_fp("6:sdpa_out", tt_sdpa)
