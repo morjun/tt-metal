@@ -40,13 +40,40 @@ PREFILL_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_CHUNK_SIZE", "8192"))
 PREFILL_SLIDING_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_SLIDING_CHUNK_SIZE", "30720"))
 
 
+# Six-stage bisect for the 1-ULP packed-vs-single-token K divergence
+# (GEMMA4_STAGE_FP=1). Instrumented in the SHARED helpers rather than at the two call
+# sites, so the path is identified automatically by the row count: 1 row = the
+# single-token/plain path, P rows = the packed path. Row 0 is the same token at the same
+# position in both, so its bytes must match; the first stage where they do not is where
+# the 1 ULP is introduced.
+_STAGE_FP = os.environ.get("GEMMA4_STAGE_FP") == "1"
+
+
+def _stage_fp(tag, t):
+    if not _STAGE_FP or t is None:
+        return
+    import hashlib
+
+    import torch as _t
+    from loguru import logger as _lg
+
+    r = ttnn.to_torch(ttnn.get_device_tensors(t)[0])
+    flat = r.reshape(-1, r.shape[-1])
+    row0 = flat[0].contiguous()
+    d = hashlib.md5(row0.view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
+    _lg.info(f"[stage] rows={flat.shape[0]:3d} {tag:14s} shape={tuple(r.shape)} row0_md5={d}")
+
+
 def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
     """Fused QKV matmul (no bias for Gemma4).
 
     ``memory_config`` lets the packed-verify decode keep the projection output
     resident on L1; ``None`` keeps the op default (DRAM) for existing callers.
     """
-    return ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    _stage_fp("1:hidden_in", hidden_states)
+    _out = ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    _stage_fp("2:xqkv_out", _out)
+    return _out
 
 
 def split_qkv_heads_decode(xqkv_fused, config, is_global: bool, tp: int = 1, kv_replicated: bool = False):
@@ -65,12 +92,14 @@ def split_qkv_heads_decode(xqkv_fused, config, is_global: bool, tp: int = 1, kv_
     # preserved; small extra L1 copy in exchange for arch-portable behavior).
     if xqkv_fused.memory_config().buffer_type == ttnn.BufferType.DRAM:
         xqkv_fused = ttnn.to_memory_config(xqkv_fused, ttnn.L1_MEMORY_CONFIG)
-    return ttnn.experimental.nlp_create_qkv_heads_decode(
+    _q, _k, _v = ttnn.experimental.nlp_create_qkv_heads_decode(
         xqkv_fused,
         num_heads=num_local_heads,
         num_kv_heads=num_local_kv_heads,
         memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
     )
+    _stage_fp("3:k_split", _k)
+    return _q, _k, _v
 
 
 def split_qkv_heads_prefill(
@@ -123,7 +152,9 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
     else:
         normed = ttnn.rms_norm(flat, epsilon=eps, memory_config=memory_config)
 
-    return ttnn.reshape(normed, orig_shape)
+    _r = ttnn.reshape(normed, orig_shape)
+    _stage_fp("4:qk_norm", _r)
+    return _r
 
 
 def apply_rope(tensor, cos_cache, sin_cache, token_index=None, memory_config=None):
@@ -159,7 +190,9 @@ def apply_rope(tensor, cos_cache, sin_cache, token_index=None, memory_config=Non
         )
         result = result[:, :, : orig_shape[2]]
 
-    return result
+    _r = result
+    _stage_fp("5:rope", _r)
+    return _r
 
 
 def _rotate_half(x):
@@ -188,7 +221,9 @@ def apply_rope_decode_peruser(tensor, cos_b, sin_b):
     if cos_b.shape[2] != heads:
         cos_b = ttnn.repeat(cos_b, ttnn.Shape([1, 1, heads, 1]))
         sin_b = ttnn.repeat(sin_b, ttnn.Shape([1, 1, heads, 1]))
-    return ttnn.add(ttnn.mul(tensor, cos_b), ttnn.mul(_rotate_half(tensor), sin_b))
+    _r = ttnn.add(ttnn.mul(tensor, cos_b), ttnn.mul(_rotate_half(tensor), sin_b))
+    _stage_fp("5:rope_peruser", _r)
+    return _r
 
 
 def prefill_sdpa_program_config(head_dim, seq_len):
