@@ -31,6 +31,7 @@ from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cach
 from models.demos.gemma4.utils.substate import substate
 
 _PV_LAYER_FP = os.environ.get("GEMMA4_PV_LAYER_FP") == "1"
+_STAGE_FP_TAG = os.environ.get("GEMMA4_STAGE_FP") == "1"
 
 # Tracy signpost headers — paired begin/end with the same name. The
 # ``models/tt_transformers/scripts/op_perf_results.py --signpost <NAME>``
@@ -1008,6 +1009,11 @@ class Gemma4Model:
             # runs localises it to a single layer — the same fingerprinting that
             # caught the fp32 workaround. Costs a device->host read per layer, so it
             # is strictly a debug path.
+            if _STAGE_FP_TAG:
+                from models.demos.gemma4.tt.attention import operations as _ops
+
+                _ops._CUR_LAYER = i
+
             if _PV_LAYER_FP and packed is not None:
                 import loguru
 

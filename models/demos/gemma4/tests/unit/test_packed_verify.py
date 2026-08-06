@@ -2381,10 +2381,13 @@ def test_junk_chain_kv_matches_reference_chain(mesh_device, reset_seeds):
         return out
 
     def _run(junk):
+        from models.demos.gemma4.tt.attention import operations as _ops
+
         _prefill()
         spec._pv_a_prev = -1
         snaps, toks, tok, pos = [], [], t0, p0
-        for _ in range(n_steps):
+        for _step in range(n_steps):
+            _ops._CUR_STEP = _step
             tokens = [tok] + ([1, 2, 3][:K] if junk else [])
             lh, h = spec._verify(tokens, [pos + j for j in range(len(tokens))])
             h.deallocate(True)

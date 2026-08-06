@@ -52,6 +52,12 @@ _STAGE_FP = os.environ.get("GEMMA4_STAGE_FP") == "1"
 # handed to the KV write -- identical there means the compute is fine and the drift is in
 # the write/staging; different means the compute diverged.
 _STAGE_ONLY = os.environ.get("GEMMA4_STAGE_ONLY")
+# Explicit (step, layer) tagging. Fingerprints used to be paired by ORDINAL POSITION -- the
+# Nth call in one chain against the Nth in the other -- which silently manufactures a
+# divergence if the two chains ever emit a different number of calls. The caller now stamps
+# these so pairing is by identity, not by counting.
+_CUR_STEP = -1
+_CUR_LAYER = -1
 
 
 def _stage_fp(tag, t):
@@ -68,7 +74,7 @@ def _stage_fp(tag, t):
     flat = r.reshape(-1, r.shape[-1])
     row0 = flat[0].contiguous()
     d = hashlib.md5(row0.view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
-    _lg.info(f"[stage] rows={flat.shape[0]:3d} {tag:14s} shape={tuple(r.shape)} row0_md5={d}")
+    _lg.info(f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} rows={flat.shape[0]:4d} {tag:14s} row0_md5={d}")
 
 
 def _stage_fp_full(tag, t):
@@ -89,7 +95,9 @@ def _stage_fp_full(tag, t):
 
     r = ttnn.to_torch(ttnn.get_device_tensors(t)[0])
     dg = hashlib.md5(r.contiguous().view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
-    _lg.info(f"[stage] rows={r.reshape(-1, r.shape[-1]).shape[0]:4d} {tag:14s} shape={tuple(r.shape)} full_md5={dg}")
+    _lg.info(
+        f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} rows={r.reshape(-1, r.shape[-1]).shape[0]:4d} {tag:14s} full_md5={dg}"
+    )
 
 
 def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
