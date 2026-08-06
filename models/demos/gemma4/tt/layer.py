@@ -43,6 +43,7 @@ import torch
 
 import ttnn
 from models.demos.gemma4.tt.attention import Gemma4Attention, Gemma4AttentionConfig
+from models.demos.gemma4.tt.attention.operations import _stage_fp
 from models.demos.gemma4.tt.gemma4_attention_config import get_attention_program_config
 from models.demos.gemma4.tt.moe import MoEBlock
 from models.demos.gemma4.tt.rms_norm import RMSNorm
@@ -270,14 +271,18 @@ class Gemma4DecoderLayer:
                 residual = ttnn.reshape(
                     residual, [1, 1, residual.shape[-2] * residual.shape[-3] * residual.shape[0], -1]
                 )
+            _stage_fp("D:attn_out", attn_output)
             hidden_states = ttnn.add(residual, attn_output)
+            _stage_fp("E:attn_resid", hidden_states)
             residual.deallocate(True)
             attn_output.deallocate(True)
 
         # 2. MLP + MoE block
         residual = hidden_states
         normed = self.pre_feedforward_layernorm.forward(hidden_states)
+        _stage_fp("F:pre_ff_norm", normed)
         mlp_output = self.shared_mlp(normed)
+        _stage_fp("G:mlp_out", mlp_output)
         normed.deallocate(True)
 
         if self.enable_moe_block:
@@ -307,7 +312,9 @@ class Gemma4DecoderLayer:
 
         # post_feedforward_layernorm -> residual add
         hidden_states = self.post_feedforward_layernorm.forward(hidden_states)
+        _stage_fp("H:post_ff_norm", hidden_states)
         combined = ttnn.add(residual, hidden_states)
+        _stage_fp("I:ff_resid", combined)
         residual.deallocate(True)
         hidden_states.deallocate(True)
 
@@ -316,12 +323,20 @@ class Gemma4DecoderLayer:
         # Per-layer input embeddings (E2B/E4B) — BEFORE layer_scalar (matching HF order)
         if self.hidden_size_per_layer_input and per_layer_input is not None and hasattr(self, "per_layer_input_gate"):
             residual_pli = hidden_states
+            # The PLI tensor is the one input to this block that is genuinely DIFFERENT data
+            # between the two chains: the single-token verify builds it from 1 token id, the
+            # packed verify from P (anchor + drafts). Row 0 is the anchor in both, so it must
+            # match bit-for-bit -- if it does not, the two PLI construction paths disagree.
+            _stage_fp("J:pli_in", per_layer_input)
             gated = ttnn.linear(hidden_states, self.per_layer_input_gate)
+            _stage_fp("K:pli_gated", gated)
             gated = ttnn.gelu(gated, fast_and_approximate_mode=True)
             gated = ttnn.mul(gated, per_layer_input)
             projected = ttnn.linear(gated, self.per_layer_projection)
             normed_pli = self.post_per_layer_input_norm.forward(projected)
+            _stage_fp("L:pli_normed", normed_pli)
             hidden_states = ttnn.add(residual_pli, normed_pli)
+            _stage_fp("M:layer_out", hidden_states)
             if len(hidden_states.shape) > 4:
                 hidden_states = ttnn.reshape(hidden_states, (1, 1, hidden_states.shape[-2], self.hidden_size))
 

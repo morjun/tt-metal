@@ -58,12 +58,27 @@ _STAGE_ONLY = os.environ.get("GEMMA4_STAGE_ONLY")
 # these so pairing is by identity, not by counting.
 _CUR_STEP = -1
 _CUR_LAYER = -1
+# GEMMA4_STAGE_DIFF=1: the two chains run in ONE process, so stash the reference chain's
+# row (rows==1) and diff the packed chain's row (rows>1) against it elementwise. Gives the
+# exact count and magnitude of differing elements instead of an all-or-nothing md5.
+_STASH = {}
+# GEMMA4_STAGE_AT="step:layer" restricts fingerprinting to ONE (step, layer), so every
+# stage can be dumped at the single point of interest without paying the readback cost
+# across the whole run.
+_STAGE_AT = os.environ.get("GEMMA4_STAGE_AT")
+_STAGE_AT = tuple(int(x) for x in _STAGE_AT.split(":")) if _STAGE_AT else None
+
+
+def _stage_gate():
+    return _STAGE_AT is None or (_CUR_STEP, _CUR_LAYER) == _STAGE_AT
 
 
 def _stage_fp(tag, t):
     if not _STAGE_FP or t is None:
         return
     if _STAGE_ONLY and not tag.startswith(_STAGE_ONLY):
+        return
+    if not _stage_gate():
         return
     import hashlib
 
@@ -74,7 +89,25 @@ def _stage_fp(tag, t):
     flat = r.reshape(-1, r.shape[-1])
     row0 = flat[0].contiguous()
     d = hashlib.md5(row0.view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
-    _lg.info(f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} rows={flat.shape[0]:4d} {tag:14s} row0_md5={d}")
+    _vals = ""
+    if os.environ.get("GEMMA4_STAGE_VALS") == "1":
+        _v = row0.float()[:6].tolist()
+        _vals = " vals=[" + ", ".join(f"{x:+.6f}" for x in _v) + f"] |row0|={row0.float().abs().max().item():.6f}"
+    if os.environ.get("GEMMA4_STAGE_DIFF") == "1":
+        key = (_CUR_STEP, _CUR_LAYER, tag)
+        cur = row0.float()
+        if flat.shape[0] == 1:
+            _STASH[key] = cur
+        elif key in _STASH:
+            ref = _STASH[key]
+            n = min(ref.numel(), cur.numel())
+            dv = (ref[:n] - cur[:n]).abs()
+            idx = (dv > 0).nonzero().flatten().tolist()
+            _lg.info(
+                f"[diff] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} {tag:14s} "
+                f"differing={len(idx)}/{n} max|d|={dv.max().item():.8f} first_idx={idx[:6]}"
+            )
+    _lg.info(f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} rows={flat.shape[0]:4d} {tag:14s} row0_md5={d}{_vals}")
 
 
 def _stage_fp_full(tag, t):
@@ -87,6 +120,8 @@ def _stage_fp_full(tag, t):
     if not _STAGE_FP or t is None:
         return
     if _STAGE_ONLY and not tag.startswith(_STAGE_ONLY):
+        return
+    if not _stage_gate():
         return
     import hashlib
 

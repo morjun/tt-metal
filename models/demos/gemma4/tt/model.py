@@ -698,6 +698,14 @@ class Gemma4Model:
             cache_file_name=get_cache_file_name(self.tensor_cache_path, "pli_embed_table"),
         )
         # ttnn.linear(x[..., hidden], w[..., hidden, out]) -> transpose HF's [out, hidden].
+        # NOTE bf16, while the HOST path runs this projection in fp32 (cached proj_w32) and
+        # casts to bf16 only at the end. That precision gap is REAL: it is why
+        # test_pli_device_matches_host sits at PCC 0.9999947, max|diff| = 0.0625 = one bf16
+        # ULP. Moving these weights to fp32 was measured: PCC 0.99999470 -> 0.99999774 and
+        # max|diff| 0.0625 -> 0.0303, but throughput 31.77 -> 20.30 tok/s/u (fp32 doubles the
+        # DRAM traffic and the matmul cost) and it still is NOT bit-exact, because a device
+        # matmul and a host matmul use different reduction orders. Not worth it -- see the
+        # analysis doc for the parity route that keeps this fast.
         self._pli_proj_tt = ttnn.as_tensor(
             w["per_layer_model_projection"].transpose(-2, -1).unsqueeze(0).unsqueeze(0),
             device=self.mesh_device,
@@ -1519,9 +1527,32 @@ class Gemma4Model:
 
         toks = torch.as_tensor(token_ids, dtype=torch.long).reshape(1, -1)  # [1, B]
         embeds = F.embedding(toks, self._embed_weight_cpu).float() * self.embed_scale  # [1, B, hidden]
-        pli_list = self._compute_per_layer_inputs(toks.int(), embeds)  # n_layers x [1, B, pli_size]
-        if pli_list is None:
+
+        # ONE ROW AT A TIME, not one batched call. _compute_per_layer_inputs does
+        # F.linear(embeds, proj_w) on host, and torch dispatches different BLAS kernels by
+        # batch size: a B-row call and a 1-row call disagree by ~3e-08 in fp32 on the SAME
+        # row. That usually vanishes in the final bf16 cast, but across 256 elements x 35
+        # layers x many steps a value occasionally sits within 3e-08 of a bf16 midpoint and
+        # flips.
+        #
+        # Measured consequence before this fix (spec decode vs plain decode, step 10,
+        # layer 20): exactly ONE element of the 256-wide PLI vector differed -- index 170, by
+        # 0.00048828 = 2^-11 = one bf16 ULP -- with every upstream stage bit-identical. It
+        # propagated through the rest of that layer stack; once such a perturbation survived
+        # the K/V rounding it entered the KV cache (step 22) and flipped a committed token
+        # (step 27), which is the ~197-character divergence from plain decode.
+        #
+        # Plain decode and the single-token verify compute PLI with ONE row, so evaluating
+        # each candidate on its own makes row 0 bit-identical to them. Same total FLOPs, only
+        # the dispatch is split. Scoped to THIS entry point deliberately:
+        # _compute_per_layer_inputs is shared with PREFILL, where both paths batch identically
+        # and a per-row loop would change prefill numerics and cost thousands of matmuls.
+        per_row = [
+            self._compute_per_layer_inputs(toks[:, r : r + 1].int(), embeds[:, r : r + 1]) for r in range(toks.shape[1])
+        ]
+        if per_row[0] is None:
             return None
+        pli_list = [torch.cat([pr[i] for pr in per_row], dim=1) for i in range(len(per_row[0]))]
         # [n_layers, 1, B, pli_size]: dim 0 selects the layer, dim 2 the candidate.
         return torch.stack([t.reshape(1, -1, t.shape[-1]) for t in pli_list], dim=0).to(torch.bfloat16)
 
