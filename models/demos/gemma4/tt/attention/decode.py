@@ -342,6 +342,7 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    _stage_fp("7:sdpa_q", tt_q)
     _stage_fp("6:sdpa_out", tt_sdpa)
     tt_q.deallocate(True)
 
@@ -1079,6 +1080,7 @@ def packed_decode_forward(
         eff_bs_sdpa,
         nkv_local,
     )
+    _stage_fp("7:sdpa_q", q_packed)
     _stage_fp("6:sdpa_out", tt_sdpa)
     ttnn.deallocate(q_packed)
 
