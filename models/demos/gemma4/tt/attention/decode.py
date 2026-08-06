@@ -15,6 +15,7 @@ import ttnn
 
 from .operations import (
     _stage_fp,
+    _stage_fp_full,
     apply_allreduce,
     apply_output_projection,
     apply_per_head_norm,
@@ -357,6 +358,8 @@ def decode_forward(
         mask="(internal)",
     )
     _stage_fp("7:sdpa_q", tt_q)
+    _stage_fp_full("8:sdpa_k", k_cache)
+    _stage_fp_full("9:sdpa_v", v_cache)
     _stage_fp("6:sdpa_out", tt_sdpa)
     tt_q.deallocate(True)
 
@@ -1129,6 +1132,8 @@ def packed_decode_forward(
         n_splits=n_sdpa_splits,
     )
     _stage_fp("7:sdpa_q", q_packed)
+    _stage_fp_full("8:sdpa_k", k_cache_use)
+    _stage_fp_full("9:sdpa_v", v_cache_use)
     _stage_fp("6:sdpa_out", tt_sdpa)
     ttnn.deallocate(q_packed)
 

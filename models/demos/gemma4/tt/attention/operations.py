@@ -71,6 +71,27 @@ def _stage_fp(tag, t):
     _lg.info(f"[stage] rows={flat.shape[0]:3d} {tag:14s} shape={tuple(r.shape)} row0_md5={d}")
 
 
+def _stage_fp_full(tag, t):
+    """Like _stage_fp but hashes the WHOLE tensor, not row 0.
+
+    _stage_fp fingerprints row 0, which is right for per-row activations but useless for a KV
+    CACHE — row 0 is just position 0 and would miss every difference further along. Used to
+    compare the actual K/V handed to each SDPA call.
+    """
+    if not _STAGE_FP or t is None:
+        return
+    if _STAGE_ONLY and not tag.startswith(_STAGE_ONLY):
+        return
+    import hashlib
+
+    import torch as _t
+    from loguru import logger as _lg
+
+    r = ttnn.to_torch(ttnn.get_device_tensors(t)[0])
+    dg = hashlib.md5(r.contiguous().view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
+    _lg.info(f"[stage] rows={r.reshape(-1, r.shape[-1]).shape[0]:4d} {tag:14s} shape={tuple(r.shape)} full_md5={dg}")
+
+
 def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
     """Fused QKV matmul (no bias for Gemma4).
 
