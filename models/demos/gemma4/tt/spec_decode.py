@@ -1647,6 +1647,21 @@ class SpeculativeDecoder:
         # the anchor + drafts, and by then it reads as zeros. That is the whole 0.00/3:
         # every draft compared as 0 against a real target id, so nothing ever matched.
         # Same alias-deallocate bug as the one fixed in masked_embedding._argmax_rows.
+        if os.environ.get("GEMMA4_ROW_DBG") == "1":
+            # Row p must attend to j <= c+p and carry RoPE position c+p. The masks are
+            # head-major (row = h*P + p), so row 2 of the P-row output corresponds to mask
+            # rows 2, P+2, 2P+2, ... Dump each row's unmasked key count and its position, to
+            # check the bound and the RoPE index actually handed to the op.
+            from loguru import logger as _rl
+
+            _vp = ttnn.to_torch(ttnn.get_device_tensors(tr["v_pos"])[0]).flatten().tolist()
+            for _nm, _mk in (("full", tr["mask_full"]), ("slide", tr["mask_slide"])):
+                _m = ttnn.to_torch(ttnn.get_device_tensors(_mk)[0]).float()
+                _m = _m.reshape(-1, _m.shape[-1])
+                _cnt = [int((_m[r] == 0).sum()) for r in range(min(2 * P, _m.shape[0]))]
+                _rl.info(f"[rowdbg] {_nm} unmasked_keys_per_row(first {len(_cnt)})={_cnt}")
+            _rl.info(f"[rowdbg] v_pos={_vp[: 2 * P]}  (expect c, c+1, ... c+{P - 1})")
+
         vlogits, vhidden = self.target.ttnn_packed_verify_forward(
             x=verify_x,
             position_idx=tr["v_pos"],
