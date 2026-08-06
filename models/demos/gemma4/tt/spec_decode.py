@@ -1815,7 +1815,7 @@ class SpeculativeDecoder:
                 drafts = [int(vx[b * P + 1 + j]) for j in range(K)]
                 g = [gids[b * P + j] for j in range(P)]
                 m = next((i for i in range(K) if drafts[i] != g[i]), K)
-                if _FUSED_DBG and len(accepts[b]) < 3:
+                if _FUSED_DBG and len(accepts[b]) < int(os.environ.get("GEMMA4_SPEC_FUSED_DEBUG_N", "3")):
                     from loguru import logger as _fd
 
                     # vx[b*P] is the ANCHOR token, which is known non-zero. Printing it
