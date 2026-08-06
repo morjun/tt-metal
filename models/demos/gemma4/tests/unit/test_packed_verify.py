@@ -2489,6 +2489,22 @@ def test_pli_device_row_count_invariant(mesh_device, reset_seeds):
     )
 
 
+def _snap_kv(target, page_table, block_size, mesh_device, n_pos):
+    """De-paged KV for every layer, positions 0..n_pos-1, keyed by layer index."""
+    from models.demos.gemma4.tests.unit.test_spec_decode import _depage
+
+    out = {}
+    for li in range(len(target.tt_kv_cache)):
+        kc, vc = target.tt_kv_cache[li]
+        lt = next((t for t, idx in target.last_kv_layer_by_type.items() if idx == li), None)
+        rep = lt == "full_attention" if lt else (li % 6 == 5)
+        out[f"L{li:02d}"] = (
+            _depage(kc, page_table, n_pos, block_size, mesh_device, rep),
+            _depage(vc, page_table, n_pos, block_size, mesh_device, rep),
+        )
+    return out
+
+
 def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
     """Cross-chain against the FUSED path — the configuration the demo actually runs.
 
@@ -2574,12 +2590,33 @@ def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
         cur = cur + 1
         if t in spec.stop_tokens:
             break
+    plain_kv = _snap_kv(generator.model[0], page_table, block_size, mesh_device, p0 + len(plain) + 1)
 
     # B: the FUSED path
     _prefill()
     spec._pv_a_prev = -1
     outs, _acc = spec.generate_batched([t0], [p0], n_new, max_seq_len)
     fused = outs[0]
+
+    fused_kv = _snap_kv(generator.model[0], page_table, block_size, mesh_device, p0 + len(fused) + 1)
+
+    # Which CACHE POSITION first differs? Row 2 of the packed verify reads c+1 and c+2 (the
+    # accepted drafts written by that same verify). Everything about row 2 checked so far was
+    # structural -- which keys, which RoPE position -- never the CONTENTS it reads. Plain
+    # decode writes those two positions across two separate decode steps; the packed verify
+    # writes all P in one shot before reading any of them.
+    first_pos = None
+    for lt in plain_kv:
+        for nm in (0, 1):
+            a, b_ = plain_kv[lt][nm], fused_kv[lt][nm]
+            n_ = min(a.shape[-2], b_.shape[-2])
+            d = (a[..., :n_, :] - b_[..., :n_, :]).abs()
+            per = d.amax(dim=(0, 1, 3)) if d.dim() == 4 else d.reshape(n_, -1).amax(-1)
+            ch = (per > 0).nonzero().flatten().tolist()
+            if ch and (first_pos is None or ch[0] < first_pos[1]):
+                first_pos = (lt, ch[0], "K" if nm == 0 else "V", float(per[ch[0]]))
+    logger.info(f"  first differing CACHE POSITION: {first_pos}")
+    logger.info(f"  (anchor at the diverging iteration was c=132, so c+1=133, c+2=134)")
 
     n = min(len(plain), len(fused))
     i = next((k for k in range(n) if plain[k] != fused[k]), None)
