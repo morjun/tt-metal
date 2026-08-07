@@ -236,6 +236,7 @@ def decode_forward(
                         vb = ttnn.to_memory_config(vb, single_user_mem)
                         pos_b = ttnn.slice(cache_pos, [b], [b + 1])
                         pt_b = ttnn.slice(page_table, [b, 0], [b + 1, page_table.shape[1]])
+                        _branch_mark(1)
                         ttnn.experimental.paged_update_cache(
                             k_cache,
                             kb,
@@ -245,6 +246,7 @@ def decode_forward(
                             num_kv_heads=num_local_kv_heads,
                             **paged_modulo_kwargs,
                         )
+                        _branch_mark(2)
                         ttnn.experimental.paged_update_cache(
                             v_cache,
                             vb,
@@ -259,6 +261,8 @@ def decode_forward(
                     k_seq.deallocate(True)
                     v_seq.deallocate(True)
                 else:
+                    _branch_mark(3)
+                    _write_dbg("PLAIN", cache_pos, tt_k)
                     ttnn.experimental.paged_update_cache(
                         k_cache,
                         tt_k,
@@ -268,6 +272,7 @@ def decode_forward(
                         num_kv_heads=num_local_kv_heads,
                         **paged_modulo_kwargs,
                     )
+                    _branch_mark(4)
                     ttnn.experimental.paged_update_cache(
                         v_cache,
                         tt_v,
@@ -278,7 +283,9 @@ def decode_forward(
                         **paged_modulo_kwargs,
                     )
             else:
+                _branch_mark(5)
                 ttnn.experimental.paged_update_cache(k_cache, tt_k, update_idxs_tensor=cache_pos)
+                _branch_mark(6)
                 ttnn.experimental.paged_update_cache(v_cache, tt_v, update_idxs_tensor=cache_pos)
     else:
         k_cache = tt_k
@@ -470,6 +477,51 @@ def _log_sdpa_call(tag, **kw):
             v = f"shape{tuple(v.shape)}"
         parts.append(f"{k}={v}")
     _l.info(f"[sdpa-args] {tag}: " + " ".join(parts))
+
+
+def _write_dbg(tag, pos_tensor, k_tensor):
+    """GEMMA4_WRITE_DBG=<pos>: dump the K row being written AT that cache position.
+
+    The fused KV first diverges from plain decode at position 128 == 2*block_size, a paged
+    BLOCK BOUNDARY, by one bf16 ULP. Both paths write that position with paged_update_cache;
+    plain decode in a single decode step at cur_pos=128, the packed verify as one of its P
+    rows. This logs the VALUE each path hands to the write, so the two can be compared at the
+    one position that matters.
+    """
+    want = os.environ.get("GEMMA4_WRITE_DBG")
+    if not want:
+        return
+    want = int(want)
+    import hashlib
+
+    import torch as _t
+
+    idxs = [int(v) for v in ttnn.to_torch(ttnn.get_device_tensors(pos_tensor)[0]).flatten().tolist()]
+    if want not in idxs:
+        return
+    r = ttnn.to_torch(ttnn.get_device_tensors(k_tensor)[0])
+    flat = r.reshape(-1, r.shape[-1])
+    row = flat[0].contiguous()
+    dg = hashlib.md5(row.view(_t.uint8).numpy().tobytes()).hexdigest()[:12]
+    logger.info(
+        f"[write] {tag} pos={want} shape={tuple(r.shape)} row_md5={dg} "
+        f"first6={[round(float(x), 6) for x in row.float()[:6]]}"
+    )
+
+
+_BRANCH_SEEN = set()
+
+
+def _branch_mark(n):
+    """GEMMA4_BRANCH_DBG=1: log which paged_update_cache call site actually executes.
+
+    decode.py has five of them (replicated/global/batched variants plus the fallback), and
+    instrumenting the wrong one produced no output at all. Fires once per site.
+    """
+    if os.environ.get("GEMMA4_BRANCH_DBG") != "1" or n in _BRANCH_SEEN:
+        return
+    _BRANCH_SEEN.add(n)
+    logger.info(f"[branch] paged_update_cache site #{n} EXECUTED")
 
 
 def _packed_verify_sdpa(
@@ -1033,6 +1085,8 @@ def packed_decode_forward(
             k_p = ttnn.to_memory_config(k_p, q_sharded_mem)
             v_p = ttnn.to_memory_config(v_p, q_sharded_mem)
             if page_table is not None:
+                _branch_mark(7)
+                _write_dbg("PACKED", kv_write_idxs[p], k_p)
                 ttnn.experimental.paged_update_cache(
                     k_cache_w,
                     k_p,
@@ -1041,6 +1095,7 @@ def packed_decode_forward(
                     block_size=eff_bs,
                     num_kv_heads=nkv_local,
                 )
+                _branch_mark(8)
                 ttnn.experimental.paged_update_cache(
                     v_cache_w,
                     v_p,
@@ -1050,7 +1105,9 @@ def packed_decode_forward(
                     num_kv_heads=nkv_local,
                 )
             else:
+                _branch_mark(9)
                 ttnn.experimental.paged_update_cache(k_cache_w, k_p, update_idxs_tensor=kv_write_idxs[p])
+                _branch_mark(10)
                 ttnn.experimental.paged_update_cache(v_cache_w, v_p, update_idxs_tensor=kv_write_idxs[p])
             ttnn.deallocate(k_p)
             ttnn.deallocate(v_p)
