@@ -5,13 +5,25 @@ from torch import nn
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
+from models.demos.gemma4.tt.weight_placement import place_as_tensor
+from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, mesh_device, hf_config, state_dict, tensor_cache_path=None, mesh_config=None, with_scale=True):
+    def __init__(
+        self,
+        mesh_device,
+        hf_config,
+        state_dict,
+        tensor_cache_path=None,
+        mesh_config=None,
+        with_scale=True,
+        weight_placement=None,
+    ):
         super().__init__()
         self.with_scale = with_scale
+        placement = resolve_placement(weight_placement)
 
         if with_scale and state_dict and "weight" in state_dict:
             torch_weight = state_dict["weight"].reshape((1, 1, -1, ttnn.TILE_SIZE))
@@ -22,16 +34,18 @@ class RMSNorm(nn.Module):
         self.is_distributed = False
 
         if with_scale:
-            self.tt_weight = ttnn.as_tensor(
+            norm_mapper = (
+                self.mesh_config.shard_mapper(mesh_device, mesh_dims=(None, -2)) if self.is_distributed else None
+            )
+            self.tt_weight = place_as_tensor(
+                placement,
+                f"{tensor_cache_path or 'rms_norm'}/weight",
                 torch_weight,
                 device=mesh_device,
                 dtype=ttnn.bfloat16,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=norm_mapper,
                 cache_file_name=get_cache_file_name(tensor_cache_path, "weight"),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=self.mesh_config.shard_mapper(mesh_device, mesh_dims=(None, -2))
-                if self.is_distributed
-                else None,
             )
         else:
             self.tt_weight = None

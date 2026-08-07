@@ -41,6 +41,8 @@ from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.rms_norm import RMSNorm
+from models.demos.gemma4.tt.weight_placement import place_as_tensor
+from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
 
@@ -81,7 +83,16 @@ class Gemma4AssistantModel:
         tensor_cache_path=None,
         mesh_config=None,
         max_local_batch_size=1,
+        weight_placement=None,
     ):
+        # Where this drafter's weights live (DRAM by default). The policy object
+        # accumulates a per-device byte total across every tensor below, so the
+        # construction order below is also the priority order for the L1 budget:
+        # decoder layers first, then the projections, then the CME head (whose
+        # 128 MiB replicated embed_table is expected to fall back to DRAM).
+        self.weight_placement = placement = resolve_placement(weight_placement)
+        if placement.enabled:
+            placement.log_hardware_ceiling(mesh_device)
         self.mesh_device = mesh_device
         self.max_local_batch_size = max_local_batch_size
         self.args = assistant_args
@@ -122,6 +133,7 @@ class Gemma4AssistantModel:
                 mesh_config=mesh_config,
                 max_seq_len=self.text_args.max_seq_len,
                 max_local_batch_size=max_local_batch_size,
+                weight_placement=placement,
             )
             self.layers.append(layer)
 
@@ -132,6 +144,7 @@ class Gemma4AssistantModel:
             state_dict=substate(state_dict, "model.norm"),
             tensor_cache_path=f"{tensor_cache_path}/final_norm" if tensor_cache_path else None,
             mesh_config=mesh_config,
+            weight_placement=placement,
         )
 
         # pre_projection (2*backbone -> hidden) and post_projection (hidden ->
@@ -147,14 +160,16 @@ class Gemma4AssistantModel:
                 return None
             wt = w.transpose(-2, -1) if transpose else w
             wt = wt.unsqueeze(0).unsqueeze(0)
-            return ttnn.as_tensor(
+            eff_mapper = mapper if mapper is not None else (replicate if is_mesh else None)
+            return place_as_tensor(
+                placement,
+                f"assistant/{key}",
                 wt,
                 device=mesh_device,
                 dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=mapper if mapper is not None else (replicate if is_mesh else None),
+                mesh_mapper=eff_mapper,
                 cache_file_name=get_cache_file_name(tensor_cache_path, key.replace(".", "_")),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
         self.pre_projection = _linear("pre_projection.weight", None)
@@ -172,6 +187,7 @@ class Gemma4AssistantModel:
                 dtype=dtype,
                 tensor_cache_path=tensor_cache_path,
                 mesh_config=mesh_config,
+                weight_placement=placement,
             )
         else:
             # lm_head tied to the assistant's own embed_tokens when a separate
@@ -182,6 +198,11 @@ class Gemma4AssistantModel:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
+
+        if placement.enabled:
+            from loguru import logger
+
+            logger.info("\n" + placement.report())
 
     def _raw_token_embed(self, token_tt):
         """Target token embedding of a single token id -> [1,1,1,backbone] TILE.

@@ -49,6 +49,8 @@ from dataclasses import dataclass
 import torch
 
 import ttnn
+from models.demos.gemma4.tt.weight_placement import place_as_tensor
+from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
@@ -103,7 +105,9 @@ class Gemma4TTMaskedEmbedder:
         dtype=ttnn.bfloat16,
         tensor_cache_path=None,
         mesh_config=None,
+        weight_placement=None,
     ):
+        placement = resolve_placement(weight_placement)
         self.mesh_device = mesh_device
         self.args = assistant_args
         text_args = assistant_args.text_args
@@ -159,41 +163,38 @@ class Gemma4TTMaskedEmbedder:
         if missing:
             raise ValueError(f"Assistant checkpoint has use_ordered_embeddings but is missing: {', '.join(missing)}")
 
+        def _load(name, weight, tensor_dtype, layout):
+            return place_as_tensor(
+                placement,
+                f"{tensor_cache_path or 'cme'}/{name}",
+                weight,
+                device=mesh_device,
+                dtype=tensor_dtype,
+                layout=layout,
+                mesh_mapper=self._mapper,
+                cache_file_name=get_cache_file_name(tensor_cache_path, name),
+            )
+
         # Stage 1 weight: [C, H] -> [1,1,H,C] so `ttnn.linear(normed, .)` gives [.., C].
-        self.centroids = ttnn.as_tensor(
-            centroids.transpose(-2, -1).unsqueeze(0).unsqueeze(0),
-            device=mesh_device,
-            dtype=dtype,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=self._mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, "cme_centroids"),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        self.centroids = _load(
+            "cme_centroids", centroids.transpose(-2, -1).unsqueeze(0).unsqueeze(0), dtype, ttnn.TILE_LAYOUT
         )
 
         # HF's `canonical_positions_per_cluster`: token_ordering.view(C, P).
         # uint32 so the ids are exact (bf16 only represents integers up to 256,
         # and ids run to 262143). TILE layout because `ttnn.gather` requires it.
-        self.ordering = ttnn.as_tensor(
+        self.ordering = _load(
+            "cme_token_ordering",
             ordering.to(torch.int64).reshape(1, 1, self.num_centroids, self.vocab_per_centroid),
-            device=mesh_device,
-            dtype=ttnn.uint32,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=self._mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, "cme_token_ordering"),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            ttnn.uint32,
+            ttnn.TILE_LAYOUT,
         )
 
         # Row-gatherable copy of the output embedding: `ttnn.embedding` requires a
         # ROW_MAJOR bf16 weight whose leading two dims are 1. This REPLACES the
         # dense [H, V] lm_head in CME mode, so DRAM is net-neutral.
-        self.embed_table = ttnn.as_tensor(
-            embed.unsqueeze(0).unsqueeze(0),
-            device=mesh_device,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, "cme_embed_table"),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        self.embed_table = _load(
+            "cme_embed_table", embed.unsqueeze(0).unsqueeze(0), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT
         )
 
     # ── forward ───────────────────────────────────────────────────────────────

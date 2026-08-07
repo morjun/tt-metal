@@ -20,6 +20,8 @@ import torch
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig
+from models.demos.gemma4.tt.weight_placement import place_as_tensor
+from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
@@ -42,12 +44,14 @@ def load_attention_weights(
     mesh_config: MeshConfig,
     weight_dtype=ttnn.bfloat16,
     tensor_cache_path=None,
+    weight_placement=None,
 ) -> AttentionWeights:
     """
     Load and fuse attention weights with tensor parallelism.
 
     No Meta-format conversion needed — uses HF-style rotary_embedding.
     """
+    placement = resolve_placement(weight_placement)
     is_global = config.use_kv_tying
     q_size = config.num_attention_heads * config.head_dim
     kv_size = config.num_key_value_heads * config.head_dim
@@ -143,41 +147,25 @@ def load_attention_weights(
 
     dtype_suffix = f"_{dtype_to_str(weight_dtype)}"
 
-    wqkv = ttnn.as_tensor(
-        qkv,
-        device=mesh_device,
-        dtype=weight_dtype,
-        layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=col_mapper,
-        cache_file_name=get_cache_file_name(tensor_cache_path, f"wqkv{tp_suffix}{dtype_suffix}"),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    def _load(name, weight, mapper, dtype, cache_suffix, layout=ttnn.TILE_LAYOUT):
+        return place_as_tensor(
+            placement,
+            f"{tensor_cache_path or 'self_attn'}/{name}",
+            weight,
+            device=mesh_device,
+            dtype=dtype,
+            layout=layout,
+            mesh_mapper=mapper,
+            cache_file_name=get_cache_file_name(tensor_cache_path, cache_suffix),
+        )
+
+    wqkv = _load("wqkv", qkv, col_mapper, weight_dtype, f"wqkv{tp_suffix}{dtype_suffix}")
+    o_proj = _load("o_proj", o_w, row_mapper, weight_dtype, f"o_proj{o_proj_cache_suffix}{tp_suffix}{dtype_suffix}")
+    q_norm_weight = _load(
+        "q_norm", q_norm_w, replicate_mapper, ttnn.bfloat16, f"q_norm.weight{tp_suffix}", ttnn.ROW_MAJOR_LAYOUT
     )
-    o_proj = ttnn.as_tensor(
-        o_w,
-        device=mesh_device,
-        dtype=weight_dtype,
-        layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=row_mapper,
-        cache_file_name=get_cache_file_name(tensor_cache_path, f"o_proj{o_proj_cache_suffix}{tp_suffix}{dtype_suffix}"),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-    )
-    q_norm_weight = ttnn.as_tensor(
-        q_norm_w,
-        device=mesh_device,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        mesh_mapper=replicate_mapper,
-        cache_file_name=get_cache_file_name(tensor_cache_path, f"q_norm.weight{tp_suffix}"),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-    )
-    k_norm_weight = ttnn.as_tensor(
-        k_norm_w,
-        device=mesh_device,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        mesh_mapper=replicate_mapper,
-        cache_file_name=get_cache_file_name(tensor_cache_path, f"k_norm.weight{tp_suffix}"),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    k_norm_weight = _load(
+        "k_norm", k_norm_w, replicate_mapper, ttnn.bfloat16, f"k_norm.weight{tp_suffix}", ttnn.ROW_MAJOR_LAYOUT
     )
 
     return AttentionWeights(

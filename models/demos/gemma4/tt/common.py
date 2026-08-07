@@ -114,6 +114,7 @@ def create_assistant_model(
     assistant_path=None,
     state_dict=None,
     max_local_batch_size=1,
+    weight_placement=None,
 ):
     """Create the Gemma4 it-assistant drafter, sharing the target's mesh/CCL.
 
@@ -161,5 +162,6 @@ def create_assistant_model(
         tensor_cache_path=tensor_cache_path,
         mesh_config=mesh_config,
         max_local_batch_size=max_local_batch_size,
+        weight_placement=weight_placement,
     )
     return assistant_args, model
