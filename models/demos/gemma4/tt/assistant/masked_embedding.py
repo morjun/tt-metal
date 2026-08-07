@@ -44,6 +44,8 @@ Every step is a device op (no host round-trip), so the head captures inside the
 existing fused Metal trace in ``spec_decode.py``.
 """
 
+import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -181,13 +183,44 @@ class Gemma4TTMaskedEmbedder:
         )
 
         # HF's `canonical_positions_per_cluster`: token_ordering.view(C, P).
-        # uint32 so the ids are exact (bf16 only represents integers up to 256,
-        # and ids run to 262143). TILE layout because `ttnn.gather` requires it.
-        self.ordering = _load(
-            "cme_token_ordering",
-            ordering.to(torch.int64).reshape(1, 1, self.num_centroids, self.vocab_per_centroid),
-            ttnn.uint32,
-            ttnn.TILE_LAYOUT,
+        ordering_2d = ordering.to(torch.int64).reshape(1, 1, self.num_centroids, self.vocab_per_centroid)
+
+        # ── the ordering lookup, in base-64 digits ────────────────────────────
+        # What this lookup needs is a pure ROW gather: out[s,:] = ordering[top[s],:].
+        # The obvious spelling, ttnn.gather(ordering, dim=2, index=repeat(top)),
+        # is catastrophically slow: MEASURED 5.13 ms on ONE core of 110, with
+        # cost proportional to the INPUT table (C=2048 -> 5.2 ms, C=4096 ->
+        # 10.3 ms) and independent of how much is actually gathered (K=32 and
+        # K=256 both ~5 ms). It rewalks all C*P elements at ~20 cycles each.
+        # That single op was 81% of the whole drafter step.
+        #
+        # ttnn.embedding does exactly this row gather in ~3 us, but it requires a
+        # ROW_MAJOR *bfloat16* weight, and bf16 has an 8-bit mantissa so it
+        # cannot hold token ids up to 262143 exactly. So split each id into
+        # base-64 digits: every digit is < 64 and therefore exact in bf16, and
+        # 64**3 == 262144 covers the vocab in 3 tables. Three cheap embeddings
+        # plus an fp32 recombine replace the one expensive gather.
+        self.digit_base = 64
+        self.num_digits = max(1, math.ceil(math.log(max(self.vocab_size, 2)) / math.log(self.digit_base)))
+        if self.digit_base**self.num_digits < self.vocab_size:
+            self.num_digits += 1
+        self.ordering_digits = []
+        for d in range(self.num_digits):  # least-significant digit first
+            digit = (ordering_2d // (self.digit_base**d)) % self.digit_base
+            self.ordering_digits.append(
+                _load(
+                    f"cme_token_ordering_b{self.digit_base}_d{d}",
+                    digit.to(torch.bfloat16),
+                    ttnn.bfloat16,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                )
+            )
+
+        # Legacy uint32 TILE copy, only built for the GEMMA4_CME_GATHER=1 A/B
+        # path (and kept out of the L1 budget otherwise).
+        self.use_legacy_gather = os.getenv("GEMMA4_CME_GATHER", "0") == "1"
+        self.ordering = (
+            _load("cme_token_ordering", ordering_2d, ttnn.uint32, ttnn.TILE_LAYOUT) if self.use_legacy_gather else None
         )
 
         # Row-gatherable copy of the output embedding: `ttnn.embedding` requires a
@@ -242,17 +275,44 @@ class Gemma4TTMaskedEmbedder:
             top_idx.deallocate(True)
             top_idx = top_u32
 
-        # 3. Broadcast each chosen centroid down a column so the gather picks whole
-        #    rows of `ordering`: idx[s, j] = top_idx[s] for every j in [0, P).
-        idx_col = ttnn.transpose(top_idx, -2, -1)  # [1,1,K,1]
-        top_idx.deallocate(True)
-        gather_idx = ttnn.repeat(idx_col, ttnn.Shape([1, 1, 1, P]))  # [1,1,K,P]
-        idx_col.deallocate(True)
+        # 3-4. selected_canonical = canon[top_k_indices] -> the candidate token ids,
+        #      i.e. the row gather out[s,:] = ordering[top_idx[s],:], done as
+        #      num_digits base-64 embeddings + an fp32 recombine. See the
+        #      ordering_digits comment in __init__ for why not ttnn.gather.
+        if self.use_legacy_gather:
+            idx_col = ttnn.transpose(top_idx, -2, -1)  # [1,1,K,1]
+            top_idx.deallocate(True)
+            gather_idx = ttnn.repeat(idx_col, ttnn.Shape([1, 1, 1, P]))  # [1,1,K,P]
+            idx_col.deallocate(True)
+            sel_ids = ttnn.gather(self.ordering, dim=2, index=gather_idx)  # [1,1,K,P] uint32
+            gather_idx.deallocate(True)
+        else:
+            # ttnn.embedding wants a [1, K] ROW_MAJOR index.
+            top_rm = ttnn.to_layout(top_idx, ttnn.ROW_MAJOR_LAYOUT)
+            top_idx.deallocate(True)
+            top_rm = ttnn.reshape(top_rm, (1, K))
 
-        # 4. selected_canonical = canon[top_k_indices] -> the candidate token ids.
-        #    gather along dim 2: out[s,j] = ordering[gather_idx[s,j], j].
-        sel_ids = ttnn.gather(self.ordering, dim=2, index=gather_idx)  # [1,1,K,P] uint32
-        gather_idx.deallocate(True)
+            # Recombine most-significant digit first: acc = acc*base + digit.
+            # fp32 throughout — the result runs to 262143, which needs 18 bits
+            # and so is exact in fp32 but NOT in bf16.
+            acc = None
+            for d in reversed(range(self.num_digits)):
+                dig = ttnn.embedding(top_rm, self.ordering_digits[d], layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+                if len(dig.shape) == 3:
+                    dig = ttnn.unsqueeze_to_4D(dig)  # [1,1,K,P]
+                dig_f32 = ttnn.typecast(dig, ttnn.float32)
+                dig.deallocate(True)
+                if acc is None:
+                    acc = dig_f32
+                else:
+                    scaled = ttnn.multiply(acc, float(self.digit_base), dtype=ttnn.float32)
+                    acc.deallocate(True)
+                    acc = ttnn.add(scaled, dig_f32, dtype=ttnn.float32)
+                    scaled.deallocate(True)
+                    dig_f32.deallocate(True)
+            top_rm.deallocate(True)
+            sel_ids = ttnn.typecast(acc, ttnn.uint32)  # [1,1,K,P] uint32 TILE
+            acc.deallocate(True)
 
         # Flatten K x P -> N in C order (matches HF's `.view(batch, seq, -1)`), so a
         # local index f corresponds to centroid slot f // P, offset f % P. The

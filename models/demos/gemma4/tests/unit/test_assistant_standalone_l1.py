@@ -621,6 +621,52 @@ def test_l1_capacity_ceiling(mesh_device, budget_mb, reset_seeds):
 
 
 @_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 2)], device_params_extra={"trace_region_size": 200_000_000})
+def test_cme_digit_gather_vs_legacy(mesh_device, reset_seeds):
+    """Base-64 digit embeddings vs the legacy ttnn.gather in the CME head.
+
+    The digit path must produce **bit-identical** token ids — it is exact integer
+    arithmetic (every digit < 64 is exact in bf16, the recombine is fp32, and the
+    result needs 18 bits) — while replacing a single 5.13 ms one-core gather with
+    3 embeddings plus an fp32 recombine.
+    """
+    prev = os.environ.get("GEMMA4_CME_GATHER")
+    try:
+        results = {}
+        for tag, flag in (("legacy-gather", "1"), ("digit-embed", "0")):
+            os.environ["GEMMA4_CME_GATHER"] = flag
+            rig = _build_standalone(mesh_device, "dram")
+            logits, next_hidden = rig["assistant"].step(*_step_args(rig))
+            ttnn.synchronize_device(mesh_device)
+            ids = _dev0(logits.ids, mesh_device).to(torch.int64)
+            vals = _dev0(logits.values, mesh_device).float()
+            logits.deallocate(True)
+            next_hidden.deallocate(True)
+            full = _time_traced_step(mesh_device, rig, return_logits=True)
+            nolm = _time_traced_step(mesh_device, rig, return_logits=False)
+            results[tag] = (ids, vals, full, nolm)
+            logger.info(
+                f"[cme] {tag:<14} full={full:.3f} ms/step ({1e3/full:6.2f} tok/s/u)  "
+                f"backbone={nolm:.3f} ms  head={full-nolm:.3f} ms"
+            )
+
+        (id_g, v_g, f_g, n_g), (id_d, v_d, f_d, n_d) = results["legacy-gather"], results["digit-embed"]
+        logger.info(
+            f"[cme] ===== head {f_g-n_g:.3f} -> {f_d-n_d:.3f} ms ({(f_g-n_g)/(f_d-n_d):.1f}x), "
+            f"step {f_g:.3f} -> {f_d:.3f} ms ({f_g/f_d:.2f}x, "
+            f"{1e3/f_g:.1f} -> {1e3/f_d:.1f} tok/s/u) ====="
+        )
+        assert torch.equal(
+            id_g, id_d
+        ), f"digit path changed the candidate ids: {int((id_g != id_d).sum())} of {id_g.numel()} differ"
+        assert torch.equal(v_g, v_d), "digit path changed the candidate logits"
+    finally:
+        os.environ.pop("GEMMA4_CME_GATHER", None)
+        if prev is not None:
+            os.environ["GEMMA4_CME_GATHER"] = prev
+
+
+@_needs_assistant
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2)], device_params_extra={"trace_region_size": 200_000_000})
 def test_profile_eager_step(mesh_device, reset_seeds):
     """Eager (untraced) drafter steps, for per-op device times under the profiler.
