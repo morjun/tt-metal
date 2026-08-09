@@ -746,3 +746,89 @@ def test_l1_headroom_probe(mesh_device, reset_seeds):
     logger.info(f"[headroom] ===== largest L1 weight footprint that still runs: {last_ok:.1f} MB/device =====")
     for t in filler:
         t.deallocate(True)
+
+
+# ── why L1 weights cost time: it is kernel selection, not the L1 read path ────
+
+_MM_MC = {"dram": ttnn.DRAM_MEMORY_CONFIG, "l1": ttnn.L1_MEMORY_CONFIG}
+_MM_INNER, _MM_REPLAYS = 20, 30
+
+
+def _mm_timed(md, x_t, w_t, a, b, pc=None):
+    x = ttnn.from_torch(x_t, device=md, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=_MM_MC[a])
+    w = ttnn.from_torch(w_t, device=md, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=_MM_MC[b])
+    kw = {"program_config": pc} if pc is not None else {}
+    outs = [ttnn.linear(x, w, **kw) for _ in range(_MM_INNER)]
+    ttnn.synchronize_device(md)
+    ref = ttnn.to_torch(outs[0]).float()
+    for o in outs:
+        o.deallocate(True)
+    tid = ttnn.begin_trace_capture(md, cq_id=0)
+    outs = [ttnn.linear(x, w, **kw) for _ in range(_MM_INNER)]
+    ttnn.end_trace_capture(md, tid, cq_id=0)
+    ttnn.synchronize_device(md)
+    for _ in range(3):
+        ttnn.execute_trace(md, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(md)
+    t0 = time.perf_counter()
+    for _ in range(_MM_REPLAYS):
+        ttnn.execute_trace(md, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(md)
+    us = (time.perf_counter() - t0) / _MM_REPLAYS / _MM_INNER * 1e6
+    ttnn.release_trace(md, tid)
+    for o in outs:
+        o.deallocate(True)
+    x.deallocate(True)
+    w.deallocate(True)
+    return us, ref
+
+
+#: The drafter's skinny-N shapes (o_proj, down_proj, pre_projection) plus a larger control.
+_MM_SHAPES = [(32, 512, 256), (32, 1024, 256), (32, 3072, 256), (32, 6144, 256)]
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_l1_penalty_is_kernel_selection(mesh_device, reset_seeds):
+    """The L1-weight penalty is ttnn's matmul heuristic, NOT the L1 read path.
+
+    Times ttnn.linear with the weight in DRAM vs L1, first letting ttnn choose
+    the program config and then forcing one explicit config on both.
+
+    MEASURED: with the auto config an L1 weight costs +72% to +93%, growing with
+    K. With one fixed config the penalty VANISHES (-0.1% to -4.3%, i.e. L1 is
+    equal or marginally faster) and the two outputs become bit-identical — so
+    the earlier "different accumulation order" numerical difference was the same
+    artifact. The fixed config is also 1.4-1.7x faster than ttnn's choice for
+    the DRAM baseline, so the heuristic is leaving throughput on the table at
+    these shapes regardless of where the weight lives.
+    """
+    pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(8, 1),
+        in0_block_w=4,
+        out_subblock_h=1,
+        out_subblock_w=1,
+        per_core_M=1,
+        per_core_N=1,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+    torch.manual_seed(0)
+    logger.info(
+        f"{'K':>6} | {'auto dram':>10}{'auto l1':>9}{'pen':>8} | {'fixed dram':>11}{'fixed l1':>10}{'pen':>8} |"
+        f" {'speedup':>8} | {'pcc vs fp32':>22} | bitwise d==l1"
+    )
+    for M, K, N in _MM_SHAPES:
+        x_t = torch.randn(1, 1, M, K).bfloat16()
+        w_t = torch.randn(1, 1, K, N).bfloat16()
+        gold = x_t.float() @ w_t.float()
+        ad, rad = _mm_timed(mesh_device, x_t, w_t, "dram", "dram")
+        al, ral = _mm_timed(mesh_device, x_t, w_t, "dram", "l1")
+        fd, rfd = _mm_timed(mesh_device, x_t, w_t, "dram", "dram", pc)
+        fl, rfl = _mm_timed(mesh_device, x_t, w_t, "dram", "l1", pc)
+        logger.info(
+            f"{K:>6} | {ad:>10.1f}{al:>9.1f}{(al-ad)/ad*100:>+7.1f}% | {fd:>11.1f}{fl:>10.1f}{(fl-fd)/fd*100:>+7.1f}% |"
+            f" {ad/fd:>7.2f}x | auto {_pcc(gold,rad):.5f} fixed {_pcc(gold,rfd):.5f} |"
+            f" auto={bool(torch.equal(rad,ral))} fixed={bool(torch.equal(rfd,rfl))}"
+        )
+        assert _pcc(gold, rfd) > 0.999 and _pcc(gold, rfl) > 0.999, "forced config lost accuracy"
