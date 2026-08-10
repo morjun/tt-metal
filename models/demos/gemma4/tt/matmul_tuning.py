@@ -115,10 +115,11 @@ class DecodeMatmulTuner:
             enabled = False
         else:
             enabled = scope in {s.strip() for s in raw.split(",")}
-        return cls(mesh_device, enabled=enabled)
+        return cls(mesh_device, enabled=enabled, label=scope)
 
-    def __init__(self, mesh_device=None, enabled=False):
+    def __init__(self, mesh_device=None, enabled=False, label="mm"):
         self.enabled = bool(enabled)
+        self.label = label
         self._cache = {}
         self._max_x, self._max_y = 8, 8
         if self.enabled and mesh_device is not None:
@@ -132,7 +133,15 @@ class DecodeMatmulTuner:
         if key not in self._cache:
             pc = derive_decode_1d_config(int(x.shape[-2]), int(x.shape[-1]), int(w.shape[-1]), self._max_x, self._max_y)
             self._cache[key] = pc
-            logger.debug(f"[mm-tune] {tuple(x.shape)} x {tuple(w.shape)} -> {'tuned' if pc else 'auto'}")
+            # One line per DISTINCT shape (the cache makes this fire once each), so
+            # this stays ~10 lines for a 35-layer model and gives the attribution
+            # for any measured speedup rather than just a count.
+            grid = f" grid={pc.compute_with_storage_grid_size.x}x{pc.compute_with_storage_grid_size.y}" if pc else ""
+            blk = f" in0_block_w={pc.in0_block_w} per_core_N={pc.per_core_N}" if pc else ""
+            logger.info(
+                f"[mm-tune:{self.label}] M={int(x.shape[-2])} K={int(x.shape[-1])} N={int(w.shape[-1])}"
+                f" -> {'TUNED' if pc else 'auto'}{grid}{blk}"
+            )
         return self._cache[key]
 
     def stats(self):

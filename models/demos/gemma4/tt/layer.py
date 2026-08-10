@@ -45,6 +45,7 @@ import ttnn
 from models.demos.gemma4.tt.attention import Gemma4Attention, Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.operations import _stage_fp
 from models.demos.gemma4.tt.gemma4_attention_config import get_attention_program_config
+from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.moe import MoEBlock
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.shared_mlp import SharedMLP
@@ -76,6 +77,9 @@ class Gemma4DecoderLayer:
     ):
         # Per-module dtype overrides default to the model-wide ``dtype`` so
         # callers that don't care about precision config see no change.
+        # Per-layer-input projections are decode linears too (N = pli_size), and
+        # they are the skinny-N shape the tuned config helps most.
+        self.mm = resolve_tuner(matmul_tuner)
         if shared_mlp_dtype is None:
             shared_mlp_dtype = dtype
         if attention_dtype is None:
@@ -335,11 +339,11 @@ class Gemma4DecoderLayer:
             # packed verify from P (anchor + drafts). Row 0 is the anchor in both, so it must
             # match bit-for-bit -- if it does not, the two PLI construction paths disagree.
             _stage_fp("J:pli_in", per_layer_input)
-            gated = ttnn.linear(hidden_states, self.per_layer_input_gate)
+            gated = self.mm.linear(hidden_states, self.per_layer_input_gate)
             _stage_fp("K:pli_gated", gated)
             gated = ttnn.gelu(gated, fast_and_approximate_mode=True)
             gated = ttnn.mul(gated, per_layer_input)
-            projected = ttnn.linear(gated, self.per_layer_projection)
+            projected = self.mm.linear(gated, self.per_layer_projection)
             normed_pli = self.post_per_layer_input_norm.forward(projected)
             _stage_fp("L:pli_normed", normed_pli)
             hidden_states = ttnn.add(residual_pli, normed_pli)
