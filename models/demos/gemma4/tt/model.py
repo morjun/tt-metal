@@ -26,6 +26,7 @@ import ttnn
 from models.common.sampling.generator import SamplingGenerator
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
@@ -249,9 +250,19 @@ class Gemma4Model:
         create_kv_cache=True,
         precision=None,
         bounded_sliding_kv_cache: bool = False,
+        matmul_tuner=None,
         # Legacy parameters — ignored
         transformation_mats=None,
     ):
+        # Explicit decode matmul program configs for the 35 decoder layers'
+        # linears (see tt/matmul_tuning.py). Default OFF; opt in with
+        # GEMMA4_TUNE_MATMULS=target (or =1 for target + drafter). Prefill is
+        # unaffected by construction — the config only applies at one tile row.
+        # lm_head is deliberately excluded: it already has
+        # _get_lm_head_program_config.
+        self.matmul_tuner = (
+            matmul_tuner if matmul_tuner is not None else DecodeMatmulTuner.from_env(mesh_device, scope="target")
+        )
         self.mesh_device = mesh_device
         self.hf_config = hf_config
         # kept for lazily-built weights (e.g. init_pli_device_weights)
@@ -438,6 +449,7 @@ class Gemma4Model:
                 max_seq_len=max_seq_len,
                 max_local_batch_size=max_local_batch_size,
                 bounded_sliding_kv_cache=bounded_sliding_kv_cache,
+                matmul_tuner=self.matmul_tuner,
             )
             # Create KV cache for non-shared layers only
             # Shared layers will use their source layer's KV cache

@@ -101,10 +101,20 @@ class DecodeMatmulTuner:
     """
 
     @classmethod
-    def from_env(cls, mesh_device=None, default=False):
-        """Build from ``GEMMA4_TUNE_MATMULS`` (1/true/yes/on enables)."""
-        raw = os.getenv("GEMMA4_TUNE_MATMULS")
-        enabled = default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+    def from_env(cls, mesh_device=None, scope="draft"):
+        """Build from ``GEMMA4_TUNE_MATMULS``.
+
+        ``1``/``true``/``all`` enables everywhere; ``0``/unset disables. A comma
+        list selects scopes — ``draft``, ``target``, or ``draft,target`` — so the
+        drafter and the 35-layer target can be A/B'd independently.
+        """
+        raw = (os.getenv("GEMMA4_TUNE_MATMULS") or "").strip().lower()
+        if raw in ("1", "true", "yes", "on", "all"):
+            enabled = True
+        elif raw in ("", "0", "false", "no", "off"):
+            enabled = False
+        else:
+            enabled = scope in {s.strip() for s in raw.split(",")}
         return cls(mesh_device, enabled=enabled)
 
     def __init__(self, mesh_device=None, enabled=False):
