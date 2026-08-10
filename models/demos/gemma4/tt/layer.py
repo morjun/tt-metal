@@ -71,6 +71,7 @@ class Gemma4DecoderLayer:
         router_dtype=None,
         bounded_sliding_kv_cache: bool = False,
         weight_placement=None,
+        matmul_tuner=None,
         transformation_mats=None,  # Legacy — ignored (HF-style RoPE needs no transformation mats)
     ):
         # Per-module dtype overrides default to the model-wide ``dtype`` so
@@ -142,6 +143,7 @@ class Gemma4DecoderLayer:
             weight_dtype=attention_dtype,
             bounded_sliding_kv_cache=bounded_sliding_kv_cache,
             weight_placement=weight_placement,
+            matmul_tuner=matmul_tuner,
         )
 
         # Shared/dense MLP (HF key: "mlp")
@@ -154,6 +156,7 @@ class Gemma4DecoderLayer:
             dtype=shared_mlp_dtype,
             tensor_cache_path=f"{tensor_cache_path}/layer_{layer_idx}/mlp" if tensor_cache_path else None,
             weight_placement=weight_placement,
+            matmul_tuner=matmul_tuner,
         )
 
         # MoE block (router + routed experts) — split dtypes between the two

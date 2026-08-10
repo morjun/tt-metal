@@ -19,6 +19,7 @@ import os
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 
 from .weights import AttentionWeights
 
@@ -135,14 +136,14 @@ def _stage_fp_full(tag, t):
     )
 
 
-def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
+def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None, matmul_tuner=None):
     """Fused QKV matmul (no bias for Gemma4).
 
     ``memory_config`` lets the packed-verify decode keep the projection output
     resident on L1; ``None`` keeps the op default (DRAM) for existing callers.
     """
     _stage_fp("1:hidden_in", hidden_states)
-    _out = ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    _out = resolve_tuner(matmul_tuner).linear(hidden_states, weights.wqkv, memory_config=memory_config)
     _stage_fp("2:xqkv_out", _out)
     return _out
 
@@ -585,9 +586,9 @@ def concat_heads(tensor, is_decode_mode: bool, num_heads: int = None, head_dim: 
     return ttnn.experimental.nlp_concat_heads(tensor, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-def apply_output_projection(tensor, weights: AttentionWeights):
+def apply_output_projection(tensor, weights: AttentionWeights, matmul_tuner=None):
     """Apply output projection (no bias for Gemma4)."""
-    out = ttnn.linear(tensor, weights.o_proj)
+    out = resolve_tuner(matmul_tuner).linear(tensor, weights.o_proj)
     tensor.deallocate(True)
     return out
 

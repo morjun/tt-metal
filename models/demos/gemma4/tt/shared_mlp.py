@@ -16,6 +16,7 @@ HF weight shapes:
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.weight_placement import place_as_tensor
 from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
@@ -32,8 +33,10 @@ class SharedMLP:
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
         weight_placement=None,
+        matmul_tuner=None,
     ):
         placement = resolve_placement(weight_placement)
+        self.mm = resolve_tuner(matmul_tuner)
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
         self.ccl_manager = ccl_manager
@@ -92,11 +95,11 @@ class SharedMLP:
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
         # gate = GELU(x @ gate_proj)
-        gate = ttnn.linear(hidden_states, self.gate_proj)
+        gate = self.mm.linear(hidden_states, self.gate_proj)
         gate = ttnn.gelu(gate, fast_and_approximate_mode=True)
 
         # up = x @ up_proj
-        up = ttnn.linear(hidden_states, self.up_proj)
+        up = self.mm.linear(hidden_states, self.up_proj)
 
         # hidden = gate * up
         hidden = ttnn.mul(gate, up)
@@ -104,7 +107,7 @@ class SharedMLP:
         up.deallocate(True)
 
         # output = hidden @ down_proj
-        output = ttnn.linear(hidden, self.down_proj)
+        output = self.mm.linear(hidden, self.down_proj)
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj

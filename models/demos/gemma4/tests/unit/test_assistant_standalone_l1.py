@@ -58,6 +58,7 @@ from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
 from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.model import create_rope_caches
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs
 from models.demos.gemma4.tt.weight_placement import WeightPlacement
@@ -224,7 +225,9 @@ def _fabricate_shared_kv(mesh_device, text_args, tp, num_devices, mapper, contex
     return shared_kv, page_table_tt
 
 
-def _build_standalone(mesh_device, placement_mode, context_len=DEFAULT_CONTEXT, max_seq_len=1024, budget_mb=None):
+def _build_standalone(
+    mesh_device, placement_mode, context_len=DEFAULT_CONTEXT, max_seq_len=1024, budget_mb=None, tune_matmuls=None
+):
     """Build the drafter alone, on a stub target, with the given weight placement.
 
     Returns a dict of everything a step needs plus the placement policy object.
@@ -254,6 +257,10 @@ def _build_standalone(mesh_device, placement_mode, context_len=DEFAULT_CONTEXT, 
     kwargs = {} if budget_mb is None else {"budget_bytes": int(budget_mb * (1 << 20))}
     placement = WeightPlacement(mode=placement_mode, label=f"assistant-{placement_mode}", **kwargs)
 
+    if tune_matmuls is None:
+        tune_matmuls = os.getenv("GEMMA4_TUNE_MATMULS", "0") == "1"
+    tuner = DecodeMatmulTuner(mesh_device, enabled=tune_matmuls)
+
     state_dict = Gemma4AssistantArgs.load_state_dict(ASSISTANT_PATH, dummy_weights=False)
     assistant = Gemma4AssistantModel(
         mesh_device=mesh_device,
@@ -265,6 +272,7 @@ def _build_standalone(mesh_device, placement_mode, context_len=DEFAULT_CONTEXT, 
         tensor_cache_path=str(assistant_args.weight_cache_path(ttnn.bfloat16)),
         mesh_config=mesh_config,
         weight_placement=placement,
+        matmul_tuner=tuner,
     )
 
     shared_kv, page_table_tt = _fabricate_shared_kv(mesh_device, text_args, tp, num_devices, mapper, context_len)
@@ -618,6 +626,73 @@ def test_l1_capacity_ceiling(mesh_device, budget_mb, reset_seeds):
         logger.info(f"[capacity] step still runs at budget={budget_mb} MB: {ms:.3f} ms/step")
     except Exception as e:  # noqa: BLE001
         logger.info(f"[capacity] allocation succeeded but the step FAILED: {type(e).__name__}: {e}")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 2)], device_params_extra={"trace_region_size": 200_000_000})
+def test_tuned_matmuls_in_model(mesh_device, reset_seeds):
+    """Explicit decode matmul program configs, measured in the real drafter.
+
+    The isolated numbers (`test_matmul_weight_placement.py`) say the tuned config
+    is 1.1-2.4x per matmul with the weights left in DRAM. This checks what that is
+    worth once it is inside the model, where the linears are only part of the
+    step — and that the output does not change.
+    """
+    out = {}
+    for tag, tune in (("auto", False), ("tuned", True)):
+        rig = _build_standalone(mesh_device, "dram", tune_matmuls=tune)
+        logits, next_hidden = rig["assistant"].step(*_step_args(rig))
+        ttnn.synchronize_device(mesh_device)
+        ids = _dev0(logits.ids, mesh_device).to(torch.int64)
+        vals = _dev0(logits.values, mesh_device).float()
+        hid = _dev0(next_hidden, mesh_device).float()
+        logits.deallocate(True)
+        next_hidden.deallocate(True)
+        full = _time_traced_step(mesh_device, rig, return_logits=True)
+        nolm = _time_traced_step(mesh_device, rig, return_logits=False)
+        out[tag] = (full, nolm, ids, vals, hid)
+        n_tuned, n_shapes = rig["assistant"].mm.stats()
+        logger.info(
+            f"[tuned] {tag:<6} full={full:.3f} ms/step ({1e3/full:6.2f} tok/s/u)  "
+            f"backbone={nolm:.3f} ms  head={full-nolm:.3f} ms  "
+            f"[{n_tuned}/{n_shapes} shapes tuned]"
+        )
+        if tune:
+            assert n_tuned > 0, "tuner enabled but no shape qualified — the config never fired"
+
+    (fa, na, ida, va, ha), (ft, nt, idt, vt, ht) = out["auto"], out["tuned"]
+    logger.info(
+        f"[tuned] ===== backbone {na:.3f} -> {nt:.3f} ms ({(na-nt)/na*100:+.2f}%), "
+        f"step {fa:.3f} -> {ft:.3f} ms ({(fa-ft)/fa*100:+.2f}%, "
+        f"{1e3/fa:.1f} -> {1e3/ft:.1f} tok/s/u) ====="
+    )
+
+    # This config is NOT bit-neutral: it reblocks the K accumulation, so it rounds
+    # differently (measured per-op: 0.99988 vs 0.99997 PCC against fp32 — both
+    # correct, the tuned one marginally less so). The drafter amplifies any ULP,
+    # so calibrate against a 1-bf16-ULP input perturbation exactly as
+    # test_standalone_parity_dram_vs_l1 does, rather than demanding equality.
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=False)
+    hb = _dev0(rig["hidden"], mesh_device)
+    perturbed = ((hb.view(torch.int16).int() + 1).to(torch.int16)).view(torch.bfloat16)
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device) if mesh_device.get_num_devices() > 1 else None
+    rig["hidden"] = ttnn.from_torch(
+        perturbed, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=mapper
+    )
+    lg_u, nh_u = rig["assistant"].step(*_step_args(rig))
+    ttnn.synchronize_device(mesh_device)
+    hu = _dev0(nh_u, mesh_device).float()
+
+    d_tuned, d_ulp = _pcc(ha, ht), _pcc(ha, hu)
+    logger.info(
+        f"[tuned] auto vs tuned    : hidden_pcc={d_tuned:.6f} logits_pcc={_pcc(va, vt):.6f} ids_equal={bool(torch.equal(ida, idt))}"
+    )
+    logger.info(f"[tuned] auto vs +1ULP-in : hidden_pcc={d_ulp:.6f}")
+    assert d_tuned >= d_ulp, (
+        f"tuned config perturbs the drafter MORE than a 1-ULP input change "
+        f"(pcc {d_tuned:.6f} < {d_ulp:.6f}) — that is beyond reblocking, investigate"
+    )
+    assert nt < na, f"tuned backbone ({nt:.3f} ms) not faster than auto ({na:.3f} ms)"
 
 
 @_needs_assistant

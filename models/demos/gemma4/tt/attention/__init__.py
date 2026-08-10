@@ -77,9 +77,11 @@ class Gemma4Attention:
         weight_dtype=ttnn.bfloat16,
         bounded_sliding_kv_cache: bool = False,
         weight_placement=None,
+        matmul_tuner=None,
         # Legacy parameter — ignored (no longer needed with HF-style RoPE)
         transformation_mats=None,
     ):
+        self.matmul_tuner = matmul_tuner
         self.mesh_device = mesh_device
         self.config = config
         self.ccl_manager = ccl_manager
@@ -195,6 +197,7 @@ class Gemma4Attention:
                 kv_staging=self.kv_staging,
                 embed_idx=packed.get("embed_idx"),
                 hot_pt=packed.get("hot_pt"),
+                matmul_tuner=self.matmul_tuner,
             )
 
         if is_decode:
@@ -215,6 +218,7 @@ class Gemma4Attention:
                 position_idx_cache=position_idx_cache,
                 sequential_kv_write=sequential_kv_write,
                 rope_presliced=rope_presliced,
+                matmul_tuner=self.matmul_tuner,
             )
         else:
             # Sliding-window layers under generator-level chunked prefill carry a

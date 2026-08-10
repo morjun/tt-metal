@@ -40,6 +40,7 @@ from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbe
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.weight_placement import place_as_tensor
 from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
@@ -84,7 +85,10 @@ class Gemma4AssistantModel:
         mesh_config=None,
         max_local_batch_size=1,
         weight_placement=None,
+        matmul_tuner=None,
     ):
+        # Explicit decode matmul program configs (default off). See tt/matmul_tuning.py.
+        self.mm = resolve_tuner(matmul_tuner)
         # Where this drafter's weights live (DRAM by default). The policy object
         # accumulates a per-device byte total across every tensor below, so the
         # construction order below is also the priority order for the L1 budget:
@@ -134,6 +138,7 @@ class Gemma4AssistantModel:
                 max_seq_len=self.text_args.max_seq_len,
                 max_local_batch_size=max_local_batch_size,
                 weight_placement=placement,
+                matmul_tuner=self.mm,
             )
             self.layers.append(layer)
 
@@ -247,7 +252,7 @@ class Gemma4AssistantModel:
         inp = ttnn.concat([tok_embed, target_hidden], dim=-1)
         tok_embed.deallocate(True)
 
-        h = ttnn.linear(inp, self.pre_projection)
+        h = self.mm.linear(inp, self.pre_projection)
         inp.deallocate(True)
 
         for i, layer in enumerate(self.layers):
@@ -278,6 +283,6 @@ class Gemma4AssistantModel:
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)
 
-        next_hidden = ttnn.linear(normed, self.post_projection)
+        next_hidden = self.mm.linear(normed, self.post_projection)
         normed.deallocate(True)
         return logits, next_hidden
