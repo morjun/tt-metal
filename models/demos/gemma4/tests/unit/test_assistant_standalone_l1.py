@@ -907,3 +907,107 @@ def test_l1_penalty_is_kernel_selection(mesh_device, reset_seeds):
             f" auto={bool(torch.equal(rad,ral))} fixed={bool(torch.equal(rfd,rfl))}"
         )
         assert _pcc(gold, rfd) > 0.999 and _pcc(gold, rfl) > 0.999, "forced config lost accuracy"
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 2)], device_params_extra={"trace_region_size": 200_000_000})
+def test_l1_headroom_with_real_target(mesh_device, reset_seeds):
+    """Usable L1 alongside the 35-layer TARGET, not just the 4-layer drafter.
+
+    The 46 MB figure quoted elsewhere was measured with the drafter's circular
+    buffers. The target's CBs are far larger, and TP changes them again (narrower
+    per-device matmuls => smaller CBs), so the real weight-pinning budget for the
+    target is a different number. This measures it: allocate L1-interleaved filler
+    until a real target decode forward stops fitting, and report the last size
+    that ran.
+    """
+    import math as _math
+
+    from models.demos.gemma4.tt.common import create_assistant_model
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+
+    max_seq_len, block_size = 1024, 64
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=_math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    target = generator.model[0]
+    _, assistant = create_assistant_model(
+        mesh_device=mesh_device,
+        target_model=target,
+        mesh_config=target.mesh_config,
+        ccl_manager=target.ccl_manager,
+        assistant_path=ASSISTANT_PATH,
+    )
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+
+    page_table = create_tt_page_table(1, pac)
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        ["Explain how a CPU pipeline works."], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    anchor_token, anchor_pos = int(encoded[0][prefill_lens[0] - 1]), prefill_lens[0] - 1
+    spec = SpeculativeDecoder(
+        target_model=target,
+        assistant_model=assistant,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        stop_tokens=tokenizer.stop_tokens,
+        draft_len=3,
+    )
+    generator.prefill_forward_text(in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos)
+
+    def _target_step():
+        lg, hid = spec._verify([anchor_token], [anchor_pos])
+        ttnn.synchronize_device(mesh_device)
+        hid.deallocate(True)
+
+    _target_step()
+    tp = mesh_device.shape[1] if mesh_device.get_num_devices() > 1 else 1
+    logger.info(f"[tgt-headroom] tp={tp}: baseline target decode OK, adding L1 filler")
+
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device) if mesh_device.get_num_devices() > 1 else None
+    filler, last_ok = [], 0
+    for total_mb in (16, 32, 48, 64, 80, 96, 112, 128):
+        have = sum(t.volume() * 2 for t in filler) / (1 << 20)
+        want_mb = total_mb - have
+        if want_mb > 0:
+            rows = max(32, int(want_mb * (1 << 20) / 2 / 1024 / 32) * 32)
+            try:
+                filler.append(
+                    ttnn.from_torch(
+                        torch.zeros(1, 1, rows, 1024, dtype=torch.bfloat16),
+                        device=mesh_device,
+                        layout=ttnn.TILE_LAYOUT,
+                        dtype=ttnn.bfloat16,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        mesh_mapper=mapper,
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.info(f"[tgt-headroom] {total_mb} MB: FILLER ALLOC FAILED: {str(e)[:120]}")
+                break
+        try:
+            _target_step()
+            last_ok = total_mb
+            logger.info(f"[tgt-headroom] {total_mb:4d} MB pinned: target decode OK")
+        except Exception as e:  # noqa: BLE001
+            first = str(e).split("backtrace")[0].strip().replace("\n", " ")
+            logger.info(f"[tgt-headroom] {total_mb:4d} MB pinned: FAILED -> {first[:190]}")
+            break
+    logger.info(f"[tgt-headroom] ===== tp={tp}: usable L1 alongside the 35-layer target = {last_ok} MB/device =====")
+    for t in filler:
+        t.deallocate(True)
