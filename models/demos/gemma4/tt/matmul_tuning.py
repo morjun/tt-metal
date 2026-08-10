@@ -33,6 +33,8 @@ Default OFF (`enabled=False`), so the target model and existing tests are
 unaffected until explicitly opted in.
 """
 
+import os
+
 from loguru import logger
 
 import ttnn
@@ -97,6 +99,13 @@ class DecodeMatmulTuner:
     lazily on first use and cached by (in0 shape, in1 shape) — the same
     lazy-cache pattern as ``RMSNorm._build_sharded_cfg``.
     """
+
+    @classmethod
+    def from_env(cls, mesh_device=None, default=False):
+        """Build from ``GEMMA4_TUNE_MATMULS`` (1/true/yes/on enables)."""
+        raw = os.getenv("GEMMA4_TUNE_MATMULS")
+        enabled = default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+        return cls(mesh_device, enabled=enabled)
 
     def __init__(self, mesh_device=None, enabled=False):
         self.enabled = bool(enabled)

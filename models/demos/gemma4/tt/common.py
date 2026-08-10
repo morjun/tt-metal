@@ -16,6 +16,7 @@ import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
 from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.ccl import CCLManager
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.model import Gemma4Model
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs, Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
@@ -152,6 +153,11 @@ def create_assistant_model(
         state_dict = Gemma4AssistantArgs.load_state_dict(assistant_path, dummy_weights=False)
 
     tensor_cache_path = str(assistant_args.weight_cache_path(dtype))
+
+    # Opt-in via GEMMA4_TUNE_MATMULS so existing spec-decode entry points can flip
+    # the tuned decode matmul configs without threading a new argument. Default off.
+    if matmul_tuner is None:
+        matmul_tuner = DecodeMatmulTuner.from_env(mesh_device)
 
     model = Gemma4AssistantModel(
         mesh_device=mesh_device,
