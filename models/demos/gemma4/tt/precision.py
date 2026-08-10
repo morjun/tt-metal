@@ -77,13 +77,11 @@ class Gemma4Precision:
             with open(_PATH) as f:
                 table = json.load(f)
         except FileNotFoundError:
-            return cls({})
+            table = {}
 
-        model_entry = table.get(model_key)
-        if not model_entry:
-            return cls({})
-
-        # Mesh-specific override wins over "default"
+        # Mesh-specific override wins over "default"; a model absent from the
+        # table simply starts empty (the env overlay below still applies).
+        model_entry = table.get(model_key) or {}
         raw = model_entry.get(mesh_key) or model_entry.get("default") or {}
         resolved = {}
         for k, v in raw.items():
@@ -95,4 +93,23 @@ class Gemma4Precision:
                     f"unknown dtype; expected one of {sorted(_DTYPE_BY_NAME)}"
                 )
             resolved[k] = _DTYPE_BY_NAME[v]
+
+        # GEMMA4_PRECISION overlays the JSON, e.g.
+        #   GEMMA4_PRECISION="shared_mlp=bfp8,attention=bfp8"
+        # so a precision A/B does not require editing the shared config file.
+        # Cache filenames already carry the dtype suffix, so flipping back and
+        # forth re-caches rather than reusing a stale tensor.
+        raw_env = (os.getenv("GEMMA4_PRECISION") or "").strip()
+        for item in (i.strip() for i in raw_env.split(",") if i.strip()):
+            k, _, v = item.partition("=")
+            k, v = k.strip(), v.strip()
+            if k not in KNOWN_MODULES:
+                raise ValueError(f"GEMMA4_PRECISION: unknown module {k!r}; expected one of {sorted(KNOWN_MODULES)}")
+            if v not in _DTYPE_BY_NAME:
+                raise ValueError(f"GEMMA4_PRECISION: {k}={v!r} — expected one of {sorted(_DTYPE_BY_NAME)}")
+            resolved[k] = _DTYPE_BY_NAME[v]
+        if raw_env:
+            import loguru
+
+            loguru.logger.info(f"[precision] GEMMA4_PRECISION overlay -> {resolved}")
         return cls(resolved)
