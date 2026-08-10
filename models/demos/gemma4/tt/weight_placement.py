@@ -152,6 +152,11 @@ class WeightPlacement:
     #: Names carry ``layer_<i>/``, so this filters on the parsed index.
     #: Env: GEMMA4_L1_LAYERS="0,1,2" or "0-3".
     layers: tuple = ()
+    #: Defer all sharding to an explicit post-load pass. Required for the TARGET,
+    #: whose weights also serve prefill: a decode-shaped shard makes prefill's
+    #: auto-selected config FATAL, so the reshard must wait until prefill is done
+    #: (Gemma4Model.pin_l1_weights). The drafter has no prefill and leaves this off.
+    defer: bool = False
     used_bytes: int = 0
     entries: list = field(default_factory=list)
 
@@ -223,6 +228,9 @@ class WeightPlacement:
         fits in the remaining per-device budget.
         """
         if not self.enabled:
+            return ttnn.DRAM_MEMORY_CONFIG
+        if self.sharded and self.defer:
+            # Budget is accounted for by the post-prefill pass, not here.
             return ttnn.DRAM_MEMORY_CONFIG
         if shape is None:
             # Dummy-weight paths pass a None tensor; nothing to account for.
@@ -386,6 +394,8 @@ def place_as_tensor(
         cache_file_name=cache_file_name,
         memory_config=mem,
     )
+    if placement.sharded and placement.defer:
+        return tensor
     if placement.sharded and mem.buffer_type == ttnn.BufferType.DRAM:
         # memory_config() returns DRAM for sharded mode; a recorded L1 entry means
         # "pin this one". Anything else genuinely stays in DRAM.

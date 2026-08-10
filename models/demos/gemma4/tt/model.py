@@ -28,7 +28,7 @@ from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
-from models.demos.gemma4.tt.weight_placement import WeightPlacement
+from models.demos.gemma4.tt.weight_placement import WeightPlacement, shard_l1_width
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
 
@@ -270,7 +270,7 @@ class Gemma4Model:
         # L1-sharded weights REQUIRE the matching program config (the matmul
         # validator FATALs on per_core_N != in1 shard width), so enable the tuner
         # alongside rather than letting the two drift apart.
-        self.weight_placement = weight_placement or WeightPlacement.from_env(label="target")
+        self.weight_placement = weight_placement or WeightPlacement.from_env(label="target", defer=True)
         if self.weight_placement.sharded and not self.matmul_tuner.enabled:
             logger.info("[placement:target] l1_sharded requires the tuned matmul config; enabling it")
             self.matmul_tuner = DecodeMatmulTuner(mesh_device, enabled=True, label="target")
@@ -1283,6 +1283,59 @@ class Gemma4Model:
 
             embeds = ccl_allgather(embeds, self.mesh_config, self.ccl_manager)
         return embeds
+
+    def pin_l1_weights(self):
+        """Reshard eligible decode weights to L1 WIDTH_SHARDED. Call AFTER prefill.
+
+        Load-time sharding does not work for the target: its weights serve BOTH
+        prefill and decode, and at prefill the tuned config does not apply
+        (Mt != 1), so ttnn auto-selects a config that clashes with a
+        decode-shaped shard ("input B shard width in tiles must equal
+        per_core_N"). Deferring to here sidesteps it — prefill runs once, decode
+        thousands of times.
+
+        No-op unless the placement is in l1_sharded mode. Idempotent.
+        """
+        p = self.weight_placement
+        if not getattr(p, "sharded", False) or getattr(self, "_l1_pinned", False):
+            return
+        self._l1_pinned = True
+
+        pinned = 0
+        for i, layer in enumerate(self.layers):
+            if not p._layer_allowed(f"layer_{i}/"):
+                continue
+            targets = [
+                (layer.shared_mlp, "gate_proj"),
+                (layer.shared_mlp, "up_proj"),
+                (layer.shared_mlp, "down_proj"),
+                (layer.self_attn.weights, "wqkv"),
+                (layer.self_attn.weights, "o_proj"),
+            ]
+            for holder, attr in targets:
+                w = getattr(holder, attr, None)
+                if w is None or w.memory_config().is_sharded():
+                    continue
+                nbytes = w.volume() * 2
+                if p.used_bytes + nbytes > p.budget_bytes:
+                    continue
+                try:
+                    moved = shard_l1_width(w, self.mesh_device)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[placement:target] layer {i} {attr}: {str(e)[:90]}")
+                    moved = None
+                if moved is None:
+                    continue
+                # AttentionWeights is a frozen dataclass; this is the one place we
+                # mutate it, deliberately, after construction.
+                object.__setattr__(holder, attr, moved)
+                w.deallocate(True)
+                p.used_bytes += nbytes
+                pinned += 1
+        logger.info(
+            f"[placement:target] post-prefill pin: {pinned} weights -> L1 WIDTH_SHARDED, "
+            f"{p.used_bytes/(1<<20):.2f} MB/device of {p.budget_bytes/(1<<20):.0f} MB budget"
+        )
 
     def get_shared_kv_caches(self):
         """Return the target KV caches the it-assistant drafter cross-attends to.

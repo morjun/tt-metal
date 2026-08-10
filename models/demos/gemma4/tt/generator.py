@@ -495,7 +495,7 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
             can_batch_prefill=can_batch_prefill,
         )
 
-        return super().prefill_forward_text(
+        out = super().prefill_forward_text(
             tokens=tokens,
             page_table=page_table,
             kv_cache=kv_cache,
@@ -509,6 +509,15 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
             warmup_prefill=warmup_prefill,
             **kwargs,
         )
+
+        # L1 weight pinning must happen AFTER prefill: a decode-shaped shard is
+        # incompatible with the config ttnn auto-selects for prefill's many-row
+        # matmuls. Prefill runs once and decode thousands of times, so paying it
+        # here costs nothing. No-op unless GEMMA4_WEIGHTS_IN_L1=sharded.
+        for _m in self.model:
+            if hasattr(_m, "pin_l1_weights"):
+                _m.pin_l1_weights()
+        return out
 
     @classmethod
     def from_pretrained(
