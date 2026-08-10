@@ -31,6 +31,7 @@ failure ("Statically allocated circular buffers ... clash with L1 buffers").
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -51,6 +52,41 @@ _BYTES_PER_ELEM = {
 }
 
 DEFAULT_BUDGET_MB = 32
+
+_LAYER_RE = re.compile(r"layer_(\d+)")
+
+
+def _parse_layer_spec(spec):
+    """ "0,1,2" or "0-3" or "0-3,7" -> frozenset of ints; empty -> ()."""
+    spec = (spec or "").strip()
+    if not spec:
+        return ()
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return frozenset(out)
+
+
+def _pick_grid(n_tiles, max_x=8, max_y=8):
+    """Largest core rectangle whose core count divides n_tiles.
+
+    MUST match DecodeMatmulTuner's grid choice — the matmul validator requires
+    per_core_N == in1 shard width in tiles, so a mismatch is a hard TT_FATAL.
+    """
+    best = (1, 1)
+    for gy in range(1, max_y + 1):
+        for gx in range(1, max_x + 1):
+            c = gx * gy
+            if n_tiles % c == 0 and c > best[0] * best[1]:
+                best = (gx, gy)
+    return best
 
 
 def _is_replicating(mesh_mapper) -> bool:
@@ -98,6 +134,12 @@ class WeightPlacement:
             the same process stay distinguishable.
     """
 
+    #: ``"dram"`` | ``"l1"`` (interleaved) | ``"l1_sharded"``.
+    #: MEASURED: interleaved L1 is worth ~0 (it stripes the weight across all 110
+    #: cores, so a compute core still fetches over the NoC). ``l1_sharded`` puts
+    #: each core's own N-slice in its own L1 and is worth 42-85% per matmul at the
+    #: target's shapes. It REQUIRES the matching explicit program config, so it
+    #: only pays off with DecodeMatmulTuner enabled.
     mode: str = "dram"
     budget_bytes: int = None
     label: str = "weights"
@@ -106,30 +148,56 @@ class WeightPlacement:
     #: just the MLPs, say) and as the bisect tool when an op misbehaves on an
     #: L1 operand. Env: GEMMA4_L1_ONLY="gate_proj,up_proj".
     only: tuple = ()
+    #: Layer allow-list for selective pinning. Empty = every layer is eligible.
+    #: Names carry ``layer_<i>/``, so this filters on the parsed index.
+    #: Env: GEMMA4_L1_LAYERS="0,1,2" or "0-3".
+    layers: tuple = ()
     used_bytes: int = 0
     entries: list = field(default_factory=list)
 
     def __post_init__(self):
-        if self.mode not in ("dram", "l1"):
-            raise ValueError(f"WeightPlacement.mode must be 'dram' or 'l1', got {self.mode!r}")
+        if self.mode not in ("dram", "l1", "l1_sharded"):
+            raise ValueError(f"WeightPlacement.mode must be dram|l1|l1_sharded, got {self.mode!r}")
         if self.budget_bytes is None:
             self.budget_bytes = int(float(os.getenv("GEMMA4_L1_WEIGHT_BUDGET_MB", DEFAULT_BUDGET_MB)) * (1 << 20))
         if not self.only:
             raw = os.getenv("GEMMA4_L1_ONLY", "").strip()
             self.only = tuple(s.strip() for s in raw.split(",") if s.strip()) if raw else ()
+        if not self.layers:
+            self.layers = _parse_layer_spec(os.getenv("GEMMA4_L1_LAYERS", ""))
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
-        """Build from ``GEMMA4_WEIGHTS_IN_L1`` (1/true/l1 enables L1 mode)."""
-        raw = os.getenv("GEMMA4_WEIGHTS_IN_L1")
+        """Build from ``GEMMA4_WEIGHTS_IN_L1``.
+
+        ``sharded`` (recommended) -> WIDTH_SHARDED on the matmul grid;
+        ``1``/``l1`` -> interleaved (measured worthless, kept for A/B);
+        ``0``/unset -> DRAM.
+        """
+        raw = (os.getenv("GEMMA4_WEIGHTS_IN_L1") or "").strip().lower()
         mode = default_mode
-        if raw is not None:
-            mode = "l1" if raw.strip().lower() in ("1", "true", "yes", "on", "l1") else "dram"
+        if raw in ("sharded", "l1_sharded", "shard"):
+            mode = "l1_sharded"
+        elif raw in ("1", "true", "yes", "on", "l1"):
+            mode = "l1"
+        elif raw in ("0", "false", "no", "off"):
+            mode = "dram"
         return cls(mode=mode, **kwargs)
 
     @property
     def enabled(self) -> bool:
-        return self.mode == "l1"
+        return self.mode in ("l1", "l1_sharded")
+
+    @property
+    def sharded(self) -> bool:
+        return self.mode == "l1_sharded"
+
+    def _layer_allowed(self, name):
+        if not self.layers:
+            return True
+        m = _LAYER_RE.search(name or "")
+        # Weights outside any layer (projections, CME tables) stay eligible.
+        return True if m is None else int(m.group(1)) in self.layers
 
     def log_hardware_ceiling(self, mesh_device):
         """Log the raw L1 bank capacity. Reference only — see the module docstring."""
@@ -163,6 +231,9 @@ class WeightPlacement:
         if self.only and not any(s in name for s in self.only):
             self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_ONLY"))
             return ttnn.DRAM_MEMORY_CONFIG
+        if not self._layer_allowed(name):
+            self.entries.append(_Entry(name, 0, False, "layer not in GEMMA4_L1_LAYERS"))
+            return ttnn.DRAM_MEMORY_CONFIG
 
         num_devices = 1
         if mesh_device is not None and hasattr(mesh_device, "get_num_devices"):
@@ -172,7 +243,10 @@ class WeightPlacement:
         if self.used_bytes + nbytes <= self.budget_bytes:
             self.used_bytes += nbytes
             self.entries.append(_Entry(name, nbytes, True, "fits"))
-            return ttnn.L1_MEMORY_CONFIG
+            # l1_sharded needs the PER-DEVICE shape to build its shard spec, which
+            # is only knowable after the mesh mapper has run. Load to DRAM here and
+            # let place_as_tensor reshard; it records the outcome either way.
+            return ttnn.DRAM_MEMORY_CONFIG if self.sharded else ttnn.L1_MEMORY_CONFIG
 
         self.entries.append(
             _Entry(
@@ -228,6 +302,50 @@ def resolve(placement):
     return placement if placement is not None else DRAM_ONLY
 
 
+def shard_l1_width(tensor, mesh_device):
+    """Reshard a loaded weight to L1 WIDTH_SHARDED on the matmul's compute grid.
+
+    Each core ends up holding exactly the N-slice it multiplies, which is what
+    makes L1 residency worth 42-85% per matmul (interleaved L1 buys ~0).
+
+    The grid comes from ``derive_decode_1d_config`` — the SAME function the matmul
+    tuner uses — because the validator requires
+    ``per_core_N == in1_shard_width_tiles`` and a duplicated grid heuristic drifts
+    out of sync (it did: "shard width in tiles (2) must equal per_core_N (1)").
+
+    Returns the resharded tensor, or None when the weight does not qualify
+    (ROW_MAJOR norms, shapes with no valid grid).
+    """
+    from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
+
+    T = ttnn.TILE_SIZE
+    if tensor.layout != ttnn.TILE_LAYOUT:
+        return None  # norms / embedding tables are not matmul in1
+    try:
+        local = ttnn.get_device_tensors(tensor)[0].shape if mesh_device.get_num_devices() > 1 else tensor.shape
+    except Exception:  # noqa: BLE001
+        local = tensor.shape
+    if len(local) < 2:
+        return None
+    k, n = int(local[-2]), int(local[-1])
+
+    pc = derive_decode_1d_config(1, k, n)
+    if pc is None:
+        return None
+    gx, gy = pc.compute_with_storage_grid_size.x, pc.compute_with_storage_grid_size.y
+    cores = gx * gy
+    shard_w = n // cores
+    if shard_w // T != pc.per_core_N:  # would FATAL in the matmul validator
+        return None
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+    mc = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(grid, [k, shard_w], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    return ttnn.to_memory_config(tensor, mc)
+
+
 def place_as_tensor(
     placement,
     name,
@@ -268,6 +386,36 @@ def place_as_tensor(
         cache_file_name=cache_file_name,
         memory_config=mem,
     )
+    if placement.sharded and mem.buffer_type == ttnn.BufferType.DRAM:
+        # memory_config() returns DRAM for sharded mode; a recorded L1 entry means
+        # "pin this one". Anything else genuinely stays in DRAM.
+        wanted = placement.entries and placement.entries[-1].name == name and placement.entries[-1].placed_l1
+        if not wanted:
+            return tensor
+        try:
+            moved = shard_l1_width(tensor, device)
+            if moved is None:
+                # Normal for norms / non-matmul weights: give the budget back and
+                # record it, but do not shout about it.
+                for entry in reversed(placement.entries):
+                    if entry.name == name and entry.placed_l1:
+                        entry.placed_l1 = False
+                        entry.reason = "not a shardable matmul weight"
+                        placement.used_bytes -= entry.nbytes
+                        break
+                return tensor
+            tensor.deallocate(True)
+            return moved
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[placement:{placement.label}] could not L1-shard {name}: {str(e)[:110]}")
+            for entry in reversed(placement.entries):
+                if entry.name == name and entry.placed_l1:
+                    entry.placed_l1 = False
+                    entry.reason = f"shard failed: {type(e).__name__}"
+                    placement.used_bytes -= entry.nbytes
+                    break
+            return tensor
+
     if device is None or mem.buffer_type == ttnn.BufferType.DRAM:
         return tensor
     if tensor.memory_config().buffer_type == mem.buffer_type:

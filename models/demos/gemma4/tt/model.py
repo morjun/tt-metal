@@ -28,6 +28,7 @@ from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
+from models.demos.gemma4.tt.weight_placement import WeightPlacement
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
 
@@ -251,6 +252,7 @@ class Gemma4Model:
         precision=None,
         bounded_sliding_kv_cache: bool = False,
         matmul_tuner=None,
+        weight_placement=None,
         # Legacy parameters — ignored
         transformation_mats=None,
     ):
@@ -263,6 +265,17 @@ class Gemma4Model:
         self.matmul_tuner = (
             matmul_tuner if matmul_tuner is not None else DecodeMatmulTuner.from_env(mesh_device, scope="target")
         )
+        # Where the 35 layers' weights live. Default DRAM; GEMMA4_WEIGHTS_IN_L1=sharded
+        # pins what fits, subject to GEMMA4_L1_WEIGHT_BUDGET_MB / GEMMA4_L1_LAYERS.
+        # L1-sharded weights REQUIRE the matching program config (the matmul
+        # validator FATALs on per_core_N != in1 shard width), so enable the tuner
+        # alongside rather than letting the two drift apart.
+        self.weight_placement = weight_placement or WeightPlacement.from_env(label="target")
+        if self.weight_placement.sharded and not self.matmul_tuner.enabled:
+            logger.info("[placement:target] l1_sharded requires the tuned matmul config; enabling it")
+            self.matmul_tuner = DecodeMatmulTuner(mesh_device, enabled=True, label="target")
+        if self.weight_placement.enabled:
+            self.weight_placement.log_hardware_ceiling(mesh_device)
         self.mesh_device = mesh_device
         self.hf_config = hf_config
         # kept for lazily-built weights (e.g. init_pli_device_weights)
@@ -450,6 +463,7 @@ class Gemma4Model:
                 max_local_batch_size=max_local_batch_size,
                 bounded_sliding_kv_cache=bounded_sliding_kv_cache,
                 matmul_tuner=self.matmul_tuner,
+                weight_placement=self.weight_placement,
             )
             # Create KV cache for non-shared layers only
             # Shared layers will use their source layer's KV cache

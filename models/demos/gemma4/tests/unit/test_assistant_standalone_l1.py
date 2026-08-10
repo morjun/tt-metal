@@ -256,6 +256,9 @@ def _build_standalone(
 
     kwargs = {} if budget_mb is None else {"budget_bytes": int(budget_mb * (1 << 20))}
     placement = WeightPlacement(mode=placement_mode, label=f"assistant-{placement_mode}", **kwargs)
+    # l1_sharded needs the matching program config or the matmul validator FATALs.
+    if placement.sharded:
+        tune_matmuls = True
 
     if tune_matmuls is None:
         tune_matmuls = os.getenv("GEMMA4_TUNE_MATMULS", "0") == "1"
@@ -1011,3 +1014,47 @@ def test_l1_headroom_with_real_target(mesh_device, reset_seeds):
     logger.info(f"[tgt-headroom] ===== tp={tp}: usable L1 alongside the 35-layer target = {last_ok} MB/device =====")
     for t in filler:
         t.deallocate(True)
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 2)], device_params_extra={"trace_region_size": 200_000_000})
+def test_sharded_l1_weights_in_model(mesh_device, reset_seeds):
+    """L1 WIDTH_SHARDED weights, in the real drafter.
+
+    The drafter is the one model half that can take load-time sharding: it has no
+    prefill path, so its weights are only ever consumed at Mt == 1, where the
+    tuned program config applies. (The target reuses the same weights for prefill,
+    where the tuner deliberately returns None, so a decode-shaped shard makes
+    prefill's auto-selected config FATAL — see the report.)
+
+    Its whole weight set is ~14.5 MB against a ~48 MB budget, so this is the
+    fully-resident case: 100% of the drafter's pinnable weights in L1.
+    """
+    out = {}
+    for mode in ("dram", "l1_sharded"):
+        # BOTH arms get the tuned program config. l1_sharded forces it on (it
+        # cannot run without it), so an untuned DRAM baseline would credit the
+        # tuner's ~9% to the sharding.
+        rig = _build_standalone(mesh_device, mode, tune_matmuls=True)
+        a = rig["assistant"]
+        types = {
+            "mlp.gate_proj": a.layers[0].shared_mlp.gate_proj.memory_config(),
+            "mlp.down_proj": a.layers[0].shared_mlp.down_proj.memory_config(),
+            "attn.wqkv": a.layers[0].self_attn.weights.wqkv.memory_config(),
+            "pre_projection": a.pre_projection.memory_config(),
+        }
+        for n, mc in types.items():
+            logger.info(f"[sharded] {mode:<11} {n:<16} {mc.buffer_type} {mc.memory_layout}")
+        full = _time_traced_step(mesh_device, rig, return_logits=True)
+        nolm = _time_traced_step(mesh_device, rig, return_logits=False)
+        pinned = rig["placement"].summary()["l1_bytes"] / (1 << 20)
+        out[mode] = (full, nolm, types, pinned)
+        logger.info(f"[sharded] {mode:<11} full={full:.3f} ms  backbone={nolm:.3f} ms  pinned={pinned:.2f} MB")
+
+    (fd, nd, _, _), (fs, ns, ts, ps) = out["dram"], out["l1_sharded"]
+    logger.info(
+        f"[sharded] ===== backbone {nd:.3f} -> {ns:.3f} ms ({(nd-ns)/nd*100:+.2f}%), "
+        f"step {fd:.3f} -> {fs:.3f} ms ({(fd-fs)/fd*100:+.2f}%), pinned {ps:.1f} MB ====="
+    )
+    n_sharded = sum(1 for mc in ts.values() if mc.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED)
+    assert n_sharded >= 3, f"expected the matmul weights WIDTH_SHARDED in L1, got {ts}"

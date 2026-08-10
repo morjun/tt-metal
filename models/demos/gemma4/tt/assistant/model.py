@@ -34,6 +34,7 @@ Constraints (first cut):
 """
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbedder
@@ -42,8 +43,7 @@ from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
-from models.demos.gemma4.tt.weight_placement import place_as_tensor
-from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
+from models.demos.gemma4.tt.weight_placement import WeightPlacement, place_as_tensor
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
 
@@ -94,7 +94,14 @@ class Gemma4AssistantModel:
         # construction order below is also the priority order for the L1 budget:
         # decoder layers first, then the projections, then the CME head (whose
         # 128 MiB replicated embed_table is expected to fall back to DRAM).
-        self.weight_placement = placement = resolve_placement(weight_placement)
+        self.weight_placement = placement = (
+            weight_placement if weight_placement is not None else WeightPlacement.from_env(label="draft")
+        )
+        if placement.sharded and not self.mm.enabled:
+            from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner as _T
+
+            logger.info("[placement:draft] l1_sharded requires the tuned matmul config; enabling it")
+            self.mm = _T(mesh_device, enabled=True, label="draft")
         if placement.enabled:
             placement.log_hardware_ceiling(mesh_device)
         self.mesh_device = mesh_device
