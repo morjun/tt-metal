@@ -34,6 +34,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
 from ...tests.test_factory import parametrize_mesh_with_fabric
 
@@ -415,3 +416,163 @@ def test_weight_sharded_without_reshard(mesh_device, reset_seeds):
         ):
             us, extra = _try(mesh_device, build, gold)
             logger.info(f"[nr]    {tag:<48} " + (f"FAILED: {extra}" if us is None else f"{us:8.2f} us pcc={extra:.5f}"))
+
+
+# ── L1 weights at the TARGET's real shapes and grids ─────────────────────────
+
+# Per-device decode shapes. TP splits N for column-parallel weights (wqkv,
+# gate/up) and K for row-parallel ones (o_proj, down); the PLI pair is
+# replicated so it does not shrink. count = how many of each run per step.
+_TGT_SHAPES = {
+    1: [
+        ("PLI gate      1536x256", 1536, 256, 35),
+        ("PLI proj      256x1536", 256, 1536, 35),
+        ("wqkv sliding 1536x2560", 1536, 2560, 28),
+        ("wqkv global  1536x5120", 1536, 5120, 7),
+        ("o_proj slide 2048x1536", 2048, 1536, 28),
+        ("o_proj glob  4096x1536", 4096, 1536, 7),
+        ("gate/up narr 1536x6144", 1536, 6144, 30),
+        ("gate/up wide 1536x12288", 1536, 12288, 40),
+        ("down narrow  6144x1536", 6144, 1536, 15),
+        ("down wide   12288x1536", 12288, 1536, 20),
+    ],
+    2: [
+        ("PLI gate      1536x256", 1536, 256, 35),
+        ("PLI proj      256x1536", 256, 1536, 35),
+        ("wqkv sliding 1536x1536", 1536, 1536, 28),
+        ("wqkv global  1536x3072", 1536, 3072, 7),
+        ("o_proj slide 1024x1536", 1024, 1536, 28),
+        ("o_proj glob  2048x1536", 2048, 1536, 7),
+        ("gate/up narr 1536x3072", 1536, 3072, 30),
+        ("gate/up wide 1536x6144", 1536, 6144, 40),
+        ("down narrow  3072x1536", 3072, 1536, 15),
+        ("down wide    6144x1536", 6144, 1536, 20),
+    ],
+}
+
+
+def _pcc(a, b):
+    a, b = a.reshape(-1).float(), b.reshape(-1).float()
+    return float(torch.corrcoef(torch.stack([a, b]))[0, 1])
+
+
+def _time(md, fn):
+    outs = [fn() for _ in range(INNER)]
+    ttnn.synchronize_device(md)
+    ref = ttnn.to_torch(outs[0]).float()
+    for o in outs:
+        o.deallocate(True)
+    tid = ttnn.begin_trace_capture(md, cq_id=0)
+    outs = [fn() for _ in range(INNER)]
+    ttnn.end_trace_capture(md, tid, cq_id=0)
+    ttnn.synchronize_device(md)
+    for _ in range(3):
+        ttnn.execute_trace(md, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(md)
+    t0 = time.perf_counter()
+    for _ in range(REPLAYS):
+        ttnn.execute_trace(md, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(md)
+    us = (time.perf_counter() - t0) / REPLAYS / INNER * 1e6
+    ttnn.release_trace(md, tid)
+    for o in outs:
+        o.deallocate(True)
+    return us, ref
+
+
+def _try(md, build, gold):
+    ts = []
+    try:
+        ts, fn = build()
+        us, ref = _time(md, fn)
+        return us, _pcc(gold, ref)
+    except Exception as ex:
+        return None, str(ex).split("backtrace")[0].strip().replace("\n", " ")[:110]
+    finally:
+        for t in ts:
+            try:
+                t.deallocate(True)
+            except Exception:
+                pass
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_target_shapes_l1_weight(mesh_device, reset_seeds):
+    torch.manual_seed(0)
+    T = ttnn.TILE_SIZE
+    for tp in (1, 2):
+        logger.info(f"===== per-device shapes at tp={tp} =====")
+        logger.info(f"{'shape':<24}{'grid':>7}{'MB':>7}{'DRAM us':>10}{'L1 us':>10}{'delta':>10}{'n':>5}{'us/MB':>8}")
+        tot_d = tot_l = 0.0
+        rows = []
+        for name, K, N, cnt in _TGT_SHAPES[tp]:
+            pc = derive_decode_1d_config(1, K, N)  # the model's OWN config
+            if pc is None:
+                logger.info(f"{name:<24} no tuned config")
+                continue
+            gx, gy = pc.compute_with_storage_grid_size.x, pc.compute_with_storage_grid_size.y
+            cores = gx * gy
+            grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+            x_t = torch.randn(1, 1, 32, K).bfloat16()
+            w_t = torch.randn(1, 1, K, N).bfloat16()
+            gold = x_t.float() @ w_t.float()
+
+            def dram(t):
+                return ttnn.from_torch(
+                    t,
+                    device=mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+
+            def wsh(t):
+                return ttnn.from_torch(
+                    t,
+                    device=mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    memory_config=ttnn.MemoryConfig(
+                        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                        ttnn.BufferType.L1,
+                        ttnn.ShardSpec(grid, [K, N // cores], ttnn.ShardOrientation.ROW_MAJOR),
+                    ),
+                )
+
+            d, pd = _try(
+                mesh_device,
+                lambda: (lambda x, w: ([x, w], lambda: ttnn.linear(x, w, program_config=pc)))(dram(x_t), dram(w_t)),
+                gold,
+            )
+            l, pl = _try(
+                mesh_device,
+                lambda: (lambda x, w: ([x, w], lambda: ttnn.linear(x, w, program_config=pc)))(dram(x_t), wsh(w_t)),
+                gold,
+            )
+            mb = K * N * 2 / (1 << 20)
+            if d is None or l is None:
+                logger.info(
+                    f"{name:<24}{f'{gx}x{gy}':>7}{mb:>7.1f}  DRAM={pd if d is None else f'{d:.2f}'}  L1={pl if l is None else f'{l:.2f}'}"
+                )
+                continue
+            saved = d - l
+            logger.info(
+                f"{name:<24}{f'{gx}x{gy}':>7}{mb:>7.1f}{d:>10.2f}{l:>10.2f}{(l-d)/d*100:>9.1f}%{cnt:>5}{saved/mb:>8.2f}"
+            )
+            tot_d += d * cnt
+            tot_l += l * cnt
+            rows.append((saved / mb, mb, saved, name))
+
+        # Greedy fill of the measured L1 budget, best us-saved-per-MB first.
+        budget = 46.0
+        got = 0.0
+        used = 0.0
+        for permb, mb, saved, nm in sorted(rows, key=lambda r: -r[0]):
+            while used + mb <= budget:
+                used += mb
+                got += saved
+        logger.info(
+            f"[tp={tp}] all-matmul total: DRAM {tot_d/1000:.2f} ms -> L1 {tot_l/1000:.2f} ms "
+            f"(if EVERYTHING fit: -{(tot_d-tot_l)/1000:.2f} ms)"
+        )
+        logger.info(f"[tp={tp}] greedy fill of {budget:.0f} MB usable L1: used {used:.1f} MB -> saves {got:.0f} us")
