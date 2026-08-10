@@ -309,3 +309,109 @@ def test_sharded_l1_weight(mesh_device, reset_seeds):
                     assert p > 0.999, f"{name}: arm {tag} lost accuracy vs fp32 (pcc={p})"
         else:
             logger.info(f"[shard]    d/e/f SKIP (Kt={Kt} not divisible by {cores} cores)")
+
+
+# ── does sharding ONLY the weight work, with no activation reshard? ───────────
+
+_NR_SHAPES = [
+    ("o_proj", 32, 512, 256),
+    ("down_proj", 32, 1024, 256),
+    ("pre_proj", 32, 3072, 256),
+    ("tgt 1536x1536", 32, 1536, 1536),
+]
+_NR_INNER, _NR_REPLAYS = INNER, REPLAYS
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_weight_sharded_without_reshard(mesh_device, reset_seeds):
+    """Shard the WEIGHT into L1 and leave the activation interleaved — no reshard.
+
+    The `gather_in0` arm of the test above needs the activation width-sharded on
+    the same grid, which a model would have to produce. This asks whether the
+    cheaper thing — change only the weight's memory config at load time, keep
+    `mcast_in0` and an interleaved activation — is worth anything.
+
+    MEASURED: at the drafter's skinny-N shapes, essentially nothing (0-3%); at
+    target-scale N=1536, **-38%** (and -45% if the output is sharded too). So the
+    weight-only change is free to implement and pays off exactly where N is wide
+    enough that each core reads a meaningful slice of the weight. The larger 2x at
+    skinny N needs gather_in0, i.e. a sharded activation.
+    """
+    torch.manual_seed(0)
+    T = ttnn.TILE_SIZE
+    for name, M, K, N in _NR_SHAPES:
+        Mt, Kt, Nt = M // T, K // T, N // T
+        cores = 8 if Nt % 8 == 0 else Nt
+        gx, gy = (cores, 1) if cores <= 8 else (8, cores // 8)
+        grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+        x_t = torch.randn(1, 1, M, K).bfloat16()
+        w_t = torch.randn(1, 1, K, N).bfloat16()
+        gold = x_t.float() @ w_t.float()
+        blk = max(d for d in range(1, 9) if Kt % d == 0)
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=Mt,
+            per_core_N=Nt // cores,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+
+        def dram(t):
+            return ttnn.from_torch(
+                t,
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+
+        def wsh(t, buf):
+            return ttnn.from_torch(
+                t,
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    buf,
+                    ttnn.ShardSpec(grid, [K, N // cores], ttnn.ShardOrientation.ROW_MAJOR),
+                ),
+            )
+
+        logger.info(f"[nr] === {name} K={K} N={N} grid {gx}x{gy}")
+        for tag, build in (
+            (
+                "base: in0 DRAM int, in1 DRAM int",
+                lambda: (lambda x, w: ([x, w], lambda: ttnn.linear(x, w, program_config=pc)))(dram(x_t), dram(w_t)),
+            ),
+            (
+                "NO-RESHARD: in0 DRAM int, in1 L1 WIDTH_SHARDED",
+                lambda: (lambda x, w: ([x, w], lambda: ttnn.linear(x, w, program_config=pc)))(
+                    dram(x_t), wsh(w_t, ttnn.BufferType.L1)
+                ),
+            ),
+            (
+                "NO-RESHARD + sharded out",
+                lambda: (
+                    lambda x, w: (
+                        [x, w],
+                        lambda: ttnn.linear(
+                            x,
+                            w,
+                            program_config=pc,
+                            memory_config=ttnn.MemoryConfig(
+                                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                                ttnn.BufferType.L1,
+                                ttnn.ShardSpec(grid, [M, N // cores], ttnn.ShardOrientation.ROW_MAJOR),
+                            ),
+                        ),
+                    )
+                )(dram(x_t), wsh(w_t, ttnn.BufferType.L1)),
+            ),
+        ):
+            us, extra = _try(mesh_device, build, gold)
+            logger.info(f"[nr]    {tag:<48} " + (f"FAILED: {extra}" if us is None else f"{us:8.2f} us pcc={extra:.5f}"))
