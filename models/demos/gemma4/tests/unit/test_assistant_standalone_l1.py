@@ -1018,29 +1018,38 @@ def test_fused_k_step_dram_vs_l1(mesh_device, reset_seeds):
     prefix and cannot be inferred from the total.
     """
     k = int(os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3"))
-    modes = [m.strip() for m in os.getenv("GEMMA4_L1_MODES", "dram,l1_sharded").split(",") if m.strip()]
+    budget = float(os.getenv("GEMMA4_L1_WEIGHT_BUDGET_MB", "8"))
+
+    # EVERY arm gets the tuner. ``_build_standalone`` force-enables it for
+    # l1_sharded (the matmul validator FATALs without the matching program
+    # config), so leaving the DRAM arm on ttnn's automatic choice would credit
+    # the tuner's 1.1-2.4x to L1 placement. That confound was measured once
+    # already; the untuned DRAM arm is kept as a separate row, not as the baseline.
+    arms = [
+        ("dram (auto cfg)", "dram", False, None),
+        ("dram (tuned)", "dram", True, None),
+        ("l1 interleaved", "l1", True, budget),
+        ("l1 WIDTH_SHARDED", "l1_sharded", True, budget),
+    ]
 
     results = {}
-    for mode in modes:
-        rig = _build_standalone(mesh_device, mode)
-        logger.info("\n" + rig["placement"].report())
+    for label, mode, tuned, mb in arms:
+        rig = _build_standalone(mesh_device, mode, budget_mb=mb, tune_matmuls=tuned)
+        if rig["placement"].enabled:
+            logger.info("\n" + rig["placement"].report())
         ms, _ = _time_fused_k_steps(mesh_device, rig, k)
         pinned = rig["placement"].summary()["l1_bytes"]
-        results[mode] = (ms, pinned)
+        tn, ttl = rig["assistant"].mm.stats()
+        results[label] = (ms, pinned)
         logger.info(
-            f"[k-perf K={k}] {mode:<12} {ms:.3f} ms/iter  {ms/k:.3f} ms/step  "
-            f"{k*1e3/ms:.2f} tok/s/u  pinned {pinned/(1<<20):.2f} MB/device"
+            f"[k-perf K={k}] {label:<18} {ms:>8.3f} ms/iter  {ms/k:>7.3f} ms/step  "
+            f"{k*1e3/ms:>7.2f} tok/s/u  pinned {pinned/(1<<20):>6.2f} MB/device  tuned {tn}/{ttl} shapes"
         )
 
-    if "dram" in results and len(results) > 1:
-        base = results["dram"][0]
-        for mode, (ms, pinned) in results.items():
-            if mode == "dram":
-                continue
-            logger.info(
-                f"[k-perf K={k}] ===== {mode} vs dram: {base:.3f} -> {ms:.3f} ms/iter "
-                f"({(base-ms)/base*100:+.2f}%), pinned {pinned/(1<<20):.2f} MB/device ====="
-            )
+    base = results["dram (tuned)"][0]
+    logger.info(f"[k-perf K={k}] ===== all vs 'dram (tuned)' =====")
+    for label, (ms, pinned) in results.items():
+        logger.info(f"    {label:<18} {ms:>8.3f} ms/iter  {(base-ms)/base*100:>+6.2f}%  pinned {pinned/(1<<20):.2f} MB")
 
 
 @_needs_assistant
