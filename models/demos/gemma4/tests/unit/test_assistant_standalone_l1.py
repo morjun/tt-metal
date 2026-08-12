@@ -58,7 +58,7 @@ from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, Gemma4T
 from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
-from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather
+from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather, ccl_allreduce
 from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.model import create_rope_caches
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs
@@ -735,7 +735,7 @@ def test_standalone_perf_dram_vs_l1(mesh_device, context_len, reset_seeds):
 
 @_needs_assistant
 @parametrize_mesh_with_fabric(
-    mesh_shapes=[(1, 2)],
+    mesh_shapes=[(1, 1), (1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
 def test_fused_draft_k_steps(mesh_device, reset_seeds):
@@ -847,6 +847,151 @@ def _op_timed(mesh_device, fn, inner=4, replays=8, protect=()):
     for o in outs:
         _free(o)
     return us
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_backbone_op_costs(mesh_device, reset_seeds):
+    """Size the two ops left standing after the gather fix: argmax and the CCL.
+
+    Post-fix the step is 1.335 ms = backbone 0.718 + CME head 0.421 + argmax 0.196.
+    This prices, at the drafter's real shapes:
+
+    * ``ttnn.argmax`` over the 4096 candidates — 162 us, the largest single op
+      left in the head. 512 KB of fp32 in 162 us is ~3 GB/s, which is
+      single-core territory, not a bandwidth limit.
+    * ``ccl_allreduce`` — the drafter runs EIGHT per step at tp=2 (one after
+      o_proj and one after down_proj in each of 4 layers) and ZERO at tp=1. Any
+      standalone-vs-end-to-end throughput comparison has to account for this,
+      because the published end-to-end figures are single-P150 tp=1.
+    * ``ttnn.untilize`` and the sharded ``rms_norm``'s two layout conversions,
+      for reference (17 norms/step, so each conversion is paid 34 times).
+    """
+    num_devices, tp, mesh_config = _mesh_bits(mesh_device)
+    ccl = CCLManager(mesh_device) if tp > 1 else None
+    torch.manual_seed(0)
+
+    def dev(t, dtype, layout=ttnn.TILE_LAYOUT):
+        return ttnn.from_torch(t, device=mesh_device, layout=layout, dtype=dtype)
+
+    vals_tile = dev(torch.randn(1, 1, 32, 4096), ttnn.float32)
+    vals_rm = dev(torch.randn(1, 1, 32, 4096), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT)
+    act = dev(torch.randn(1, 1, 32, 256).bfloat16(), ttnn.bfloat16)
+    protect = (vals_tile, vals_rm, act)
+
+    cases = [
+        ("untilize [1,1,32,4096] fp32", lambda: ttnn.untilize(vals_tile, use_multicore=True), 1),
+        ("argmax  [1,1,32,4096] fp32 RM", lambda: ttnn.argmax(vals_rm, dim=-1, keepdim=False), 1),
+        ("interleaved_to_sharded [1,1,32,256]", lambda: ttnn.to_memory_config(act, _rs_cfg(mesh_device, 256)), 34),
+    ]
+    if tp > 1:
+        cases.append(("ccl_allreduce [1,1,32,256] bf16", lambda: ccl_allreduce(ttnn.clone(act), mesh_config, ccl), 8))
+
+    logger.info(f"[op-cost tp={tp}] {'op':<38}{'us/call':>10}{'n/step':>8}{'us/step':>10}")
+    for name, fn, n in cases:
+        try:
+            us = _op_timed(mesh_device, fn, protect=protect)
+            logger.info(f"[op-cost tp={tp}] {name:<38}{us:>10.1f}{n:>8}{us*n:>10.1f}")
+        except Exception as ex:  # noqa: BLE001
+            logger.info(f"[op-cost tp={tp}] {name:<38} FAILED: {str(ex).split('backtrace')[0].strip()[:100]}")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_rms_norm_layout_churn(mesh_device, reset_seeds):
+    """Does the sharded RMSNorm pay for the layout conversions it forces?
+
+    ``RMSNorm._forward_sharded`` does interleaved_to_sharded -> sharded rms_norm
+    -> sharded_to_interleaved on EVERY call, and the guard in ``forward``
+    (``not x.is_sharded()``) then makes the next norm rebuild the same layout.
+    The grid it picks for dim=256 is 8 cores at (0,0)-(7,0) — bit-identical to
+    what ``derive_decode_1d_config(1,.,256)`` picks for the matmuls, so the
+    activation is already in the layout the next op wants, and is discarded.
+
+    Counts the conversions in one real step, then A/Bs the sharded-norm path off
+    (``_build_sharded_cfg -> None`` falls back to plain interleaved
+    ``ttnn.rms_norm``, an existing branch) to price the current design.
+    """
+    from models.demos.gemma4.tt import rms_norm as rms_norm_mod
+
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+
+    counts = {"i2s": 0, "s2i": 0}
+    real_tmc, real_s2i = ttnn.to_memory_config, ttnn.sharded_to_interleaved
+
+    def c_tmc(t, mc, *a, **kw):
+        if getattr(mc, "shard_spec", None) is not None:
+            counts["i2s"] += 1
+        return real_tmc(t, mc, *a, **kw)
+
+    def c_s2i(t, *a, **kw):
+        counts["s2i"] += 1
+        return real_s2i(t, *a, **kw)
+
+    ttnn.to_memory_config, ttnn.sharded_to_interleaved = c_tmc, c_s2i
+    try:
+        _, hn = rig["assistant"].step(*_step_args(rig), return_logits=False)
+        ttnn.synchronize_device(mesh_device)
+        hn.deallocate(True)
+    finally:
+        ttnn.to_memory_config, ttnn.sharded_to_interleaved = real_tmc, real_s2i
+    total = counts["i2s"] + counts["s2i"]
+    logger.info(
+        f"[norm-churn] ONE backbone step: {counts['i2s']} interleaved_to_sharded "
+        f"+ {counts['s2i']} sharded_to_interleaved = {total} conversions"
+    )
+
+    with_sharded, _ = _time_fused_k_steps(mesh_device, rig, 1, mode="backbone")
+    real_build = rms_norm_mod.RMSNorm._build_sharded_cfg
+    rms_norm_mod.RMSNorm._build_sharded_cfg = lambda self, dim: None
+    try:
+        for obj in _walk_norms(rig["assistant"]):
+            obj._sharded_cfg = None
+            obj._sharded_dim = None
+        plain, _ = _time_fused_k_steps(mesh_device, rig, 1, mode="backbone")
+    finally:
+        rms_norm_mod.RMSNorm._build_sharded_cfg = real_build
+    logger.info(
+        f"[norm-churn] backbone/step: sharded-norm {with_sharded*1e3:.1f} us vs "
+        f"plain-norm {plain*1e3:.1f} us ({(plain-with_sharded)/with_sharded*100:+.1f}% for turning it off)"
+    )
+    logger.info(f"[norm-churn] {total} conversions x ~9.1 us = ~{total*9.1:.0f} us/step of layout churn")
+
+
+def _walk_norms(root, seen=None):
+    """Every object under `root` that carries RMSNorm's lazy sharded-config cache."""
+    seen = seen if seen is not None else set()
+    if id(root) in seen or isinstance(root, (str, bytes, int, float, bool, type(None))):
+        return
+    seen.add(id(root))
+    if hasattr(root, "_sharded_cfg"):
+        yield root
+    children = []
+    if isinstance(root, (list, tuple)):
+        children = list(root)
+    elif isinstance(root, dict):
+        children = list(root.values())
+    elif hasattr(root, "__dict__"):
+        children = list(vars(root).values())
+    for c in children:
+        yield from _walk_norms(c, seen)
+
+
+def _rs_cfg(mesh_device, dim, cores=8):
+    """The width-sharded activation spec RMSNorm already builds for dim=256."""
+    return ttnn.create_sharded_memory_config(
+        shape=(ttnn.TILE_SIZE, dim // cores),
+        core_grid=ttnn.CoreGrid(x=cores, y=1),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
 
 
 @_needs_assistant
