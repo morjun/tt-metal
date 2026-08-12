@@ -808,7 +808,7 @@ def test_fused_draft_k_steps(mesh_device, reset_seeds):
                 logger.info(f"[scale] K={k}: {fused_ms/(k1*k):.3f}x of linear extrapolation from K=1")
 
 
-def _op_timed(mesh_device, fn, inner=4, replays=8, protect=()):
+def _op_timed(mesh_device, fn, inner=20, replays=20, protect=()):
     """Per-call us for one op graph, by repeating it `inner` times in one trace.
 
     `fn` must not deallocate anything it did not create. `protect` lists tensors
@@ -885,7 +885,7 @@ def test_backbone_op_costs(mesh_device, reset_seeds):
     cases = [
         ("untilize [1,1,32,4096] fp32", lambda: ttnn.untilize(vals_tile, use_multicore=True), 1),
         ("argmax  [1,1,32,4096] fp32 RM", lambda: ttnn.argmax(vals_rm, dim=-1, keepdim=False), 1),
-        ("interleaved_to_sharded [1,1,32,256]", lambda: ttnn.to_memory_config(act, _rs_cfg(mesh_device, 256)), 34),
+        ("interleaved_to_sharded [1,1,32,256]", lambda: ttnn.to_memory_config(act, _rs_cfg(mesh_device, 256)), 42),
     ]
     if tp > 1:
         cases.append(("ccl_allreduce [1,1,32,256] bf16", lambda: ccl_allreduce(ttnn.clone(act), mesh_config, ccl), 8))
