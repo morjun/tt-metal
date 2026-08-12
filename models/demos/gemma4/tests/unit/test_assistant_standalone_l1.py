@@ -59,7 +59,7 @@ from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
 from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather, ccl_allreduce
-from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner, derive_decode_1d_config
 from models.demos.gemma4.tt.model import create_rope_caches
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs
 from models.demos.gemma4.tt.weight_placement import WeightPlacement
@@ -923,11 +923,13 @@ def test_rms_norm_layout_churn(mesh_device, reset_seeds):
     rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
 
     counts = {"i2s": 0, "s2i": 0}
+    dims = {}
     real_tmc, real_s2i = ttnn.to_memory_config, ttnn.sharded_to_interleaved
 
     def c_tmc(t, mc, *a, **kw):
         if getattr(mc, "shard_spec", None) is not None:
             counts["i2s"] += 1
+            dims[int(t.shape[-1])] = dims.get(int(t.shape[-1]), 0) + 1
         return real_tmc(t, mc, *a, **kw)
 
     def c_s2i(t, *a, **kw):
@@ -946,6 +948,7 @@ def test_rms_norm_layout_churn(mesh_device, reset_seeds):
         f"[norm-churn] ONE backbone step: {counts['i2s']} interleaved_to_sharded "
         f"+ {counts['s2i']} sharded_to_interleaved = {total} conversions"
     )
+    logger.info(f"[norm-churn] sharded at dims: {dict(sorted(dims.items()))}  (count per dim)")
 
     with_sharded, _ = _time_fused_k_steps(mesh_device, rig, 1, mode="backbone")
     real_build = rms_norm_mod.RMSNorm._build_sharded_cfg
@@ -981,6 +984,246 @@ def _walk_norms(root, seen=None):
         children = list(vars(root).values())
     for c in children:
         yield from _walk_norms(c, seen)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_matmul_sharded_in0_cost(mesh_device, reset_seeds):
+    """Can the decode matmuls consume the norm's sharded output directly?
+
+    This decides whether norm CHAINING is possible. Per-norm cost is
+    kernel 4.0 us + conversions 4.2 us; eliminating BOTH conversions needs the
+    consumer to take a width-sharded in0, and the only consumers of a norm output
+    in the drafter are the K=256 matmuls (wqkv, gate, up).
+
+    The catch: ``mcast_in0`` requires ``in0_shard_width_tiles % in0_block_w == 0``.
+    At dim=256 on the norm's 8-core grid the shard is ONE tile wide, so
+    ``in0_block_w`` is forced to 1 against the tuner's 8 — i.e. 8 K-blocks and 8
+    multicast/semaphore round-trips instead of 1. If that costs more than the
+    ~4.2 us of conversions it saves, chaining is not worth it at this width.
+
+    Arms b/c also sweep a NARROWER in0 shard grid (fewer cores, wider shard), the
+    obvious escape from the in0_block_w=1 trap.
+    """
+    torch.manual_seed(0)
+    T = ttnn.TILE_SIZE
+    for name, M, K, N in (("wqkv / gate / up", 32, 256, 1024), ("post_projection", 32, 256, 1536)):
+        Kt, Nt = K // T, N // T
+        pc_ref = derive_decode_1d_config(1, K, N)
+        gx, gy = pc_ref.compute_with_storage_grid_size.x, pc_ref.compute_with_storage_grid_size.y
+        x_t = torch.randn(1, 1, M, K).bfloat16()
+        w_t = torch.randn(1, 1, K, N).bfloat16()
+        gold = x_t.float() @ w_t.float()
+        w = ttnn.from_torch(w_t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        x_il = ttnn.from_torch(x_t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+        def pc(blk):
+            return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+                in0_block_w=blk,
+                out_subblock_h=1,
+                out_subblock_w=1,
+                per_core_M=1,
+                per_core_N=Nt // (gx * gy),
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=True,
+            )
+
+        logger.info(f"[mm-in0] === {name} M={M} K={K} N={N}, compute grid {gx}x{gy}")
+        base = _op_timed(
+            mesh_device,
+            lambda: ttnn.linear(x_il, w, program_config=pc(pc_ref.in0_block_w)),
+            inner=20,
+            replays=20,
+            protect=(x_il, w),
+        )
+        logger.info(f"[mm-in0]   in0 INTERLEAVED, in0_block_w={pc_ref.in0_block_w:<2}  {base:7.2f} us  (baseline)")
+
+        for cores in (8, 4, 2):
+            if Kt % cores:
+                continue
+            shard_w_tiles = Kt // cores
+            x_sh = ttnn.from_torch(
+                x_t,
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cores - 1, 0))}),
+                        [M, K // cores],
+                        ttnn.ShardOrientation.ROW_MAJOR,
+                    ),
+                ),
+            )
+            for blk in [d for d in range(1, shard_w_tiles + 1) if shard_w_tiles % d == 0]:
+                try:
+                    out = ttnn.linear(x_sh, w, program_config=pc(blk))
+                    ttnn.synchronize_device(mesh_device)
+                    p = _pcc(gold, ttnn.to_torch(out))
+                    out.deallocate(True)
+                    us = _op_timed(
+                        mesh_device,
+                        lambda b=blk: ttnn.linear(x_sh, w, program_config=pc(b)),
+                        inner=20,
+                        replays=20,
+                        protect=(x_sh, w),
+                    )
+                    logger.info(
+                        f"[mm-in0]   in0 SHARDED {cores} cores (w={shard_w_tiles}t), in0_block_w={blk:<2} "
+                        f"{us:7.2f} us  {(us-base)/base*100:+6.1f}% vs interleaved  pcc={p:.5f}"
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    logger.info(
+                        f"[mm-in0]   in0 SHARDED {cores} cores, in0_block_w={blk:<2} "
+                        f"FAILED: {str(ex).split('backtrace')[0].strip()[:90]}"
+                    )
+            x_sh.deallocate(True)
+        x_il.deallocate(True)
+        w.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_rms_norm_core_sweep(mesh_device, reset_seeds):
+    """Sharded RMSNorm cost vs CORE COUNT at the drafter's dims.
+
+    ``_build_sharded_cfg`` maximizes cores (8 at dim=256). But chaining into the
+    matmuls needs a shard at least ``in0_block_w`` tiles wide, and
+    ``test_matmul_sharded_in0_cost`` shows the matmul takes a sharded in0 cheaply
+    only at 2 cores / 4 tiles (+0.3 to +5.7%); at 8 cores / 1 tile it is +108%.
+    So: what does the norm cost on 2 cores?
+
+    Chaining beats the plain path iff
+    ``kernel(2 cores) + matmul_sharded < plain_norm + matmul_interleaved``.
+    """
+    torch.manual_seed(0)
+    T = ttnn.TILE_SIZE
+    for dim in (256, 512):
+        tiles = dim // T
+        x = ttnn.from_torch(
+            torch.randn(1, 1, 32, dim).bfloat16(), device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16
+        )
+        w = ttnn.from_torch(
+            torch.randn(1, 1, 1, dim).bfloat16(), device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16
+        )
+        plain = _op_timed(
+            mesh_device, lambda: ttnn.rms_norm(x, weight=w, epsilon=1e-6), inner=20, replays=20, protect=(x, w)
+        )
+        logger.info(f"[norm-cores] dim={dim}: plain (interleaved) {plain:5.2f} us")
+        for cores in (8, 4, 2, 1):
+            if tiles % cores:
+                continue
+            block_w = tiles // cores
+            sub = max(d for d in (4, 2, 1) if block_w % d == 0)
+            mc = ttnn.create_sharded_memory_config(
+                shape=(T, dim // cores),
+                core_grid=ttnn.CoreGrid(x=cores, y=1),
+                strategy=ttnn.ShardStrategy.WIDTH,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+                compute_with_storage_grid_size=[cores, 1], subblock_w=sub, block_h=1, block_w=block_w, inplace=False
+            )
+            try:
+                x_sh = ttnn.to_memory_config(x, mc)
+                us = _op_timed(
+                    mesh_device,
+                    lambda: ttnn.rms_norm(x_sh, weight=w, epsilon=1e-6, program_config=pc),
+                    inner=20,
+                    replays=20,
+                    protect=(x_sh, w),
+                )
+                logger.info(
+                    f"[norm-cores] dim={dim}: sharded kernel on {cores} cores "
+                    f"({block_w} tiles/core) {us:5.2f} us  {(us-plain)/plain*100:+6.1f}% vs plain"
+                )
+                x_sh.deallocate(True)
+            except Exception as ex:  # noqa: BLE001
+                logger.info(f"[norm-cores] dim={dim}: {cores} cores FAILED: {str(ex).split('backtrace')[0][:80]}")
+        x.deallocate(True)
+        w.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 2)], device_params_extra={"trace_region_size": 200_000_000})
+def test_rms_norm_path_costs(mesh_device, reset_seeds):
+    """Plain vs sharded RMSNorm, decomposed, at the dims the models actually use.
+
+    The sharded path exists because ``LayerNormShardedMultiCoreProgramConfig``
+    does the cross-core gather in one op. But it is bracketed by
+    interleaved_to_sharded / sharded_to_interleaved on EVERY call, and the
+    drafter runs 21 norms per step. This prices the kernel separately from the
+    conversions so the fix targets the right one:
+
+      * if the CONVERSIONS dominate -> chain the sharded stream (keep the kernel)
+      * if the sharded KERNEL is no better -> just stop sharding at that dim
+
+    dim 256 is the drafter's hidden; 1536 is the target's / the drafter's
+    backbone width; 2048/6144 bracket the target's MLP.
+    """
+    torch.manual_seed(0)
+    for dim in (256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192):
+        tiles = dim // ttnn.TILE_SIZE
+        cores = max((n for n in range(1, 65) if tiles % n == 0), default=1)
+        gx, gy = (cores, 1) if cores <= 8 else (8, cores // 8)
+        if gx > 8 or gy > 8:
+            continue
+        x_t = torch.randn(1, 1, 32, dim).bfloat16()
+        w_t = torch.randn(dim).bfloat16()
+        x = ttnn.from_torch(x_t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        w = ttnn.from_torch(w_t.reshape(1, 1, 1, dim), device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        mc = ttnn.create_sharded_memory_config(
+            shape=(ttnn.TILE_SIZE, dim // cores),
+            core_grid=ttnn.CoreGrid(x=gx, y=gy),
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        block_w = tiles // cores
+        sub = 4
+        while sub > 1 and block_w % sub:
+            sub -= 1
+        pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+            compute_with_storage_grid_size=[gx, gy], subblock_w=sub, block_h=1, block_w=block_w, inplace=False
+        )
+        x_sh = ttnn.to_memory_config(x, mc)
+
+        def f_plain():
+            return ttnn.rms_norm(x, weight=w, epsilon=1e-6)
+
+        def f_i2s():
+            return ttnn.to_memory_config(x, mc)
+
+        def f_kernel():
+            return ttnn.rms_norm(x_sh, weight=w, epsilon=1e-6, program_config=pc)
+
+        def f_s2i():
+            return ttnn.sharded_to_interleaved(x_sh, ttnn.DRAM_MEMORY_CONFIG)
+
+        # Do the two paths agree? A dim-based gate silently switches every model
+        # that shares RMSNorm, so this must be checked, not assumed.
+        y_plain = ttnn.to_torch(ttnn.get_device_tensors(f_plain())[0]).float()
+        y_sh = ttnn.to_torch(ttnn.get_device_tensors(ttnn.sharded_to_interleaved(f_kernel()))[0]).float()
+        same = torch.equal(y_plain, y_sh)
+        pcc = _pcc(y_plain, y_sh)
+
+        # These are ~5-15 us ops; the 4x8 default is inside the noise floor.
+        n = {"inner": 20, "replays": 20, "protect": (x, w, x_sh)}
+        p = _op_timed(mesh_device, f_plain, **n)
+        i2s = _op_timed(mesh_device, f_i2s, **n)
+        ker = _op_timed(mesh_device, f_kernel, **n)
+        s2i = _op_timed(mesh_device, f_s2i, **n)
+        tot = i2s + ker + s2i
+        logger.info(
+            f"[norm-path] dim={dim:<5} grid={gx}x{gy}={cores:<3} | plain {p:6.1f} | "
+            f"I2S {i2s:5.1f} + kern {ker:5.1f} + S2I {s2i:5.1f} = {tot:6.1f} us | "
+            f"sharded/plain {tot/p:4.2f}x | kern/plain {ker/p:4.2f}x | "
+            f"{'BIT-IDENTICAL' if same else f'pcc={pcc:.7f}'}"
+        )
+        for t in (x, w, x_sh):
+            t.deallocate(True)
 
 
 def _rs_cfg(mesh_device, dim, cores=8):

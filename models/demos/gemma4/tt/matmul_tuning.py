@@ -58,7 +58,7 @@ def _pick_grid(n_tiles, max_x, max_y):
     return best
 
 
-def derive_decode_1d_config(m, k, n, max_x=8, max_y=8):
+def derive_decode_1d_config(m, k, n, max_x=8, max_y=8, in0_shard_tiles=None):
     """1D multicast config for a batch-1 decode linear, or None if it doesn't apply.
 
     Returns None (caller keeps ttnn's automatic choice) unless the shape is a
@@ -68,6 +68,13 @@ def derive_decode_1d_config(m, k, n, max_x=8, max_y=8):
     ``m`` is the LOGICAL row count and is normally 1 at decode; it occupies one
     padded tile row. Requiring ``m % TILE_SIZE == 0`` here would reject every real
     decode shape, so round up instead.
+
+    ``in0_shard_tiles`` is the width in tiles of each core's in0 shard when the
+    ACTIVATION is width-sharded (see activation_sharding.py). The 1D mcast factory
+    requires ``in0_shard_width_tiles % in0_block_w == 0``, so the blocking is
+    clamped to a divisor of the shard. This matters a lot: MEASURED at K=256,N=1024,
+    a 1-tile shard forces in0_block_w=1 and costs **+108%**, while a 4-tile shard
+    (in0_block_w=4) costs **+5.7%**.
     """
     T = ttnn.TILE_SIZE
     if k % T or n % T:
@@ -79,9 +86,12 @@ def derive_decode_1d_config(m, k, n, max_x=8, max_y=8):
     cores = gx * gy
     if cores < 2:
         return None
+    blk = _largest_divisor(kt)
+    if in0_shard_tiles:
+        blk = _largest_divisor(in0_shard_tiles, cap=min(8, in0_shard_tiles))
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
-        in0_block_w=_largest_divisor(kt),
+        in0_block_w=blk,
         out_subblock_h=1,
         out_subblock_w=1,
         per_core_M=mt,
@@ -126,12 +136,31 @@ class DecodeMatmulTuner:
             grid = mesh_device.compute_with_storage_grid_size()
             self._max_x, self._max_y = min(8, grid.x), min(8, grid.y)
 
+    @staticmethod
+    def _in0_shard_tiles(x):
+        """Width in tiles of x's per-core shard, or None when x is interleaved."""
+        try:
+            if not x.is_sharded():
+                return None
+            spec = x.memory_config().shard_spec
+            return int(spec.shape[1]) // ttnn.TILE_SIZE if spec is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def config_for(self, x, w):
         if not self.enabled:
             return None
-        key = (tuple(x.shape), tuple(w.shape))
+        shard_tiles = self._in0_shard_tiles(x)
+        key = (tuple(x.shape), tuple(w.shape), shard_tiles)
         if key not in self._cache:
-            pc = derive_decode_1d_config(int(x.shape[-2]), int(x.shape[-1]), int(w.shape[-1]), self._max_x, self._max_y)
+            pc = derive_decode_1d_config(
+                int(x.shape[-2]),
+                int(x.shape[-1]),
+                int(w.shape[-1]),
+                self._max_x,
+                self._max_y,
+                in0_shard_tiles=shard_tiles,
+            )
             self._cache[key] = pc
             # One line per DISTINCT shape (the cache makes this fire once each), so
             # this stays ~10 lines for a 35-layer model and gives the attribution

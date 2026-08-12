@@ -42,6 +42,7 @@ Forward flow (matching HF exactly):
 import torch
 
 import ttnn
+from models.demos.gemma4.tt.activation_sharding import resolve as resolve_act_shard
 from models.demos.gemma4.tt.attention import Gemma4Attention, Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.operations import _stage_fp
 from models.demos.gemma4.tt.gemma4_attention_config import get_attention_program_config
@@ -73,6 +74,7 @@ class Gemma4DecoderLayer:
         bounded_sliding_kv_cache: bool = False,
         weight_placement=None,
         matmul_tuner=None,
+        activation_sharding=None,
         transformation_mats=None,  # Legacy — ignored (HF-style RoPE needs no transformation mats)
     ):
         # Per-module dtype overrides default to the model-wide ``dtype`` so
@@ -80,6 +82,9 @@ class Gemma4DecoderLayer:
         # Per-layer-input projections are decode linears too (N = pli_size), and
         # they are the skinny-N shape the tuned config helps most.
         self.mm = resolve_tuner(matmul_tuner)
+        # Keeps the residual stream WIDTH_SHARDED so the norms stop rebuilding
+        # their layout 42x per step. Default-off; see activation_sharding.py.
+        self.act_shard = resolve_act_shard(activation_sharding)
         if shared_mlp_dtype is None:
             shared_mlp_dtype = dtype
         if attention_dtype is None:
@@ -105,6 +110,7 @@ class Gemma4DecoderLayer:
 
         def _norm(name, with_scale=True):
             return RMSNorm(
+                activation_sharding=activation_sharding,
                 mesh_device=mesh_device,
                 hf_config=hf_config,
                 state_dict=substate(layer_state, name) if layer_state else {},
@@ -283,7 +289,8 @@ class Gemma4DecoderLayer:
                     residual, [1, 1, residual.shape[-2] * residual.shape[-3] * residual.shape[0], -1]
                 )
             _stage_fp("D:attn_out", attn_output)
-            hidden_states = ttnn.add(residual, attn_output)
+            residual = self.act_shard.to_stream_like(residual, attn_output)
+            hidden_states = ttnn.add(residual, attn_output, memory_config=attn_output.memory_config())
             _stage_fp("E:attn_resid", hidden_states)
             residual.deallocate(True)
             attn_output.deallocate(True)
@@ -324,7 +331,8 @@ class Gemma4DecoderLayer:
         # post_feedforward_layernorm -> residual add
         hidden_states = self.post_feedforward_layernorm.forward(hidden_states)
         _stage_fp("H:post_ff_norm", hidden_states)
-        combined = ttnn.add(residual, hidden_states)
+        residual = self.act_shard.to_stream_like(residual, hidden_states)
+        combined = ttnn.add(residual, hidden_states, memory_config=hidden_states.memory_config())
         _stage_fp("I:ff_resid", combined)
         residual.deallocate(True)
         hidden_states.deallocate(True)

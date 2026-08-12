@@ -37,10 +37,12 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.demos.gemma4.tt.activation_sharding import ActivationSharding
 from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbedder
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
 from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.weight_placement import WeightPlacement, place_as_tensor
@@ -86,9 +88,21 @@ class Gemma4AssistantModel:
         max_local_batch_size=1,
         weight_placement=None,
         matmul_tuner=None,
+        activation_sharding=None,
     ):
         # Explicit decode matmul program configs (default off). See tt/matmul_tuning.py.
         self.mm = resolve_tuner(matmul_tuner)
+        self.act_shard = (
+            activation_sharding if activation_sharding is not None else ActivationSharding.from_env(mesh_device)
+        )
+        # A sharded in0 under ttnn's AUTOMATIC matmul config is a REGRESSION
+        # (backbone 723 -> 731 us measured); with the tuned config, which clamps
+        # in0_block_w to a divisor of the shard width, it is a 9% win (674 -> 613).
+        # So chaining is only ever enabled together with the tuner — the same rule
+        # WeightPlacement.sharded already follows.
+        if self.act_shard.enabled and not self.mm.enabled:
+            logger.info("[assistant] activation sharding needs the tuned matmul config — enabling it")
+            self.mm = DecodeMatmulTuner(mesh_device, enabled=True, label="draft")
         # Where this drafter's weights live (DRAM by default). The policy object
         # accumulates a per-device byte total across every tensor below, so the
         # construction order below is also the priority order for the L1 budget:
@@ -98,10 +112,8 @@ class Gemma4AssistantModel:
             weight_placement if weight_placement is not None else WeightPlacement.from_env(label="draft")
         )
         if placement.sharded and not self.mm.enabled:
-            from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner as _T
-
             logger.info("[placement:draft] l1_sharded requires the tuned matmul config; enabling it")
-            self.mm = _T(mesh_device, enabled=True, label="draft")
+            self.mm = DecodeMatmulTuner(mesh_device, enabled=True, label="draft")
         if placement.enabled:
             placement.log_hardware_ceiling(mesh_device)
         self.mesh_device = mesh_device
@@ -146,11 +158,13 @@ class Gemma4AssistantModel:
                 max_local_batch_size=max_local_batch_size,
                 weight_placement=placement,
                 matmul_tuner=self.mm,
+                activation_sharding=self.act_shard,
             )
             self.layers.append(layer)
 
         # Final norm (model.norm)
         self.norm = RMSNorm(
+            activation_sharding=self.act_shard,
             mesh_device=mesh_device,
             hf_config=self.text_args,
             state_dict=substate(state_dict, "model.norm"),
@@ -212,8 +226,6 @@ class Gemma4AssistantModel:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
 
         if placement.enabled:
-            from loguru import logger
-
             logger.info("\n" + placement.report())
 
     def _raw_token_embed(self, token_tt):
@@ -278,6 +290,10 @@ class Gemma4AssistantModel:
             )
 
         normed = self.norm.forward(h)
+        # The CME head (topk / transpose / embedding) and post_projection both
+        # want an interleaved operand; one conversion serves both, and it
+        # replaces the S2I the norm used to do unconditionally.
+        normed = self.act_shard.from_stream(normed)
         h.deallocate(True)
 
         logits = None
