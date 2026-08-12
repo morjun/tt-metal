@@ -987,6 +987,64 @@ def _walk_norms(root, seen=None):
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_argmax_shapes(mesh_device, reset_seeds):
+    """Is ttnn.argmax's 169.6 us a PADDING tax or a single-core-per-row tax?
+
+    ``_argmax_rows`` pads [1,1,1,N] to 32 rows because the multicore argmax is
+    row-parallel and only correct at exactly one tile of rows. I claimed that was
+    the same 32x tile-padding tax the CME gathers paid. If argmax really is
+    row-parallel, that claim is WRONG: 1 row and 32 rows cost the same, and the
+    real cost is one core scanning 4096 elements scalar-ly (169.6 us / 4096 =
+    41 ns/element, exactly the single-core rate both gathers showed).
+
+    The distinguishing measurement is arm a vs b. If they are equal, the fix is
+    not "stop padding" but "give the reduction more rows to parallelize over" —
+    arm d reshapes the 4096 into [64,64] so 64 cores each scan 64 elements.
+    """
+    torch.manual_seed(0)
+    N = 4096
+    v = torch.randn(1, 1, 1, N)
+    gold = int(v.reshape(-1).argmax())
+
+    def rm(t, dtype=ttnn.float32):
+        return ttnn.from_torch(t, device=mesh_device, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=dtype)
+
+    v1 = rm(v)
+    v32 = rm(v.repeat(1, 1, 32, 1))
+    v2d = rm(v.reshape(1, 1, 64, 64))
+    v1_bf = rm(v.bfloat16(), ttnn.bfloat16)
+    v32_bf = rm(v.repeat(1, 1, 32, 1).bfloat16(), ttnn.bfloat16)
+    protect = (v1, v32, v2d, v1_bf, v32_bf)
+
+    def chk(out, want):
+        try:
+            return int(ttnn.to_torch(out).reshape(-1)[0]) == want
+        except Exception:  # noqa: BLE001
+            return None
+
+    arms = [
+        ("a  [1,1, 1,4096] fp32 (unpadded)", lambda: ttnn.argmax(v1, dim=-1, keepdim=False), gold),
+        ("b  [1,1,32,4096] fp32 (CURRENT)", lambda: ttnn.argmax(v32, dim=-1, keepdim=False), gold),
+        ("c  [1,1, 1,4096] bf16", lambda: ttnn.argmax(v1_bf, dim=-1, keepdim=False), None),
+        ("d  [1,1,64,  64] fp32 (2-stage s1)", lambda: ttnn.argmax(v2d, dim=-1, keepdim=False), None),
+        ("e  ttnn.max [1,1,64,64] fp32", lambda: ttnn.max(v2d, dim=-1), None),
+        ("f  ttnn.max [1,1,1,4096] fp32", lambda: ttnn.max(v1, dim=-1), None),
+    ]
+    for name, fn, want in arms:
+        try:
+            out = fn()
+            ttnn.synchronize_device(mesh_device)
+            ok = chk(out, want) if want is not None else "-"
+            out.deallocate(True)
+            us = _op_timed(mesh_device, fn, protect=protect)
+            logger.info(f"[argmax-shape] {name:<36} {us:8.2f} us   correct={ok}")
+        except Exception as ex:  # noqa: BLE001
+            logger.info(f"[argmax-shape] {name:<36} FAILED: {str(ex).split('backtrace')[0].strip()[:95]}")
+    for t in protect:
+        t.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
 def test_matmul_sharded_in0_cost(mesh_device, reset_seeds):
     """Can the decode matmuls consume the norm's sharded output directly?
 
@@ -1289,24 +1347,30 @@ def test_argmax_token_id_breakdown(mesh_device, reset_seeds):
     def p_full():
         return rig["assistant"].masked_embedding.argmax_token_id(logits, rows)
 
+    # The first three rebuild the OLD padded path by hand as a reference; the
+    # rest are the live one. Read each block's own cumulative column — the two
+    # are separate paths, not a single chain, so a delta ACROSS the blank line
+    # is meaningless.
     stages = [
-        ("pad (alias when rows<32)", p_pad),
-        ("+ untilize(multicore)", p_untilize),
-        ("+ argmax", p_argmax),
-        ("+ slice = _argmax_rows", p_argmax_rows),
-        ("+ reshape to column (RM view)", p_col),
-        ("+ ttnn.gather(ids) ROW_MAJOR", p_gather),
-        ("+ reshape = FULL argmax_token_id", p_full),
+        ("[old] pad to 32 rows (alias)", p_pad),
+        ("[old] + untilize(multicore)", p_untilize),
+        ("[old] + argmax over 32 rows", p_argmax),
+        ("[new] untilize+argmax = _argmax_rows", p_argmax_rows),
+        ("[new] + reshape to column (RM view)", p_col),
+        ("[new] + ttnn.gather(ids) ROW_MAJOR", p_gather),
+        ("[new] + reshape = FULL", p_full),
     ]
     assert ids.layout == ttnn.ROW_MAJOR_LAYOUT, (
         "pack.ids must be ROW_MAJOR: gathering from a TILE [1,1,rows,N] costs 2069 us "
         f"against 10.5 ROW_MAJOR, got {ids.layout}"
     )
     prev = 0.0
-    logger.info(f"{'stage':<34}{'cumulative us':>15}{'delta us':>11}")
+    logger.info(f"{'stage':<38}{'cumulative us':>15}{'delta us':>11}")
     for name, fn in stages:
         us = _op_timed(mesh_device, fn, protect=(vals, ids))
-        logger.info(f"{name:<34}{us:>15.1f}{us-prev:>11.1f}")
+        if name.startswith("[new] untilize"):
+            prev = 0.0  # new block starts its own cumulative chain
+        logger.info(f"{name:<38}{us:>15.1f}{us-prev:>11.1f}")
         prev = us
     logger.info(f"[argmax-bd] full call {prev:.1f} us/step; drafter step measured at ~1335 us")
     logits.deallocate(True)

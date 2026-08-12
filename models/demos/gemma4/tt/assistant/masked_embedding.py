@@ -408,6 +408,22 @@ class Gemma4TTMaskedEmbedder:
             for c in chunks:
                 c.deallocate(True)
             return out
+        # rows == 1 (the drafter) needs NO padding: untilizing the [1,1,1,N] TILE
+        # tensor drops the physical 32-row pad, and argmax over the resulting
+        # single ROW_MAJOR row is both correct and 17.9x cheaper.
+        # MEASURED (test_argmax_shapes, N=4096 fp32): argmax on [1,1,1,4096] is
+        # 9.49 us and returns the right index; on the padded [1,1,32,4096] it is
+        # 169.78 us. So argmax cost scales with ROWS, and 31 of the 32 were pad.
+        # rows in 2..31 keeps the pad-to-32 path: the multicore argmax is
+        # documented to need exactly one tile of rows there, and that is not
+        # exercised by any current caller, so it is left alone rather than
+        # widened on an untested assumption.
+        if rows == 1:
+            u = ttnn.untilize(values, use_multicore=True)
+            idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,1] uint32 RM
+            u.deallocate(True)
+            return idx
+
         src = values
         padded = None
         if rows < R32:
