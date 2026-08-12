@@ -344,10 +344,19 @@ class Gemma4TTMaskedEmbedder:
         values = ttnn.transpose(sel_logits_col, -2, -1)  # [1,1,1,N]
         sel_logits_col.deallocate(True)
 
-        # Keep the ids TILE-aligned alongside the values for the on-device
-        # local-index -> token-id gather in `argmax_token_id`.
-        ids = ttnn.to_layout(ttnn.reshape(sel_ids_rm, (1, 1, 1, N)), ttnn.TILE_LAYOUT)
-        sel_ids_rm.deallocate(True)
+        # Keep the ids ROW_MAJOR for the local-index -> token-id gather in
+        # `argmax_token_id`. MEASURED: gathering from a TILE [1,1,1,N] costs
+        # 2069 us against 10.5 us ROW_MAJOR — 197x — because a TILE tensor with
+        # one logical row still occupies 32 x N physically and the generic gather
+        # walks the padded volume (32 REAL rows measured at 2062 us, i.e. the same:
+        # the cost tracks the padding, not the work). This is the second instance
+        # of the CME gather problem; see the module docstring for the first.
+        # The reshape is a free ROW_MAJOR view, so `sel_ids_rm` must NOT be freed.
+        ids = ttnn.reshape(sel_ids_rm, (1, 1, 1, N))
+        if os.environ.get("GEMMA4_CME_TILED_IDS") == "1":  # A/B the layout
+            tiled = ttnn.to_layout(ids, ttnn.TILE_LAYOUT)
+            sel_ids_rm.deallocate(True)
+            return values, tiled
         return values, ids
 
     # ── greedy: argmax straight to a token id, on device ──────────────────────
@@ -360,15 +369,19 @@ class Gemma4TTMaskedEmbedder:
         vocab (see the module docstring).
         """
         local = self._argmax_rows(pack.values, rows)  # [1,1,rows] uint32 RM, in [0,N)
-        # Map local index -> token id: gather along the candidate dim.
-        local_col = ttnn.to_layout(ttnn.reshape(local, (1, 1, rows, 1)), ttnn.TILE_LAYOUT)
-        local.deallocate(True)
-        ids_col = ttnn.gather(pack.ids, dim=-1, index=local_col)  # [1,1,rows,1] uint32
-        local_col.deallocate(True)
-        ids_rm = ttnn.to_layout(ids_col, ttnn.ROW_MAJOR_LAYOUT)
-        ids_col.deallocate(True)
-        out = ttnn.reshape(ids_rm, (1, 1, rows))
-        return out
+        # Map local index -> token id: gather along the candidate dim, ENTIRELY in
+        # ROW_MAJOR. Tiling either operand makes `ttnn.gather` walk the 32-row
+        # padded volume and costs 2069 us instead of 10.5 (see `_forward_row`).
+        # Both reshapes below are free ROW_MAJOR views, so neither source is freed.
+        ids = pack.ids
+        detiled = None
+        if ids.layout != ttnn.ROW_MAJOR_LAYOUT:
+            ids = detiled = ttnn.to_layout(ids, ttnn.ROW_MAJOR_LAYOUT)
+        local_col = ttnn.reshape(local, (1, 1, rows, 1))
+        ids_col = ttnn.gather(ids, dim=-1, index=local_col)  # [1,1,rows,1] uint32 RM
+        if detiled is not None:
+            detiled.deallocate(True)
+        return ttnn.reshape(ids_col, (1, 1, rows))
 
     @staticmethod
     def _argmax_rows(values, rows):

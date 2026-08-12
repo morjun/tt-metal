@@ -54,6 +54,7 @@ from loguru import logger
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
+from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, Gemma4TTMaskedEmbedder, _same_buffer
 from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
@@ -358,6 +359,176 @@ def _time_traced_step(mesh_device, rig, return_logits, reps=TRACE_REPS):
     return ms
 
 
+def _argmax_token(assistant, logits, rows=1):
+    """Next-token id as a DEVICE [1,1,rows] uint32 tensor. Mirrors SpeculativeDecoder._argmax_last.
+
+    Under CME the head does its own argmax over the ~4096 candidates and maps the
+    winner back to a vocab id on device. The dense fallback needs the pad-to-32
+    dance because ``ttnn.argmax``'s multicore path is row-parallel and returns
+    garbage unless the row dim is exactly one tile.
+    """
+    if isinstance(logits, CmeLogits):
+        return assistant.masked_embedding.argmax_token_id(logits, rows)
+    R32 = 32
+    src, padded = logits, None
+    if rows < R32:
+        padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
+        src = padded
+    u = ttnn.untilize(src, use_multicore=True)
+    if padded is not None and not _same_buffer(padded, logits):
+        padded.deallocate(True)
+    idx = ttnn.argmax(u, dim=-1, keepdim=False)
+    u.deallocate(True)
+    if rows < R32:
+        sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
+        idx.deallocate(True)
+        idx = sliced
+    return idx
+
+
+def _time_fused_k_steps(mesh_device, rig, k, reps=TRACE_REPS, mode="full"):
+    """K drafter steps CHAINED inside ONE trace. Zero host work between replays.
+
+    This is the standalone twin of ``spec_decode._fused_body_batched``'s draft
+    section: argmax on device, ``ttnn.reshape`` re-feeds the id as the next token,
+    and the hidden recurrence is a plain Python rebind chained in-graph. Nothing
+    crosses to host.
+
+    It is a valid steady-state benchmark because a drafter iteration is
+    side-effect-free on device state: the drafter never writes KV
+    (``is_kv_shared=True``, so ``attention/decode.py`` skips K/V proj, the K
+    rotation and ``paged_update_cache``), and all K steps query ONE fixed position
+    (HF SinglePositionMTP). So replaying the identical trace N times repeats
+    identical work, and no buffer needs resetting between replays.
+
+    ``mode`` decomposes the step, all three chaining the hidden identically so
+    only the head differs:
+      ``full``      — CME head + argmax_token_id, the real drafter step
+      ``no_argmax`` — CME head runs, argmax_token_id does not (token stays fixed)
+      ``backbone``  — ``return_logits=False``: no head at all
+    full - no_argmax isolates ``argmax_token_id`` (its argmax over ~4096
+    candidates plus the second ``ttnn.gather`` over ``pack.ids``), which every
+    previous standalone number omitted by stopping at logits.
+
+    Returns (ms per K-step iteration, capture seconds).
+    """
+    assistant = rig["assistant"]
+    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
+    pu, pi = rig["pos_uint32"], rig["pos_int32"]
+    want_logits = mode != "backbone"
+
+    def body():
+        tok, h = rig["token"], rig["hidden"]
+        last = None
+        for _ in range(k):
+            logits, h = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=want_logits)
+            if mode == "full":
+                last = _argmax_token(assistant, logits, rows=1)
+                logits.deallocate(True)
+                # ROW_MAJOR reshape is a free VIEW of `last`. Never deallocate
+                # either one: freeing the view hands its storage back and a later
+                # replay reads zeros (the verify_x bug in spec_decode.py:1641).
+                tok = ttnn.reshape(last, (1, 1))
+            elif logits is not None:
+                logits.deallocate(True)
+        return last, h
+
+    idx, h = body()  # compile
+    ttnn.synchronize_device(mesh_device)
+    if idx is not None:
+        idx.deallocate(True)
+    h.deallocate(True)
+
+    t_cap = time.perf_counter()
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    idx, h = body()
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    ttnn.synchronize_device(mesh_device)
+    capture_s = time.perf_counter() - t_cap
+
+    for _ in range(3):
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(mesh_device)
+
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(mesh_device)
+    ms = (time.perf_counter() - t0) / reps * 1e3
+
+    ttnn.release_trace(mesh_device, tid)
+    if idx is not None:
+        idx.deallocate(True)
+    h.deallocate(True)
+    return ms, capture_s
+
+
+def _time_per_step_replay(mesh_device, rig, k, reps=max(4, TRACE_REPS // 8)):
+    """CONTROL: one step traced, replayed K times, paying host dispatch per step.
+
+    Reproduces ``spec_decode._draft_traced`` standalone — the design the fused
+    path replaced. Per draft step it pays, outside the trace: a device->device
+    ``ttnn.copy`` for the hidden recurrence (an in-trace copy fails capture with
+    "Writes not supported during trace capture"), an eagerly dispatched argmax, a
+    ``to_torch`` readback of one uint32, and a host->device token write.
+
+    The delta against ``_time_fused_k_steps`` IS the host dispatch overhead.
+    Fewer reps by default: each one is K host round-trips, so it is slow.
+    """
+    assistant = rig["assistant"]
+    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
+    pu, pi = rig["pos_uint32"], rig["pos_int32"]
+    tp = mesh_device.get_num_devices()
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device) if tp > 1 else None
+
+    tok_in = ttnn.clone(rig["token"])
+    h_in = ttnn.clone(rig["hidden"])
+
+    logits, h_next = assistant.step(tok_in, h_in, shared_kv, page_tables, pu, pi)
+    ttnn.synchronize_device(mesh_device)
+    logits.deallocate(True)
+    h_next.deallocate(True)
+
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    logits, h_next = assistant.step(tok_in, h_in, shared_kv, page_tables, pu, pi)
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    ttnn.synchronize_device(mesh_device)
+
+    def one_iteration():
+        ttnn.copy(rig["hidden"], h_in)  # reset the recurrence to this iter's seed
+        for step in range(k):
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+            if step < k - 1:
+                ttnn.copy(h_next, h_in)  # the trace cannot update its own input
+            idx = _argmax_token(assistant, logits, rows=1)  # eager, not traced
+            t = ttnn.to_torch(ttnn.get_device_tensors(idx)[0] if tp > 1 else idx)
+            tok = int(t.reshape(-1)[0])
+            idx.deallocate(True)
+            if step < k - 1:
+                host_tok = ttnn.from_torch(
+                    torch.tensor([[tok]], dtype=torch.int64),
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    dtype=ttnn.uint32,
+                    mesh_mapper=mapper,
+                )
+                ttnn.copy_host_to_device_tensor(host_tok, tok_in)
+
+    for _ in range(2):
+        one_iteration()
+    ttnn.synchronize_device(mesh_device)
+
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        one_iteration()
+    ttnn.synchronize_device(mesh_device)
+    ms = (time.perf_counter() - t0) / reps * 1e3
+
+    ttnn.release_trace(mesh_device, tid)
+    for t in (logits, h_next, tok_in, h_in):
+        t.deallocate(True)
+    return ms
+
+
 def _buffer_types(assistant):
     """Buffer type of a representative weight from each module, for assertions."""
     layer0 = assistant.layers[0]
@@ -560,6 +731,316 @@ def test_standalone_perf_dram_vs_l1(mesh_device, context_len, reset_seeds):
     # No perf assertion: the measurement IS the result. Guard only against a
     # broken L1 arm that silently fell back to DRAM.
     assert l1b > 8 * (1 << 20), "L1 arm pinned almost nothing — placement did not take effect"
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_fused_draft_k_steps(mesh_device, reset_seeds):
+    """THE instrument: K chained drafter steps in one trace, vs per-step replay.
+
+    Every previously published standalone drafter number came from
+    ``_time_traced_step``, which captures exactly ONE step and re-reads the same
+    hidden and token on every replay (``h_next`` is discarded). The K-step cost
+    was only ever EXTRAPOLATED — ``test_spec_decode.py::test_draft_step_breakdown``
+    literally prints ``full K={K} steps ~= full_ms*K``. This measures it.
+
+    Two arms:
+      fused   — K steps chained in ONE trace, zero host work between replays
+      control — one step traced and replayed K times, paying ttnn.copy +
+                eager argmax + uint32 readback + host->device token write per step
+
+    The control is the design the fused end-to-end path replaced; the fused
+    write-up measured it at 10.2 ms/step against ~4-5 ms of device work. The
+    fused/control ratio here is that same overhead, isolated to the drafter.
+
+    K is swept because the packed-verify constraint ``(H_local*P) % 32 == 0``
+    is verify-side only, so a drafter-only benchmark can use any K.
+    """
+    ks = [int(s) for s in os.getenv("GEMMA4_DRAFT_K_SWEEP", "1,2,3,4,8").split(",") if s.strip()]
+    rig = _build_standalone(mesh_device, "dram")
+
+    logger.info(
+        f"{'K':>3} {'fused ms/iter':>14} {'ms/step':>9} {'tok/s/u':>9} "
+        f"{'control ms/iter':>16} {'ms/step':>9} {'speedup':>8} {'capture s':>10}"
+    )
+    rows = []
+    for k in ks:
+        fused_ms, cap_s = _time_fused_k_steps(mesh_device, rig, k)
+        ctl_ms = _time_per_step_replay(mesh_device, rig, k)
+        rows.append((k, fused_ms, ctl_ms))
+        logger.info(
+            f"{k:>3} {fused_ms:>14.3f} {fused_ms/k:>9.3f} {k*1e3/fused_ms:>9.2f} "
+            f"{ctl_ms:>16.3f} {ctl_ms/k:>9.3f} {ctl_ms/fused_ms:>7.2f}x {cap_s:>10.2f}"
+        )
+
+    # Where the fused step actually goes. Every previous standalone number
+    # stopped at logits, so argmax_token_id was never in any published figure.
+    kb = ks[-1]
+    full_ms, _ = _time_fused_k_steps(mesh_device, rig, kb, mode="full")
+    noam_ms, _ = _time_fused_k_steps(mesh_device, rig, kb, mode="no_argmax")
+    back_ms, _ = _time_fused_k_steps(mesh_device, rig, kb, mode="backbone")
+    logger.info(f"[breakdown K={kb}] per step, ms:")
+    logger.info(f"    backbone (4 layers, no head)   {back_ms/kb:8.3f}   {back_ms/full_ms*100:5.1f}%")
+    logger.info(
+        f"    CME head forward               {(noam_ms-back_ms)/kb:8.3f}   {(noam_ms-back_ms)/full_ms*100:5.1f}%"
+    )
+    logger.info(
+        f"    argmax_token_id (+2nd gather)  {(full_ms-noam_ms)/kb:8.3f}   {(full_ms-noam_ms)/full_ms*100:5.1f}%"
+    )
+    logger.info(f"    TOTAL                          {full_ms/kb:8.3f}")
+
+    # The fused chain must beat the per-step-replay control at every K>1. At K=1
+    # they are the same graph plus one eager argmax + readback, so the control is
+    # only slightly worse there; the gap is what grows with K.
+    for k, fused_ms, ctl_ms in rows:
+        if k > 1:
+            assert ctl_ms > fused_ms, f"K={k}: fused ({fused_ms:.3f} ms) did not beat per-step replay ({ctl_ms:.3f} ms)"
+    # Scaling check: a chained trace should be close to linear in K, since every
+    # step is the same graph and nothing is amortized across steps. A large
+    # sublinearity would mean the K=1 number was dominated by per-replay overhead.
+    if len(rows) > 1:
+        k1 = next((f for k, f, _ in rows if k == 1), None)
+        if k1:
+            for k, fused_ms, _ in rows:
+                logger.info(f"[scale] K={k}: {fused_ms/(k1*k):.3f}x of linear extrapolation from K=1")
+
+
+def _op_timed(mesh_device, fn, inner=4, replays=8, protect=()):
+    """Per-call us for one op graph, by repeating it `inner` times in one trace.
+
+    `fn` must not deallocate anything it did not create. `protect` lists tensors
+    the caller owns: a returned tensor that ALIASES one of them is not freed.
+    Required because a shape-only op can hand back a view of its input — e.g.
+    ``ttnn.pad`` to 32 rows on a [1,1,rows<32,N] TILE tensor is a logical no-op
+    that ttnn satisfies with an alias, so freeing the "output" frees the pack
+    (``masked_embedding._argmax_rows:404-413``).
+    """
+
+    def _free(o):
+        try:
+            if any(_same_buffer(o, p) for p in protect):
+                return
+            o.deallocate(True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    outs = [fn() for _ in range(inner)]
+    ttnn.synchronize_device(mesh_device)
+    for o in outs:
+        _free(o)
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    outs = [fn() for _ in range(inner)]
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    ttnn.synchronize_device(mesh_device)
+    for _ in range(3):
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(mesh_device)
+    t0 = time.perf_counter()
+    for _ in range(replays):
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(mesh_device)
+    us = (time.perf_counter() - t0) / replays / inner * 1e6
+    ttnn.release_trace(mesh_device, tid)
+    for o in outs:
+        _free(o)
+    return us
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_argmax_token_id_breakdown(mesh_device, reset_seeds):
+    """Split ``argmax_token_id``, measured at 66% of the fused drafter step.
+
+    ``test_fused_draft_k_steps`` attributes 2.26 of 3.43 ms/step to this call,
+    which no previous standalone measurement included (they all stopped at
+    logits). ``CME_DIGIT_GATHER.md`` §7 flagged the second ``ttnn.gather`` here as
+    unmeasured; this decides whether that gather, the argmax, the untilize or the
+    layout conversions owns the time — the first CME gather had exactly this
+    shape of problem (one core, cost tracking the INPUT not the work).
+
+    Cumulative prefixes, so each row's cost is the delta from the row above.
+    """
+    rig = _build_standalone(mesh_device, "dram")
+    logits, h = rig["assistant"].step(*_step_args(rig), return_logits=True)
+    ttnn.synchronize_device(mesh_device)
+    h.deallocate(True)
+    assert isinstance(logits, CmeLogits), "this breakdown is CME-specific"
+    vals, ids = logits.values, logits.ids
+    rows = 1
+    N = int(vals.shape[-1])
+    logger.info(f"[argmax-bd] values{tuple(vals.shape)} {vals.dtype}  ids{tuple(ids.shape)} {ids.dtype}  N={N}")
+
+    def p_pad():
+        return ttnn.pad(vals, [(0, 0), (0, 0), (0, 32 - rows), (0, 0)], value=0.0)
+
+    def p_untilize():
+        return ttnn.untilize(p_pad(), use_multicore=True)
+
+    def p_argmax():
+        u = p_untilize()
+        idx = ttnn.argmax(u, dim=-1, keepdim=False)
+        u.deallocate(True)
+        return idx
+
+    def p_argmax_rows():
+        return Gemma4TTMaskedEmbedder._argmax_rows(vals, rows)
+
+    def p_col():
+        # ROW_MAJOR reshape = free view of the argmax output; do not free either.
+        return ttnn.reshape(p_argmax_rows(), (1, 1, rows, 1))
+
+    def p_gather():
+        return ttnn.gather(ids, dim=-1, index=p_col())
+
+    def p_full():
+        return rig["assistant"].masked_embedding.argmax_token_id(logits, rows)
+
+    stages = [
+        ("pad (alias when rows<32)", p_pad),
+        ("+ untilize(multicore)", p_untilize),
+        ("+ argmax", p_argmax),
+        ("+ slice = _argmax_rows", p_argmax_rows),
+        ("+ reshape to column (RM view)", p_col),
+        ("+ ttnn.gather(ids) ROW_MAJOR", p_gather),
+        ("+ reshape = FULL argmax_token_id", p_full),
+    ]
+    assert ids.layout == ttnn.ROW_MAJOR_LAYOUT, (
+        "pack.ids must be ROW_MAJOR: gathering from a TILE [1,1,rows,N] costs 2069 us "
+        f"against 10.5 ROW_MAJOR, got {ids.layout}"
+    )
+    prev = 0.0
+    logger.info(f"{'stage':<34}{'cumulative us':>15}{'delta us':>11}")
+    for name, fn in stages:
+        us = _op_timed(mesh_device, fn, protect=(vals, ids))
+        logger.info(f"{name:<34}{us:>15.1f}{us-prev:>11.1f}")
+        prev = us
+    logger.info(f"[argmax-bd] full call {prev:.1f} us/step; drafter step measured at ~1335 us")
+    logits.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_second_gather_alternatives(mesh_device, reset_seeds):
+    """Replace ``ttnn.gather(pack.ids, dim=-1, index=argmax_col)`` — 2045 us/step.
+
+    Measured at 60% of the fused drafter step. Same failure mode as the first CME
+    gather: cost tracks the INPUT, and a [1,1,1,4096] TILE tensor physically
+    occupies 32x4096 = 131072 elements, so the generic gather walks 32x more than
+    the row holds.
+
+    The operation is ``out[s] = ids[s, local[s]]`` — one element per row. Arms:
+      a  current, TILE ids + TILE index
+      b  same over 32 real rows (does cost track the padded volume?)
+      c  ROW_MAJOR ids and index (does dropping tile padding fix it?)
+      d  mask-and-reduce: eq(arange, local) * ids, summed. Exact in fp32
+         (max id 262143 < 2^24) and every op is multicore elementwise/reduction.
+    """
+    torch.manual_seed(0)
+    N, V = 4096, 262144
+    ar = torch.arange(N, dtype=torch.float32).reshape(1, 1, 1, N)
+    ids_t = torch.randint(0, V, (1, 1, 1, N), dtype=torch.int32)
+    sel = 1234
+    idx_t = torch.tensor([[[[sel]]]], dtype=torch.int32)
+    gold = int(ids_t[0, 0, 0, sel])
+
+    def dev(t, dtype, layout=ttnn.TILE_LAYOUT):
+        return ttnn.from_torch(t, device=mesh_device, layout=layout, dtype=dtype)
+
+    ids_tile = dev(ids_t, ttnn.uint32)
+    idx_tile = dev(idx_t, ttnn.uint32)
+    arange_tile = dev(ar, ttnn.float32)
+    ids_f32 = dev(ids_t.float(), ttnn.float32)
+
+    ids_rm = dev(ids_t, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+    idx_rm = dev(idx_t, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+
+    ids32_tile = dev(ids_t.repeat(1, 1, 32, 1), ttnn.uint32)
+    idx32_tile = dev(idx_t.repeat(1, 1, 32, 1), ttnn.uint32)
+
+    def a():
+        return ttnn.gather(ids_tile, dim=-1, index=idx_tile)
+
+    def b():
+        return ttnn.gather(ids32_tile, dim=-1, index=idx32_tile)
+
+    def c():
+        return ttnn.gather(ids_rm, dim=-1, index=idx_rm)
+
+    def d():
+        # local index -> fp32 column, broadcast-compare against 0..N-1
+        col = ttnn.typecast(idx_tile, ttnn.float32)
+        mask = ttnn.eq(arange_tile, col)  # [1,1,1,N] fp32, one-hot
+        col.deallocate(True)
+        prod = ttnn.mul(ids_f32, mask)
+        mask.deallocate(True)
+        out = ttnn.sum(prod, dim=-1)
+        prod.deallocate(True)
+        return out
+
+    protect = (ids_tile, idx_tile, arange_tile, ids_f32, ids_rm, idx_rm, ids32_tile, idx32_tile)
+    for name, fn, note in (
+        ("a TILE ids, 1 row (CURRENT)", a, ""),
+        ("b TILE ids, 32 real rows", b, "cost vs padded volume"),
+        ("c ROW_MAJOR ids + index", c, ""),
+        ("d mask-and-reduce (fp32)", d, ""),
+    ):
+        try:
+            out = fn()
+            ttnn.synchronize_device(mesh_device)
+            got = ttnn.to_torch(out).reshape(-1)[0]
+            ok = int(got) == gold
+            out.deallocate(True)
+            us = _op_timed(mesh_device, fn, protect=protect)
+            logger.info(f"[gather-alt] {name:<30} {us:>9.1f} us  correct={ok} (got {int(got)} want {gold}) {note}")
+        except Exception as ex:  # noqa: BLE001
+            logger.info(f"[gather-alt] {name:<30} FAILED: {str(ex).split('backtrace')[0].strip()[:110]}")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_fused_k_step_dram_vs_l1(mesh_device, reset_seeds):
+    """The L1 weight A/B, re-measured on the K-chained harness.
+
+    Supersedes ``test_standalone_perf_dram_vs_l1`` as the number to quote: that
+    one measures a single step replayed with a frozen input, which is not what a
+    drafter does. Also dumps ``WeightPlacement.report()`` for each arm, which is
+    the ground truth for WHICH tensors got pinned — admission is whole-tensor
+    greedy first-fit in construction order, with a refund for anything that turns
+    out not to be a shardable matmul weight, so the pinned set is not a layer
+    prefix and cannot be inferred from the total.
+    """
+    k = int(os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3"))
+    modes = [m.strip() for m in os.getenv("GEMMA4_L1_MODES", "dram,l1_sharded").split(",") if m.strip()]
+
+    results = {}
+    for mode in modes:
+        rig = _build_standalone(mesh_device, mode)
+        logger.info("\n" + rig["placement"].report())
+        ms, _ = _time_fused_k_steps(mesh_device, rig, k)
+        pinned = rig["placement"].summary()["l1_bytes"]
+        results[mode] = (ms, pinned)
+        logger.info(
+            f"[k-perf K={k}] {mode:<12} {ms:.3f} ms/iter  {ms/k:.3f} ms/step  "
+            f"{k*1e3/ms:.2f} tok/s/u  pinned {pinned/(1<<20):.2f} MB/device"
+        )
+
+    if "dram" in results and len(results) > 1:
+        base = results["dram"][0]
+        for mode, (ms, pinned) in results.items():
+            if mode == "dram":
+                continue
+            logger.info(
+                f"[k-perf K={k}] ===== {mode} vs dram: {base:.3f} -> {ms:.3f} ms/iter "
+                f"({(base-ms)/base*100:+.2f}%), pinned {pinned/(1<<20):.2f} MB/device ====="
+            )
 
 
 @_needs_assistant
