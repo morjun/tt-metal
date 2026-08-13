@@ -306,17 +306,23 @@ def decode_forward(
     batch_size = tt_q.shape[1]
     device_grid = mesh_device.compute_with_storage_grid_size()
     if config.head_dim >= 512 and batch_size == 1:
-        # Single-user global layers: smaller grid — head_dim=512 needs more L1 per core.
-        sdpa_grid = ttnn.CoreCoord(8, 4)
+        # Single-user global layers: smaller grid. NOTE the grid does NOT change
+        # per-core CB bytes — num_cores_per_head = min(grid, max_cores_per_head_batch)
+        # saturates at 16 for any grid >= 16, so the CB stack per core is identical
+        # at 8x4 and 11x10. What the smaller grid changes is how MANY cores carry
+        # that stack (CBs are stamped on the whole grid regardless of which cores
+        # compute: sdpa_decode_program_factory.cpp `.core_ranges = core_grid`).
+        sdpa_grid = _env_grid("GEMMA4_SDPA_GLOBAL_GRID") or ttnn.CoreCoord(8, 4)
     else:
         # Sliding layers, and all batched decode: use the full device compute grid.
-        sdpa_grid = ttnn.CoreCoord(device_grid.x, device_grid.y)
+        sdpa_grid = _env_grid("GEMMA4_SDPA_SLIDING_GRID") or ttnn.CoreCoord(device_grid.x, device_grid.y)
 
     sdpa_program_config = ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=sdpa_grid,
         q_chunk_size=32,
-        k_chunk_size=64,
+        k_chunk_size=int(os.environ.get("GEMMA4_SDPA_KCHUNK", "64")),
         exp_approx_mode=False,
+        max_cores_per_head_batch=int(os.environ.get("GEMMA4_SDPA_MAX_CORES", "16")),
     )
 
     if page_table is not None:
@@ -388,6 +394,17 @@ def decode_forward(
 # running a single non-causal SDPA with an additive mask that bakes in the
 # per-position causal upper bound (and the sliding-window lower bound on
 # sliding layers). Ported from the gemma4_cody packed-verify path.
+
+
+def _env_grid(name):
+    """Parse a "WxH" core-grid override, or None. For CB-capacity experiments:
+    the SDPA CB stack is stamped on the WHOLE grid, so the grid decides how many
+    cores pay for it (see sdpa_decode_program_factory.cpp `.core_ranges = core_grid`)."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return None
+    x, _, y = raw.partition("x")
+    return ttnn.CoreCoord(int(x), int(y))
 
 
 def _packed_sdpa_grid(config, mesh_device):
