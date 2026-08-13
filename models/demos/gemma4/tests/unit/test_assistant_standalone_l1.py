@@ -46,6 +46,7 @@ Usage:
 
 import math
 import os
+import re
 import time
 
 import pytest
@@ -920,6 +921,57 @@ def test_cb_high_water(mesh_device, reset_seeds):
         logger.info(
             f"[cb-hw] {op[:44]:<44}{e['end']:>15}{e['end']/1024:>9.1f}{e['cbs']:>6}"
             f"{e['bytes']/1024:>9.1f}  {e['grid'][:34]}"
+        )
+
+    # PER-CORE map. The CB region end is NOT uniform: each program's CBs live on
+    # its own core range, so a core's true high-water is the max over only the
+    # programs that cover it. LOCKSTEP then collapses this to ONE global frontier
+    # (bank_manager.cpp:410-445), charging every core as if it were the worst —
+    # so the uniform "KB/core" budget is an ACCOUNTING artifact, not physics.
+    def _cores(crs):
+        out = set()
+        for part in re.findall(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]", crs or ""):
+            x1, y1, x2, y2 = (int(v) for v in part)
+            for x in range(min(x1, x2), max(x1, x2) + 1):
+                for y in range(min(y1, y2), max(y1, y2) + 1):
+                    out.add((x, y))
+        return out
+
+    core_end = {}
+    core_owner = {}
+    for v in graph:
+        if v.get("node_type") != "circular_buffer_allocate":
+            continue
+        pr = v.get("params", {})
+        if pr.get("globally_allocated", "0") == "1":
+            continue
+        e = int(pr.get("address", 0)) + int(pr.get("size", 0))
+        for c in _cores(pr.get("core_range_set", "")):
+            if e > core_end.get(c, 0):
+                core_end[c] = e
+    for op, info in per_op.items():
+        for c in _cores(info["grid"]):
+            if core_end.get(c, 0) == info["end"]:
+                core_owner[c] = op
+
+    if core_end:
+        gx = max(c[0] for c in core_end) + 1
+        gy = max(c[1] for c in core_end) + 1
+        logger.info(f"[cb-hw] per-core CB high-water, KB (grid {gx}x{gy}; '.' = no CBs at all):")
+        logger.info("[cb-hw]      " + "".join(f"{x:>7}" for x in range(gx)))
+        for y in range(gy):
+            row = "".join((f"{core_end[(x, y)]/1024:>7.0f}" if (x, y) in core_end else f"{'.':>7}") for x in range(gx))
+            logger.info(f"[cb-hw]  y={y:<2} {row}")
+        vals = [core_end.get((x, y), 0) for x in range(gx) for y in range(gy)]
+        busiest = max(vals) / 1024
+        idle = sum(1 for v in vals if v == 0)
+        logger.info(
+            f"[cb-hw] busiest core {busiest:.0f} KB, quietest {min(vals)/1024:.0f} KB, "
+            f"{idle} of {len(vals)} cores hold NO CBs"
+        )
+        logger.info(
+            f"[cb-hw] spread = {busiest - min(vals)/1024:.0f} KB. LOCKSTEP charges every core the "
+            f"worst ({busiest:.0f} KB); only HYBRID + per_core_allocation can use the difference."
         )
 
     owner, worst = ranked[0]
