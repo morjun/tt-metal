@@ -855,6 +855,67 @@ def _op_timed(mesh_device, fn, inner=20, replays=20, protect=()):
     mesh_shapes=[(1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
+def test_sdpa_max_cores_latency(mesh_device, reset_seeds):
+    """What does shrinking `max_cores_per_head_batch` cost, and does it grow with context?
+
+    It is the largest capacity lever found: 16 -> 1 drops the binding CB high-water
+    782 -> 512 KB, i.e. +270 KB against a ~320 KB allowance (`test_cb_high_water`).
+    The cost is latency — the cap sets how many cores share one head's K-sweep, so
+    1 serialises it.
+
+    Context matters because the two layer types differ: the drafter's **sliding**
+    layers are capped at their 512-token window no matter how long the context is,
+    while the **global** layer sweeps the whole thing. So any penalty should be
+    flat in context for sliding and linear for global — which is exactly what
+    decides whether this lever is usable in production.
+
+    One rig per context; the cap is read from the environment at SDPA call time,
+    so the sweep re-captures a trace per setting without rebuilding the model.
+    """
+    ctxs = [int(c) for c in os.getenv("GEMMA4_CTX_SWEEP", "512,2048,8192").split(",") if c.strip()]
+    caps = [int(c) for c in os.getenv("GEMMA4_MAXCORES_SWEEP", "16,8,4,1").split(",") if c.strip()]
+    prev = os.environ.get("GEMMA4_SDPA_MAX_CORES")
+    results = {}
+    try:
+        for ctx in ctxs:
+            rig = _build_standalone(mesh_device, "dram", context_len=ctx, max_seq_len=max(1024, ctx), tune_matmuls=True)
+            for cap in caps:
+                os.environ["GEMMA4_SDPA_MAX_CORES"] = str(cap)
+                try:
+                    full, _ = _time_fused_k_steps(mesh_device, rig, 1, reps=20, mode="full")
+                    back, _ = _time_fused_k_steps(mesh_device, rig, 1, reps=20, mode="backbone")
+                    results[(ctx, cap)] = (full, back)
+                except Exception as ex:  # noqa: BLE001
+                    logger.info(f"[maxcores] ctx={ctx} cap={cap} FAILED: {str(ex).split('backtrace')[0][:110]}")
+                    return  # a failure leaves a dangling trace capture; do not continue
+    finally:
+        if prev is None:
+            os.environ.pop("GEMMA4_SDPA_MAX_CORES", None)
+        else:
+            os.environ["GEMMA4_SDPA_MAX_CORES"] = prev
+
+    logger.info(f"[maxcores] step ms (backbone ms), and % vs cap=16 at the same context")
+    logger.info("[maxcores] " + f"{'ctx':>7}" + "".join(f"{('cap=' + str(c)):>22}" for c in caps))
+    for ctx in ctxs:
+        base = results.get((ctx, caps[0]))
+        row = ""
+        for cap in caps:
+            r = results.get((ctx, cap))
+            if r is None:
+                row += f"{'-':>22}"
+                continue
+            d = (r[0] - base[0]) / base[0] * 100 if base else 0.0
+            row += f"{f'{r[0]:.3f} ({r[1]:.3f}) {d:+5.1f}%':>22}"
+        logger.info(f"[maxcores] {ctx:>7}{row}")
+
+    logger.info("[maxcores] sliding layers are window-capped (512); only the global layer grows with ctx")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
 def test_cb_high_water(mesh_device, reset_seeds):
     """WHICH program owns the circular-buffer high-water, and how much headroom is left.
 
