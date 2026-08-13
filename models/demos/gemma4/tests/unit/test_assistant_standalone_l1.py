@@ -854,6 +854,177 @@ def _op_timed(mesh_device, fn, inner=20, replays=20, protect=()):
     mesh_shapes=[(1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
+def test_cb_high_water(mesh_device, reset_seeds):
+    """WHICH program owns the circular-buffer high-water, and how much headroom is left.
+
+    Usable L1 for pinned weights is ``allocatable_l1 - max_program_CB_high_water``
+    (`program.cpp:1767-1776` throws when an L1 buffer drops below a program's CB
+    region end). That maximum is a **max over programs**, and nobody has measured
+    which program owns it — so every capacity number so far has been an empirical
+    bisect with no attribution.
+
+    Graph capture gives it directly: `track_allocate_cb` (`graph_processor.cpp:306-334`)
+    records every CB's `address`, per-core `size`, `core_range_set` and
+    `globally_allocated` flag, parented to the enclosing op. A program's CB region
+    end on a core is `max(address + size)` over its NON-globally-allocated CBs
+    covering that core — globally-allocated ones are skipped by the region walk
+    (`program.cpp:1558-1568`) because the allocator already tracks them.
+    """
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+
+    ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+    try:
+        logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
+        ttnn.synchronize_device(mesh_device)
+        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        ttnn.synchronize_device(mesh_device)
+    finally:
+        graph = ttnn.graph.end_graph_capture()
+    for t in (idx, hn):
+        t.deallocate(True)
+    logits.deallocate(True)
+
+    # Walk the graph, attributing each CB to the op that created it.
+    per_op = {}  # op -> {"end": max(addr+size), "cbs": n, "bytes": sum, "grid": str}
+    op_stack = []
+    for v in graph:
+        nt = v.get("node_type", "")
+        if nt == "function_start":
+            op_stack.append(v.get("params", {}).get("name", "?"))
+        elif nt == "function_end":
+            if op_stack:
+                op_stack.pop()
+        elif nt == "circular_buffer_allocate":
+            pr = v.get("params", {})
+            if pr.get("globally_allocated", "0") == "1":
+                continue  # allocator-tracked; not part of the CB region
+            addr, size = int(pr.get("address", 0)), int(pr.get("size", 0))
+            op = op_stack[-1] if op_stack else "<no op>"
+            e = per_op.setdefault(op, {"end": 0, "cbs": 0, "bytes": 0, "grid": ""})
+            if addr + size > e["end"]:
+                e["end"] = addr + size
+                e["grid"] = pr.get("core_range_set", "")
+            e["cbs"] += 1
+            e["bytes"] += size
+
+    assert per_op, "graph capture produced no circular_buffer_allocate nodes"
+
+    per_core = ttnn.get_max_worker_l1_unreserved_size()
+    base = ttnn.get_allocator_base_address(mesh_device, ttnn.BufferType.L1)
+    top = base + per_core
+    ranked = sorted(per_op.items(), key=lambda kv: -kv[1]["end"])
+
+    logger.info(f"[cb-hw] L1 base=0x{base:x} per-core unreserved={per_core/1024:.1f} KB top=0x{top:x}")
+    logger.info(f"[cb-hw] {'op':<44}{'CB region end':>15}{'KB':>9}{'CBs':>6}{'sum KB':>9}  grid")
+    for op, e in ranked[:18]:
+        logger.info(
+            f"[cb-hw] {op[:44]:<44}{e['end']:>15}{e['end']/1024:>9.1f}{e['cbs']:>6}"
+            f"{e['bytes']/1024:>9.1f}  {e['grid'][:34]}"
+        )
+
+    owner, worst = ranked[0]
+    headroom = top - worst["end"]
+    logger.info(f"[cb-hw] ===== high-water owner: {owner}")
+    logger.info(f"[cb-hw] ===== CB region ends at {worst['end']/1024:.1f} KB, on {worst['grid']}")
+    logger.info(
+        f"[cb-hw] ===== headroom for pinned weights = {headroom/1024:.1f} KB/bank "
+        f"({headroom*110/(1<<20):.1f} MB across 110 banks if interleaved)"
+    )
+    logger.info("[cb-hw] ===== a WIDTH_SHARDED weight costs total_bytes/num_shard_cores against this")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_per_bank_headroom(mesh_device, reset_seeds):
+    """Bisect the REAL per-bank headroom, in the units the allocator uses.
+
+    ``test_cb_high_water`` derives it from the graph: top-of-L1 minus the largest
+    program CB region end. This checks that prediction against the hardware, and
+    replaces the old 16-MB-granularity interleaved-filler probe, whose number
+    (46 MB, i.e. ~428 KB/bank) predates the CME fix, the matmul tuner and the
+    activation chaining.
+
+    Units matter: in LOCKSTEP a sharded L1 buffer is charged
+    ``total_bytes / num_shard_cores`` against EVERY bank (`bank_manager.cpp:410-445`),
+    so a filler sharded over 8 cores with X bytes per core costs exactly X per
+    bank. Bisecting X gives the budget directly, independent of shard width.
+    """
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    cores = 8
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cores - 1, 0))})
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device) if mesh_device.get_num_devices() > 1 else None
+
+    def try_kb(per_core_kb):
+        """Allocate `per_core_kb` per bank of filler, then run a real step."""
+        w_per_core = (per_core_kb * 1024) // 64  # [1,1,32,W] bf16 -> 32*w*2 bytes/core
+        w_per_core = (w_per_core // 32) * 32
+        if w_per_core == 0:
+            return True, 0.0
+        W = w_per_core * cores
+        f = None
+        try:
+            f = ttnn.from_torch(
+                torch.zeros(1, 1, 32, W, dtype=torch.bfloat16),
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=mapper,
+                memory_config=ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(grid, [32, w_per_core], ttnn.ShardOrientation.ROW_MAJOR),
+                ),
+            )
+            ms, _ = _time_fused_k_steps(mesh_device, rig, 1, reps=3, mode="full")
+            return True, ms
+        except Exception as ex:  # noqa: BLE001
+            return False, " ".join(str(ex).split("backtrace")[0].split())[:420]
+        finally:
+            if f is not None:
+                f.deallocate(True)
+
+    # NOTE: try_kb(0) short-circuits before allocating, so run the step directly
+    # to prove the baseline is sound before attributing any failure to filler.
+    base_ms, _ = _time_fused_k_steps(mesh_device, rig, 1, reps=3, mode="full")
+    logger.info(f"[bank-hw] baseline (no filler) step OK, {base_ms:.3f} ms")
+
+    # ASCENDING scan, stopping at the first failure. A bisect is wrong here: a
+    # failure inside `_time_fused_k_steps` leaves `begin_trace_capture` without a
+    # matching end, which poisons every later attempt and makes the whole sweep
+    # look like it fails at 5 KB. Never reuse the device after a probe failure.
+    lo, hi = 0, None
+    for kb in (64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 1024, 1152, 1280):
+        if kb > int(os.getenv("GEMMA4_BANK_PROBE_MAX_KB", "1280")):
+            break
+        ok, info = try_kb(kb)
+        if ok:
+            lo = kb
+            logger.info(f"[bank-hw] {kb:5d} KB/bank OK ({info:.3f} ms)")
+        else:
+            hi = kb
+            logger.info(f"[bank-hw] {kb:5d} KB/bank CLASH\n           {info}")
+            break
+    if hi is None:
+        logger.info(f"[bank-hw] never clashed up to {lo} KB/bank — raise GEMMA4_BANK_PROBE_MAX_KB")
+
+    per_core = ttnn.get_max_worker_l1_unreserved_size()
+    logger.info(f"[bank-hw] ===== usable headroom = {lo} KB/bank  (first failure at {hi} KB)")
+    logger.info(
+        f"[bank-hw] ===== of {per_core/1024:.0f} KB/core allocatable, so CBs+slack own {per_core/1024-lo:.0f} KB"
+    )
+    logger.info(f"[bank-hw] ===== weight capacity = {lo} KB x num_shard_cores:")
+    for c in (8, 16, 32, 48, 64, 110):
+        logger.info(f"[bank-hw]        {c:3d}-core shard -> {lo*c/1024:7.1f} MB/device")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
 def test_backbone_op_costs(mesh_device, reset_seeds):
     """Size the two ops left standing after the gather fix: argmax and the CCL.
 
