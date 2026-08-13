@@ -873,6 +873,15 @@ def test_cb_high_water(mesh_device, reset_seeds):
     """
     rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
 
+    def _cores(crs):
+        out = set()
+        for part in re.findall(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]", crs or ""):
+            x1, y1, x2, y2 = (int(v) for v in part)
+            for x in range(min(x1, x2), max(x1, x2) + 1):
+                for y in range(min(y1, y2), max(y1, y2) + 1):
+                    out.add((x, y))
+        return out
+
     ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
     try:
         logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
@@ -900,11 +909,16 @@ def test_cb_high_water(mesh_device, reset_seeds):
             if pr.get("globally_allocated", "0") == "1":
                 continue  # allocator-tracked; not part of the CB region
             addr, size = int(pr.get("address", 0)), int(pr.get("size", 0))
+            # Key by (op, GRID), not op name: the same op can run with different
+            # program configs in one step and they are different programs. The
+            # drafter's SDPA is exactly this — decode.py:307-313 gives global
+            # layers (head_dim>=512) an 8x4 grid and sliding layers the FULL
+            # device grid, so keying by name alone hides one of them behind the
+            # other's max.
             op = op_stack[-1] if op_stack else "<no op>"
-            e = per_op.setdefault(op, {"end": 0, "cbs": 0, "bytes": 0, "grid": ""})
-            if addr + size > e["end"]:
-                e["end"] = addr + size
-                e["grid"] = pr.get("core_range_set", "")
+            grid = pr.get("core_range_set", "")
+            e = per_op.setdefault((op, grid), {"end": 0, "cbs": 0, "bytes": 0, "grid": grid})
+            e["end"] = max(e["end"], addr + size)
             e["cbs"] += 1
             e["bytes"] += size
 
@@ -916,11 +930,11 @@ def test_cb_high_water(mesh_device, reset_seeds):
     ranked = sorted(per_op.items(), key=lambda kv: -kv[1]["end"])
 
     logger.info(f"[cb-hw] L1 base=0x{base:x} per-core unreserved={per_core/1024:.1f} KB top=0x{top:x}")
-    logger.info(f"[cb-hw] {'op':<44}{'CB region end':>15}{'KB':>9}{'CBs':>6}{'sum KB':>9}  grid")
-    for op, e in ranked[:18]:
+    logger.info(f"[cb-hw] {'op':<40}{'region end':>13}{'KB':>9}{'CBs':>6}{'cores':>7}  grid")
+    for (op, _g), e in ranked[:20]:
+        ncores = len(_cores(e["grid"]))
         logger.info(
-            f"[cb-hw] {op[:44]:<44}{e['end']:>15}{e['end']/1024:>9.1f}{e['cbs']:>6}"
-            f"{e['bytes']/1024:>9.1f}  {e['grid'][:34]}"
+            f"[cb-hw] {op[:40]:<40}{e['end']:>13}{e['end']/1024:>9.1f}{e['cbs']:>6}" f"{ncores:>7}  {e['grid'][:30]}"
         )
 
     # PER-CORE map. The CB region end is NOT uniform: each program's CBs live on
@@ -928,14 +942,6 @@ def test_cb_high_water(mesh_device, reset_seeds):
     # programs that cover it. LOCKSTEP then collapses this to ONE global frontier
     # (bank_manager.cpp:410-445), charging every core as if it were the worst —
     # so the uniform "KB/core" budget is an ACCOUNTING artifact, not physics.
-    def _cores(crs):
-        out = set()
-        for part in re.findall(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]", crs or ""):
-            x1, y1, x2, y2 = (int(v) for v in part)
-            for x in range(min(x1, x2), max(x1, x2) + 1):
-                for y in range(min(y1, y2), max(y1, y2) + 1):
-                    out.add((x, y))
-        return out
 
     core_end = {}
     core_owner = {}
@@ -949,7 +955,7 @@ def test_cb_high_water(mesh_device, reset_seeds):
         for c in _cores(pr.get("core_range_set", "")):
             if e > core_end.get(c, 0):
                 core_end[c] = e
-    for op, info in per_op.items():
+    for (op, _g), info in per_op.items():
         for c in _cores(info["grid"]):
             if core_end.get(c, 0) == info["end"]:
                 core_owner[c] = op
@@ -974,7 +980,7 @@ def test_cb_high_water(mesh_device, reset_seeds):
             f"worst ({busiest:.0f} KB); only HYBRID + per_core_allocation can use the difference."
         )
 
-    owner, worst = ranked[0]
+    (owner, _), worst = ranked[0]
     headroom = top - worst["end"]
     logger.info(f"[cb-hw] ===== high-water owner: {owner}")
     logger.info(f"[cb-hw] ===== CB region ends at {worst['end']/1024:.1f} KB, on {worst['grid']}")
