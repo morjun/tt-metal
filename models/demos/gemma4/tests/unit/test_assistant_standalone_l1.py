@@ -916,6 +916,121 @@ def test_sdpa_max_cores_latency(mesh_device, reset_seeds):
     mesh_shapes=[(1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
+def test_per_matmul_ledger(mesh_device, reset_seeds):
+    """Per-weight-class ledger of the IN-MODEL saving from L1 WIDTH_SHARDED pinning.
+
+    Isolated microbenchmarks have now twice disagreed with in-model behaviour
+    (gather_in0's -58% became a wash), so this measures the thing directly: pin
+    exactly one weight class at a time and measure the K-chained step against the
+    same-config DRAM baseline. Every arm runs with the tuner ON, so the tuned
+    program config is not part of what is being compared.
+
+    With WIDTH_SHARDED + a matching program config, `IN1_SHARDED=1` compiles the
+    weight read out entirely — zero NoC transactions for in1 — so each row is
+    "what eliminating this weight's read is worth, in the real step".
+    """
+    k = 3
+    classes = [
+        ("wqkv", 12, 32),
+        ("o_proj", 4, 8),
+        ("gate_proj", 4, 32),
+        ("up_proj", 4, 32),
+        ("down_proj", 4, 8),
+        ("pre_projection", 1, 8),
+        ("post_projection", 1, 48),
+        ("cme_centroids", 1, 64),
+    ]
+    prev_only = os.environ.get("GEMMA4_L1_ONLY")
+    prev_tune = os.environ.get("GEMMA4_TUNE_MATMULS")
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    rows = []
+    try:
+        os.environ.pop("GEMMA4_L1_ONLY", None)
+        rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+        base, _ = _time_fused_k_steps(mesh_device, rig, k, reps=30)
+        logger.info(f"[ledger] DRAM baseline (tuner on): {base:.4f} ms/iter = {base/k*1e3:.1f} us/step")
+        for name, count, cores in classes:
+            os.environ["GEMMA4_L1_ONLY"] = name
+            try:
+                rig = _build_standalone(mesh_device, "l1_sharded", budget_mb=8, tune_matmuls=True)
+                pinned = rig["placement"].summary()["l1_bytes"] / (1 << 20)
+                ms, _ = _time_fused_k_steps(mesh_device, rig, k, reps=30)
+            except Exception as ex:  # noqa: BLE001
+                logger.info(f"[ledger] {name:<16} FAILED: {str(ex).split('backtrace')[0].strip()[:90]}")
+                return  # a failure leaves a dangling capture; do not continue
+            saved_us = (base - ms) / k * 1e3
+            rows.append((name, count, cores, pinned, ms, saved_us))
+    finally:
+        for kk, v in (("GEMMA4_L1_ONLY", prev_only), ("GEMMA4_TUNE_MATMULS", prev_tune)):
+            if v is None:
+                os.environ.pop(kk, None)
+            else:
+                os.environ[kk] = v
+
+    logger.info(
+        f"[ledger] {'weight class':<16}{'n/step':>7}{'cores':>7}{'MB':>7}{'ms/iter':>10}{'us/step saved':>15}{'per call':>10}"
+    )
+    tot = 0.0
+    for name, count, cores, pinned, ms, saved in rows:
+        tot += saved
+        logger.info(
+            f"[ledger] {name:<16}{count:>7}{cores:>7}{pinned:>7.2f}{ms:>10.4f}{saved:>15.2f}{saved/count:>10.2f}"
+        )
+    logger.info(f"[ledger] {'SUM of per-class savings':<16}{'':<21}{tot:>25.2f} us/step")
+    logger.info(f"[ledger] baseline step = {base/k*1e3:.1f} us; sum of savings = {tot/(base/k*1e3)*100:.2f}% of it")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_op_inventory(mesh_device, reset_seeds):
+    """Every device op in one drafter step, counted — the basis for attribution.
+
+    tracy cannot attribute ops replayed from a captured trace, and this build's
+    DEVICE KERNEL DURATION is corrupted for matmuls, so per-op profiling is not
+    available directly. What IS available: graph capture gives the exact op
+    sequence, and `_op_timed` gives a reliable per-call cost at a real shape.
+    Count x cost then accounts for the step, and whatever is left over is
+    dispatch and ops not individually measured.
+    """
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+    try:
+        logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
+        ttnn.synchronize_device(mesh_device)
+        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        ttnn.synchronize_device(mesh_device)
+    finally:
+        graph = ttnn.graph.end_graph_capture()
+    for t in (idx, hn):
+        t.deallocate(True)
+    logits.deallocate(True)
+
+    counts = {}
+    for v in graph:
+        if v.get("node_type") != "function_start":
+            continue
+        nm = v.get("params", {}).get("name", "?")
+        if "DeviceOperation" in nm or nm.startswith("ttnn::"):
+            counts[nm] = counts.get(nm, 0) + 1
+
+    total = sum(counts.values())
+    logger.info(f"[inventory] {total} device-op invocations in one drafter step (incl. the CME head)")
+    logger.info(f"[inventory] {'op':<52}{'count':>7}")
+    for nm, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+        if c >= 2 or "Sdpa" in nm or "Matmul" in nm:
+            logger.info(f"[inventory] {nm[:52]:<52}{c:>7}")
+    singles = sum(1 for c in counts.values() if c == 1)
+    logger.info(f"[inventory] (+{singles} op types invoked once each)")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
 def test_cb_high_water(mesh_device, reset_seeds):
     """WHICH program owns the circular-buffer high-water, and how much headroom is left.
 
