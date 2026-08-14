@@ -911,6 +911,104 @@ def test_sdpa_max_cores_latency(mesh_device, reset_seeds):
     logger.info("[maxcores] sliding layers are window-capped (512); only the global layer grows with ctx")
 
 
+def _weight_slots(assistant):
+    """(owner, attr, label) for every pinnable matmul weight, for in-place swapping."""
+    out = []
+    for i, layer in enumerate(assistant.layers):
+        w = layer.self_attn.weights
+        for a in ("wqkv", "o_proj"):
+            if getattr(w, a, None) is not None:
+                out.append((w, a, f"L{i}.{a}"))
+        m = layer.shared_mlp
+        for a in ("gate_proj", "up_proj", "down_proj"):
+            if getattr(m, a, None) is not None:
+                out.append((m, a, f"L{i}.{a}"))
+    for a in ("pre_projection", "post_projection"):
+        if getattr(assistant, a, None) is not None:
+            out.append((assistant, a, a))
+    me = getattr(assistant, "masked_embedding", None)
+    if me is not None and getattr(me, "centroids", None) is not None:
+        out.append((me, "centroids", "cme_centroids"))
+    return out
+
+
+def _relocate(slots, mesh_device, to_l1, only=None):
+    """Move the selected weights in place. Returns how many actually moved.
+
+    `object.__setattr__` because AttentionWeights is a frozen dataclass. Moving a
+    weight is just a `to_memory_config`; the point of doing it in place is that
+    the MODEL IS NOT REBUILT, so rebuild-to-rebuild variance — which swamped the
+    per-class ledger — cannot enter the comparison.
+    """
+    from models.demos.gemma4.tt.weight_placement import shard_l1_width
+
+    n = 0
+    for owner, attr, label in slots:
+        if only is not None and not any(o in label for o in only):
+            continue
+        t = getattr(owner, attr)
+        new = shard_l1_width(t, mesh_device) if to_l1 else ttnn.to_memory_config(t, ttnn.DRAM_MEMORY_CONFIG)
+        if new is None:
+            continue
+        object.__setattr__(owner, attr, new)
+        t.deallocate(True)
+        n += 1
+    return n
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_same_build_placement_ab(mesh_device, reset_seeds):
+    """DRAM vs L1 WIDTH_SHARDED with the model built EXACTLY ONCE.
+
+    Every previous placement A/B compared separately-constructed models, and the
+    per-class ledger showed that rebuild variance exceeds the signal (the same
+    shape came out +0.57 and -4.03 us/call in different arms). Here the weights
+    are relocated in place between timings, so the only thing that changes is
+    where the bytes live.
+
+    Runs DRAM -> L1 -> DRAM. The second DRAM arm is a drift control: if it does
+    not return to the first, the measurement is not trustworthy and the L1 number
+    means nothing.
+    """
+    k = 3
+    reps = int(os.getenv("GEMMA4_AB_REPS", "50"))
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    slots = _weight_slots(rig["assistant"])
+    logger.info(f"[same-build] {len(slots)} pinnable weight tensors found")
+
+    # Pinning ALL 23 exceeds the per-core budget (608+ KB against ~320 at the
+    # default SDPA cap) and clashes. Default to the high-efficiency set — the
+    # 32/64-core shards, ~224 KB/core — which covers 8.25 of 13 MB.
+    only = tuple(
+        o for o in os.getenv("GEMMA4_AB_ONLY", "wqkv,gate_proj,up_proj,post_projection,cme_centroids").split(",") if o
+    )
+
+    a1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+    moved = _relocate(slots, mesh_device, to_l1=True, only=only)
+    l1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+    _relocate(slots, mesh_device, to_l1=False, only=only)
+    a2, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+
+    base = (a1 + a2) / 2
+    drift = abs(a2 - a1) / a1 * 100
+    logger.info(f"[same-build] DRAM  #1        {a1:.4f} ms/iter")
+    logger.info(f"[same-build] L1 sharded      {l1:.4f} ms/iter   ({moved} weights moved)")
+    logger.info(f"[same-build] DRAM  #2        {a2:.4f} ms/iter")
+    logger.info(f"[same-build] drift between the two DRAM arms: {drift:.2f}%  <- the noise floor")
+    logger.info(
+        f"[same-build] ===== L1 vs mean(DRAM): {(base - l1)/base*100:+.2f}%  " f"({(base - l1)/k*1e3:+.1f} us/step)"
+    )
+    if drift > abs(base - l1) / base * 100:
+        logger.info("[same-build] ===== VERDICT: effect is SMALLER than the drift — not resolved")
+    else:
+        logger.info("[same-build] ===== VERDICT: effect exceeds the drift — resolved")
+
+
 @_needs_assistant
 @parametrize_mesh_with_fabric(
     mesh_shapes=[(1, 2)],
