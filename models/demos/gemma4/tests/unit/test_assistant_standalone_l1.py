@@ -1015,21 +1015,26 @@ def test_same_build_placement_ab(mesh_device, reset_seeds):
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
 def test_per_matmul_ledger(mesh_device, reset_seeds):
-    """Per-weight-class ledger of the IN-MODEL saving from L1 WIDTH_SHARDED pinning.
+    """Per-weight-class ledger, SAME BUILD — what each class's read is worth.
 
-    Isolated microbenchmarks have now twice disagreed with in-model behaviour
-    (gather_in0's -58% became a wash), so this measures the thing directly: pin
-    exactly one weight class at a time and measure the K-chained step against the
-    same-config DRAM baseline. Every arm runs with the tuner ON, so the tuned
-    program config is not part of what is being compared.
+    The first version of this test rebuilt the model per class and was pure
+    noise: the same shape came out +0.57 and -4.03 us/call in different arms.
+    Here the model is built once and each class is relocated in place, which
+    drops the noise floor to ~0.01% (`test_same_build_placement_ab`).
 
-    With WIDTH_SHARDED + a matching program config, `IN1_SHARDED=1` compiles the
-    weight read out entirely — zero NoC transactions for in1 — so each row is
-    "what eliminating this weight's read is worth, in the real step".
+    Each class runs DRAM -> L1 -> DRAM, and its baseline is the MEAN of its own
+    two DRAM arms, so any slow drift across the sweep cancels per row. The
+    `drift` column is that row's own control: a saving smaller than it is not
+    resolved.
     """
     k = 3
+    reps = int(os.getenv("GEMMA4_AB_REPS", "50"))
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    slots = _weight_slots(rig["assistant"])
+
     classes = [
-        ("wqkv", 12, 32),
+        ("wqkv", 4, 32),
         ("o_proj", 4, 8),
         ("gate_proj", 4, 32),
         ("up_proj", 4, 32),
@@ -1038,44 +1043,32 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
         ("post_projection", 1, 48),
         ("cme_centroids", 1, 64),
     ]
-    prev_only = os.environ.get("GEMMA4_L1_ONLY")
-    prev_tune = os.environ.get("GEMMA4_TUNE_MATMULS")
-    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
-    rows = []
-    try:
-        os.environ.pop("GEMMA4_L1_ONLY", None)
-        rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
-        base, _ = _time_fused_k_steps(mesh_device, rig, k, reps=30)
-        logger.info(f"[ledger] DRAM baseline (tuner on): {base:.4f} ms/iter = {base/k*1e3:.1f} us/step")
-        for name, count, cores in classes:
-            os.environ["GEMMA4_L1_ONLY"] = name
-            try:
-                rig = _build_standalone(mesh_device, "l1_sharded", budget_mb=8, tune_matmuls=True)
-                pinned = rig["placement"].summary()["l1_bytes"] / (1 << 20)
-                ms, _ = _time_fused_k_steps(mesh_device, rig, k, reps=30)
-            except Exception as ex:  # noqa: BLE001
-                logger.info(f"[ledger] {name:<16} FAILED: {str(ex).split('backtrace')[0].strip()[:90]}")
-                return  # a failure leaves a dangling capture; do not continue
-            saved_us = (base - ms) / k * 1e3
-            rows.append((name, count, cores, pinned, ms, saved_us))
-    finally:
-        for kk, v in (("GEMMA4_L1_ONLY", prev_only), ("GEMMA4_TUNE_MATMULS", prev_tune)):
-            if v is None:
-                os.environ.pop(kk, None)
-            else:
-                os.environ[kk] = v
-
     logger.info(
-        f"[ledger] {'weight class':<16}{'n/step':>7}{'cores':>7}{'MB':>7}{'ms/iter':>10}{'us/step saved':>15}{'per call':>10}"
+        f"[ledger2] {'class':<16}{'tensors':>8}{'cores':>7}{'DRAM ms':>10}{'L1 ms':>9}{'us/step':>9}{'%':>8}{'drift%':>8}"
     )
-    tot = 0.0
-    for name, count, cores, pinned, ms, saved in rows:
-        tot += saved
+    rows = []
+    for name, _n, cores in classes:
+        d1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+        moved = _relocate(slots, mesh_device, to_l1=True, only=(name,))
+        if moved == 0:
+            logger.info(f"[ledger2] {name:<16}  (no tensors matched)")
+            continue
+        l1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+        _relocate(slots, mesh_device, to_l1=False, only=(name,))
+        d2, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+        base = (d1 + d2) / 2
+        drift = abs(d2 - d1) / base * 100
+        pct = (base - l1) / base * 100
+        rows.append((name, moved, cores, base, l1, (base - l1) / k * 1e3, pct, drift))
         logger.info(
-            f"[ledger] {name:<16}{count:>7}{cores:>7}{pinned:>7.2f}{ms:>10.4f}{saved:>15.2f}{saved/count:>10.2f}"
+            f"[ledger2] {name:<16}{moved:>8}{cores:>7}{base:>10.4f}{l1:>9.4f}"
+            f"{(base-l1)/k*1e3:>9.2f}{pct:>8.2f}{drift:>8.3f}"
         )
-    logger.info(f"[ledger] {'SUM of per-class savings':<16}{'':<21}{tot:>25.2f} us/step")
-    logger.info(f"[ledger] baseline step = {base/k*1e3:.1f} us; sum of savings = {tot/(base/k*1e3)*100:.2f}% of it")
+
+    resolved = [r for r in rows if r[6] > r[7]]
+    logger.info(f"[ledger2] --- {len(resolved)} of {len(rows)} rows exceed their own drift ---")
+    logger.info(f"[ledger2] sum of RESOLVED savings: {sum(r[5] for r in resolved):.2f} us/step")
+    logger.info(f"[ledger2] sum of ALL rows:         {sum(r[5] for r in rows):.2f} us/step")
 
 
 @_needs_assistant
