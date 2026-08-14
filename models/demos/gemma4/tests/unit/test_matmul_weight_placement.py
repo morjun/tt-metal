@@ -259,6 +259,42 @@ def test_sharded_l1_weight(mesh_device, reset_seeds):
                 f"[shard]    e L1 shard/gather      {us_e if us_e is None else f'{us_e:8.2f} us'}  pcc={pcc_e}  {_rel(us_e)}"
             )
 
+            # e+: SAME as e, but the in0 reshard is INSIDE the timed region.
+            # Arm e builds the sharded activation outside the timing, which a real
+            # model cannot do: o_proj's in0 (K=512), down_proj's (K=1024) and
+            # pre_projection's (K=3072) all arrive interleaved and would have to be
+            # resharded per call. This is the arm that decides whether gather_in0
+            # can net positive in-model.
+            def build_ep():
+                x_il = ttnn.from_torch(
+                    x_t,
+                    device=mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                w = _sharded(mesh_device, w_t, ttnn.BufferType.L1, grid, [K, N // cores])
+                in0_mc = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(grid, [M, K // cores], ttnn.ShardOrientation.ROW_MAJOR),
+                )
+
+                def run():
+                    xs = ttnn.to_memory_config(x_il, in0_mc)  # the reshard the model would pay
+                    out = ttnn.linear(
+                        xs, w, program_config=pc1d(Kt_per_core, mcast=False, gather=True), memory_config=out_mc
+                    )
+                    xs.deallocate(True)
+                    return out
+
+                return [x_il, w], run
+
+            us_ep, pcc_ep = _try(mesh_device, build_ep, gold)
+            logger.info(
+                f"[shard]    e+ gather WITH reshard  {us_ep if us_ep is None else f'{us_ep:8.2f} us'}  pcc={pcc_ep}  {_rel(us_ep)}"
+            )
+
             # f: DRAM WIDTH_SHARDED weight
             def build_f():
                 dc = mesh_device.dram_grid_size().x

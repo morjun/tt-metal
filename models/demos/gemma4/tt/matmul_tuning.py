@@ -102,6 +102,87 @@ def derive_decode_1d_config(m, k, n, max_x=8, max_y=8, in0_shard_tiles=None):
     )
 
 
+def _pick_grid_2(n_tiles, k_tiles, max_x=8, max_y=8):
+    """Largest rectangle whose core count divides BOTH Nt and Kt.
+
+    `gather_in0` shards the ACTIVATION over K and the weight over N on the same
+    grid, so the core count must divide both. This is what confines the mechanism
+    to the N=256 shapes.
+    """
+    best = (1, 1)
+    for gy in range(1, max_y + 1):
+        for gx in range(1, max_x + 1):
+            c = gx * gy
+            if n_tiles % c == 0 and k_tiles % c == 0 and c > best[0] * best[1]:
+                best = (gx, gy)
+    return best
+
+
+def derive_decode_1d_gather_config(m, k, n, max_x=8, max_y=8):
+    """`gather_in0` ring config, or None when it would cost parallelism.
+
+    Returns None unless the grid that divides both Nt and Kt is the SAME grid the
+    mcast config would have used. That single guard is what keeps this off the
+    wide-N shapes: at K=256 the ring is capped at Kt=8 cores, so wqkv/gate/up
+    (32 cores) and post_projection (48) would lose 4-6x parallelism. Only the
+    N=256 shapes — o_proj, down_proj, pre_projection — survive it.
+
+    MEASURED per matmul against the tuned mcast baseline, WITH the in0 reshard
+    inside the timed region (`test_matmul_weight_placement.py` arm e+):
+        pre_projection 3072x256   15.54 -> 6.48 us   -58.3%
+        down_proj      1024x256    6.32 -> 4.30      -32.0%
+        o_proj          512x256    4.33 -> 4.18       -3.4%
+    """
+    T = ttnn.TILE_SIZE
+    if k % T or n % T:
+        return None
+    mt, kt, nt = -(-m // T), k // T, n // T
+    if mt != 1:
+        return None
+    gx, gy = _pick_grid_2(nt, kt, max_x, max_y)
+    cores = gx * gy
+    if cores < 2:
+        return None
+    if (gx, gy) != _pick_grid(nt, max_x, max_y):  # would lose N-parallelism
+        return None
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+        in0_block_w=kt // cores,  # the factory overwrites this with the shard width
+        out_subblock_h=1,
+        out_subblock_w=1,
+        per_core_M=mt,
+        per_core_N=nt // cores,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=False,
+        gather_in0=True,
+    )
+
+
+def gather_shard_specs(k, n, max_x=8, max_y=8):
+    """(in0 spec, in1 spec, out spec) for the gather config, or None.
+
+    All three must live on the SAME grid: the validator requires
+    `in0.shard_spec().grid == in1.shard_spec().grid` when in1 is in L1
+    (`matmul_device_operation.cpp:1741-1749`), and the output must be sharded.
+    """
+    T = ttnn.TILE_SIZE
+    if derive_decode_1d_gather_config(1, k, n, max_x, max_y) is None:
+        return None
+    gx, gy = _pick_grid_2(n // T, k // T, max_x, max_y)
+    cores = gx * gy
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+
+    def _mc(shape):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(grid, shape, ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+    return _mc([T, k // cores]), _mc([k, n // cores]), _mc([T, n // cores])
+
+
 class DecodeMatmulTuner:
     """Derives and caches decode matmul configs; a no-op passthrough when disabled.
 
@@ -178,8 +259,62 @@ class DecodeMatmulTuner:
         vals = list(self._cache.values())
         return sum(v is not None for v in vals), len(vals)
 
+    @staticmethod
+    def _l1_width_sharded(t):
+        try:
+            mc = t.memory_config()
+            return (
+                t.is_sharded()
+                and mc.buffer_type == ttnn.BufferType.L1
+                and mc.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _gather_plan(self, x, w):
+        """(config, in0_spec, out_spec) when this call can use the ring, else None.
+
+        Gathering is opted into implicitly: it fires only when the WEIGHT is
+        already L1 WIDTH_SHARDED, which `WeightPlacement` decides. So the
+        allow-list is `GEMMA4_L1_ONLY`, and no separate knob is needed.
+        """
+        if not self.enabled or not os.getenv("GEMMA4_GATHER_IN0"):
+            return None
+        if not self._l1_width_sharded(w):
+            return None
+        k, n = int(x.shape[-1]), int(w.shape[-1])
+        pc = derive_decode_1d_gather_config(1, k, n, self._max_x, self._max_y)
+        if pc is None:
+            return None
+        specs = gather_shard_specs(k, n, self._max_x, self._max_y)
+        if specs is None:
+            return None
+        in0_spec, in1_spec, out_spec = specs
+        # The weight must sit on exactly the grid the ring expects.
+        if list(w.memory_config().shard_spec.shape) != list(in1_spec.shard_spec.shape):
+            return None
+        return pc, in0_spec, out_spec
+
     def linear(self, x, w, **kwargs):
-        """``ttnn.linear`` with a tuned program config when one applies."""
+        """``ttnn.linear`` with a tuned program config when one applies.
+
+        When the weight is L1 width-sharded on the ring grid and the shape is
+        grid-neutral, this takes the `gather_in0` path instead: reshard the
+        activation over K, run the ring, and hand back an interleaved output so
+        call sites are unchanged. MEASURED with both reshards included, this is
+        -58.3% on pre_projection and -32.0% on down_proj (arm e+).
+        """
+        plan = self._gather_plan(x, w) if kwargs.get("program_config") is None else None
+        if plan is not None:
+            pc, in0_spec, out_spec = plan
+            want_mc = kwargs.pop("memory_config", None) or ttnn.DRAM_MEMORY_CONFIG
+            xs = x if x.memory_config() == in0_spec else ttnn.to_memory_config(x, in0_spec)
+            out = ttnn.linear(xs, w, program_config=pc, memory_config=out_spec, **kwargs)
+            if xs is not x:
+                xs.deallocate(True)
+            back = ttnn.sharded_to_interleaved(out, want_mc)
+            out.deallocate(True)
+            return back
         if kwargs.get("program_config") is None:
             pc = self.config_for(x, w)
             if pc is not None:
