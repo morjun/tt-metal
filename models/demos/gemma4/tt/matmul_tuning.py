@@ -202,19 +202,36 @@ class DecodeMatmulTuner:
     lazy-cache pattern as ``RMSNorm._build_sharded_cfg``.
     """
 
+    #: Scopes tuned when GEMMA4_TUNE_MATMULS is unset. `target` only, on measurement:
+    #: end to end it is +7.62% (48.38 -> 52.07 tok/s/u on the spec-decode path,
+    #: 3 runs/arm against a 0.11% noise floor), because the 35-layer target is ~92%
+    #: of a speculative-decoding iteration. The drafter is the other 7.6%, where the
+    #: same change is worth ~0 and costs acceptance (it reblocks the K accumulation,
+    #: so proposed draft tokens change), so it stays opt-in.
+    DEFAULT_SCOPES = frozenset({"target"})
+
     @classmethod
     def from_env(cls, mesh_device=None, scope="draft"):
         """Build from ``GEMMA4_TUNE_MATMULS``.
 
-        ``1``/``true``/``all`` enables everywhere; ``0``/unset disables. A comma
-        list selects scopes — ``draft``, ``target``, or ``draft,target`` — so the
-        drafter and the 35-layer target can be A/B'd independently.
+        ``1``/``true``/``all`` enables everywhere; ``0``/``off`` disables everywhere;
+        a comma list selects scopes (``draft``, ``target``, ``draft,target``) so the
+        two can be A/B'd independently. **Unset now means `DEFAULT_SCOPES`, i.e. the
+        target only** — it used to mean "off everywhere".
+
+        Caveat, and it is a product decision rather than a perf one: the tuned config
+        is not bit-neutral. It reblocks the K accumulation (per-op 0.99988 vs 0.99997
+        PCC against fp32 — both correct), and on the target that changes the
+        generated text from about the third character. `GEMMA4_TUNE_MATMULS=0`
+        restores the previous numerics exactly.
         """
         raw = (os.getenv("GEMMA4_TUNE_MATMULS") or "").strip().lower()
         if raw in ("1", "true", "yes", "on", "all"):
             enabled = True
-        elif raw in ("", "0", "false", "no", "off"):
+        elif raw in ("0", "false", "no", "off"):
             enabled = False
+        elif raw == "":
+            enabled = scope in cls.DEFAULT_SCOPES
         else:
             enabled = scope in {s.strip() for s in raw.split(",")}
         return cls(mesh_device, enabled=enabled, label=scope)
