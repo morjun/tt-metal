@@ -932,6 +932,105 @@ def _weight_slots(assistant):
     return out
 
 
+def _env_on(name):
+    """``1|true|yes|on`` -> True. A bare truth test makes ``NAME=0`` mean ENABLED."""
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _purge_gather_in0(tag):
+    """Remove GEMMA4_GATHER_IN0 from the environment, loudly.
+
+    When the weight is L1 WIDTH_SHARDED and this variable is set,
+    ``DecodeMatmulTuner.linear`` takes the ring path instead: it reshards in0 and
+    then runs ``sharded_to_interleaved`` on the output (matmul_tuning.py:305-317),
+    i.e. TWO extra device ops at the ~5.7 us per-op floor. It applies to exactly
+    o_proj, down_proj and pre_projection. Crucially it fires in the L1 arm ONLY,
+    so leaving it set converts those three rows from DRAM-vs-L1 into
+    gather-vs-mcast. No test in this file used to clear it, and until it was fixed
+    the gate was a bare ``os.getenv`` truth test, so even ``=0`` enabled it.
+    """
+    if _env_on("GEMMA4_KEEP_GATHER_IN0"):
+        # Deliberate opt-out, for the one experiment that WANTS the ring path on:
+        # attributing how much of a published ledger row was gather-vs-mcast
+        # rather than DRAM-vs-L1. Never leave this set for a placement A/B.
+        keep = os.getenv("GEMMA4_GATHER_IN0")
+        logger.info(f"[{tag}] GEMMA4_KEEP_GATHER_IN0 set - NOT purging GEMMA4_GATHER_IN0={keep!r}")
+        return keep
+    was = os.environ.pop("GEMMA4_GATHER_IN0", None)
+    if was is not None:
+        logger.info(f"[{tag}] purged GEMMA4_GATHER_IN0={was!r} - it perturbs the L1 arm only")
+    return was
+
+
+def _l1_bank_state(mesh_device):
+    """The allocator scalars that ttnn's AUTOMATIC program configs are a function of.
+
+    ``get_max_l1_space`` (matmul_utilities.cpp:79) is
+    ``lowest_occupied_compute_l1_address() - base``, and it feeds every automatic
+    matmul config (matmul_program_config.cpp:54,84,214) and the all_gather CB page
+    multiplier (all_gather_unicast_factory.cpp:330). That function has no Python
+    binding (tt_metal/impl/device/device.cpp:871), but ``get_memory_view``'s block
+    table does, and under LOCKSTEP a sharded L1 buffer is charged
+    ``total_bytes / num_shard_cores`` against EVERY bank (bank_manager.cpp:410-450)
+    - so ``total_bytes_allocated_per_bank`` is the unambiguous per-arm scalar.
+
+    Call this AFTER relocation and BEFORE timing: transients from the previous
+    timing are already freed, so what is left is the weights plus the rig.
+    """
+    mv = ttnn.get_memory_view(mesh_device, ttnn.BufferType.L1)
+    live = [b for b in mv.block_table if b.get("allocated") == "yes"]
+    addrs = [int(b["address"]) for b in live]
+    return {
+        "alloc_per_bank": int(mv.total_bytes_allocated_per_bank),
+        "free_per_bank": int(mv.total_bytes_free_per_bank),
+        "largest_free": int(mv.largest_contiguous_bytes_free_per_bank),
+        "blocks": len(live),
+        "lowest": min(addrs) if addrs else None,
+        "base": int(ttnn.get_allocator_base_address(mesh_device, ttnn.BufferType.L1)),
+    }
+
+
+def _fmt_bank_state(tag, st):
+    lo = f"0x{st['lowest']:x}" if st["lowest"] is not None else "none"
+    return (
+        f"[l1state] {tag:<20} alloc/bank={st['alloc_per_bank']:>8} free/bank={st['free_per_bank']:>8}"
+        f" largest_free={st['largest_free']:>8} lowest={lo} blocks={st['blocks']}"
+    )
+
+
+def _predicted_charge(slots, mesh_device, only=None):
+    """Per-core LOCKSTEP charge the selected weights will cost, derived from K alone.
+
+    ``shard_l1_width`` always takes its grid from ``derive_decode_1d_config``
+    (weight_placement.py:319-323), and per_core_N == 1 for EVERY drafter shape, so
+    ``shard_w = n / cores`` is always one tile column and the charge is
+
+        bytes per core = K * 32 * element_size
+
+    - independent of N and of the core count. That is why this function exists:
+    wqkv and up_proj are both K=256 with 4 tensors each, so they charge exactly
+    the same bytes per core and must leave the allocator in an identical state.
+    Any timing difference between those two rows therefore CANNOT be a function of
+    the L1 watermark, and no per-site arithmetic is needed to know that.
+
+    Returns (total_bytes_per_core, [(label, K, bytes_per_core), ...]).
+    """
+    multi = mesh_device.get_num_devices() > 1
+    total, per = 0, []
+    for owner, attr, label in slots:
+        if only is not None and not any(o in label for o in only):
+            continue
+        t = getattr(owner, attr)
+        if t is None or len(t.shape) < 2:
+            continue
+        local = ttnn.get_device_tensors(t)[0].shape if multi else t.shape
+        k = int(local[-2])
+        c = k * ttnn.TILE_SIZE * t.element_size()
+        per.append((label, k, c))
+        total += c
+    return total, per
+
+
 def _relocate(slots, mesh_device, to_l1, only=None):
     """Move the selected weights in place. Returns how many actually moved.
 
@@ -977,6 +1076,7 @@ def test_same_build_placement_ab(mesh_device, reset_seeds):
     k = 3
     reps = int(os.getenv("GEMMA4_AB_REPS", "50"))
     os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    _purge_gather_in0("same-build")
     rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
     slots = _weight_slots(rig["assistant"])
     logger.info(f"[same-build] {len(slots)} pinnable weight tensors found")
@@ -988,8 +1088,19 @@ def test_same_build_placement_ab(mesh_device, reset_seeds):
         o for o in os.getenv("GEMMA4_AB_ONLY", "wqkv,gate_proj,up_proj,post_projection,cme_centroids").split(",") if o
     )
 
+    pred, per = _predicted_charge(slots, mesh_device, only=only)
+    logger.info(f"[same-build] predicted per-core charge for this set: {pred} B ({pred/1024:.1f} KB/core)")
+
+    st_dram = _l1_bank_state(mesh_device)
+    logger.info(_fmt_bank_state("DRAM", st_dram))
     a1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
     moved = _relocate(slots, mesh_device, to_l1=True, only=only)
+    st_l1 = _l1_bank_state(mesh_device)
+    logger.info(_fmt_bank_state("L1 sharded", st_l1))
+    logger.info(
+        f"[same-build] measured dAlloc/bank = {st_l1['alloc_per_bank'] - st_dram['alloc_per_bank']} B"
+        f"  (predicted {pred} B)"
+    )
     l1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
     _relocate(slots, mesh_device, to_l1=False, only=only)
     a2, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
@@ -1015,21 +1126,39 @@ def test_same_build_placement_ab(mesh_device, reset_seeds):
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
 def test_per_matmul_ledger(mesh_device, reset_seeds):
-    """Per-weight-class ledger, SAME BUILD — what each class's read is worth.
+    """Per-weight-class ledger, SAME BUILD, with the allocator state and an L1 replicate.
 
-    The first version of this test rebuilt the model per class and was pure
-    noise: the same shape came out +0.57 and -4.03 us/call in different arms.
-    Here the model is built once and each class is relocated in place, which
-    drops the noise floor to ~0.01% (`test_same_build_placement_ab`).
+    The first version of this test rebuilt the model per class and was pure noise
+    (the same shape came out +0.57 and -4.03 us/call in different arms). Here the
+    model is built once and each class is relocated in place.
 
-    Each class runs DRAM -> L1 -> DRAM, and its baseline is the MEAN of its own
-    two DRAM arms, so any slow drift across the sweep cancels per row. The
-    `drift` column is that row's own control: a saving smaller than it is not
-    resolved.
+    Each class runs DRAM -> L1 -> DRAM and is baselined on the MEAN of its own two
+    DRAM arms, so slow drift cancels per row. **But read the `drift` column for
+    what it is: DRAM-to-DRAM stability, i.e. the reproducibility of the SAME
+    allocator and trace state.** It says nothing about an arm whose allocator state
+    and program cache differ, and nothing in this file used to measure that. Two
+    additions close the gap:
+
+    * `alloc/bank` per arm. Under LOCKSTEP the per-core charge is
+      `K * 32 * elem` (see `_predicted_charge`), independent of N and core count -
+      so `wqkv` and `up_proj` (both K=256 x 4 tensors) charge the SAME bytes and
+      leave an IDENTICAL allocator state. If they still differ in time, the cause
+      cannot be anything downstream of the L1 watermark.
+    * an **L1-vs-L1 replicate** (`GEMMA4_LEDGER_REPLICATE`, default `up_proj`),
+      bracketing a DRAM arm exactly as the rows do. Its spread is the floor every
+      row above has to beat. `gate_proj` and `up_proj` are an accidental replicate -
+      identical K, N, grid, tensor count, per-core charge and program config,
+      adjacent call sites - and they came out 3.83 us/step apart against a 0.95 us
+      drift, which is why this is measured rather than assumed.
+
+    `GEMMA4_LEDGER_REVERSE=1` reverses the sweep. The ledger does 24+
+    capture/release cycles in one process at a FIXED order, so any capture-index
+    effect is aliased onto class identity; the two orders disambiguate that.
     """
     k = 3
     reps = int(os.getenv("GEMMA4_AB_REPS", "50"))
     os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    _purge_gather_in0("ledger2")
     rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
     slots = _weight_slots(rig["assistant"])
 
@@ -1043,8 +1172,21 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
         ("post_projection", 1, 48),
         ("cme_centroids", 1, 64),
     ]
+    if _env_on("GEMMA4_LEDGER_REVERSE"):
+        classes = list(reversed(classes))
+        logger.info("[ledger2] sweep order REVERSED (GEMMA4_LEDGER_REVERSE)")
+
+    dram_state = _l1_bank_state(mesh_device)
+    logger.info(_fmt_bank_state("all-DRAM baseline", dram_state))
+    logger.info(f"[ledger2] {'class':<16}{'K':>6}{'pred B/core':>13}  (charge = K x 32 x elem, N-independent)")
+    for name, _n, _c in classes:
+        tot, per = _predicted_charge(slots, mesh_device, only=(name,))
+        ks = sorted({kk for _l, kk, _b in per})
+        logger.info(f"[ledger2] {name:<16}{str(ks)[:6]:>6}{tot:>13}")
+
     logger.info(
-        f"[ledger2] {'class':<16}{'tensors':>8}{'cores':>7}{'DRAM ms':>10}{'L1 ms':>9}{'us/step':>9}{'%':>8}{'drift%':>8}"
+        f"[ledger2] {'class':<16}{'tensors':>8}{'cores':>7}{'DRAM ms':>10}{'L1 ms':>9}"
+        f"{'us/step':>9}{'%':>8}{'drift%':>8}{'dAlloc/bank':>13}"
     )
     rows = []
     for name, _n, cores in classes:
@@ -1053,22 +1195,192 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
         if moved == 0:
             logger.info(f"[ledger2] {name:<16}  (no tensors matched)")
             continue
+        st = _l1_bank_state(mesh_device)
         l1, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
         _relocate(slots, mesh_device, to_l1=False, only=(name,))
         d2, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
         base = (d1 + d2) / 2
         drift = abs(d2 - d1) / base * 100
         pct = (base - l1) / base * 100
-        rows.append((name, moved, cores, base, l1, (base - l1) / k * 1e3, pct, drift))
+        dalloc = st["alloc_per_bank"] - dram_state["alloc_per_bank"]
+        rows.append((name, moved, cores, base, l1, (base - l1) / k * 1e3, pct, drift, dalloc))
         logger.info(
             f"[ledger2] {name:<16}{moved:>8}{cores:>7}{base:>10.4f}{l1:>9.4f}"
-            f"{(base-l1)/k*1e3:>9.2f}{pct:>8.2f}{drift:>8.3f}"
+            f"{(base-l1)/k*1e3:>9.2f}{pct:>8.2f}{drift:>8.3f}{dalloc:>13}"
         )
+        logger.info(_fmt_bank_state(f"L1 {name}", st))
+
+    # ---- the L1-vs-L1 replicate: the floor the rows above must beat ----------
+    rep = os.getenv("GEMMA4_LEDGER_REPLICATE", "up_proj").strip()
+    rep_us = None
+    if rep:
+        sel = (rep,)
+        moved = _relocate(slots, mesh_device, to_l1=True, only=sel)
+        if moved == 0:
+            logger.info(f"[ledger2] replicate: no tensors matched {rep!r}")
+        else:
+            l1a, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+            _relocate(slots, mesh_device, to_l1=False, only=sel)
+            dmid, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+            _relocate(slots, mesh_device, to_l1=True, only=sel)
+            l1b, _ = _time_fused_k_steps(mesh_device, rig, k, reps=reps)
+            _relocate(slots, mesh_device, to_l1=False, only=sel)
+            rep_us = abs(l1b - l1a) / k * 1e3
+            logger.info(f"[ledger2] replicate {rep}: L1 #1 {l1a:.4f} | DRAM {dmid:.4f} | L1 #2 {l1b:.4f} ms/iter")
+            logger.info(
+                f"[ledger2] ===== L1-vs-L1 spread: {abs(l1b-l1a)/((l1a+l1b)/2)*100:.3f}% "
+                f"({rep_us:.2f} us/step)  <- the REAL floor"
+            )
 
     resolved = [r for r in rows if r[6] > r[7]]
-    logger.info(f"[ledger2] --- {len(resolved)} of {len(rows)} rows exceed their own drift ---")
+    logger.info(f"[ledger2] --- {len(resolved)} of {len(rows)} rows exceed their own DRAM drift ---")
     logger.info(f"[ledger2] sum of RESOLVED savings: {sum(r[5] for r in resolved):.2f} us/step")
     logger.info(f"[ledger2] sum of ALL rows:         {sum(r[5] for r in rows):.2f} us/step")
+    if rep_us is not None:
+        survive = [r for r in rows if abs(r[5]) > rep_us]
+        logger.info(
+            f"[ledger2] === against the L1 replicate floor ({rep_us:.2f} us/step): "
+            f"{len(survive)} of {len(rows)} rows survive: {[r[0] for r in survive]}"
+        )
+
+    # The falsification, asserted so it cannot silently stop holding: classes with
+    # equal per-core charge MUST leave an identical allocator state.
+    by_alloc = {}
+    for name, _m, _c, _b, _l, _u, _p, _d, dalloc in rows:
+        by_alloc.setdefault(dalloc, []).append(name)
+    for dalloc, names in sorted(by_alloc.items()):
+        if len(names) > 1:
+            logger.info(f"[ledger2] identical dAlloc/bank={dalloc}: {names} — same watermark, by construction")
+
+
+def _div_up(a, b):
+    return -(-a // b)
+
+
+def _rowmajor_cores(n, gx):
+    """The core set the matmul factory builds: n cores, row-major, from a gx-wide rect.
+
+    `matmul_multicore_reuse_mcast_1d_program_factory.cpp:227-251` anchors
+    `matmul_core_rect` at `start_core` with the config's
+    `compute_with_storage_grid_size`, then fills `num_cores_with_work` cores
+    row-major out of it. So the rect WIDTH decides the shape of the set, and a
+    device-wide (11-column) rect places cores where an 8-column one never would.
+    """
+    return {(i % gx, i // gx) for i in range(n)}
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_pinned_weight_grid_agreement(mesh_device, reset_seeds):
+    """An L1 WIDTH_SHARDED in1 must sit on EXACTLY the matmul's core set. Nothing checks it.
+
+    The validator's only checks for an L1-sharded in1 are that it is WIDTH_SHARDED
+    and that `per_core_N == shard_width_in_tiles`
+    (`matmul_device_operation.cpp:1895-1907`). It never compares in1's shard GRID
+    against the matmul's core set, and the mcast_1d factory never consults that
+    grid either - it reads in1's shard spec only for tile height/width (`:196`) and
+    derives `all_cores` from `compute_with_storage_grid_size` (`:227-251`).
+    Meanwhile `set_globally_allocated_address` stores a SINGLE scalar address
+    (`circular_buffer_config.cpp:218-229`) which is valid on every bank under
+    LOCKSTEP. A grid mismatch is therefore silently accepted: cores in the matmul
+    set that hold no shard read whatever happens to live at that address, and cores
+    holding real shards are never read. Wrong logits, no FATAL.
+
+    Weights driven through `DecodeMatmulTuner` are safe by construction - the
+    tuner's grid and `shard_l1_width`'s grid both come from
+    `derive_decode_1d_config` with max 8x8 anchored at (0,0)
+    (`weight_placement.py:319-323`). A weight whose consumer passes NO program
+    config is not: `get_mcast_1d_config` uses the full device grid, so on an 11x10
+    Blackhole the same 64 cores are carved from an ELEVEN-wide rect.
+
+    `cme_centroids` was exactly that case until its linear was routed through the
+    tuner, and it is a member of the default `GEMMA4_AB_ONLY` set - i.e. it was
+    inside the headline +0.68% configuration. This test is the regression guard.
+    """
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    _purge_gather_in0("grid")
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    assistant = rig["assistant"]
+    slots = _weight_slots(assistant)
+    multi = mesh_device.get_num_devices() > 1
+
+    dg = mesh_device.compute_with_storage_grid_size()
+    logger.info(f"[grid] device compute grid {dg.x}x{dg.y} = {dg.x*dg.y} cores")
+    logger.info(
+        f"[grid] {'weight':<18}{'K':>6}{'N':>6}{'tuned grid':>12}{'cores':>7}"
+        f"{'auto grid':>11}{'auto cores':>11}{'outside':>9}"
+    )
+
+    bad_auto = []
+    for owner, attr, label in slots:
+        t = getattr(owner, attr)
+        local = ttnn.get_device_tensors(t)[0].shape if multi else t.shape
+        kk, nn = int(local[-2]), int(local[-1])
+        pc = derive_decode_1d_config(1, kk, nn)
+        assert pc is not None, f"{label}: derive_decode_1d_config returned None for K={kk} N={nn}"
+        gx, gy = pc.compute_with_storage_grid_size.x, pc.compute_with_storage_grid_size.y
+        tuned = _rowmajor_cores(gx * gy, gx)
+
+        # What ttnn's automatic path would build for the same weight:
+        # get_mcast_1d_config (matmul_program_config.cpp:379-380) computes
+        # per_core_N = div_up(div_up(N, gx*gy), tile_width) over the DEVICE grid.
+        nt = nn // ttnn.TILE_SIZE
+        auto_pcn = max(1, _div_up(_div_up(nn, dg.x * dg.y), ttnn.TILE_SIZE))
+        auto_cores = _div_up(nt, auto_pcn)
+        auto = _rowmajor_cores(auto_cores, dg.x)
+        outside = len(auto - tuned)
+        if outside:
+            bad_auto.append((label, outside))
+        logger.info(
+            f"[grid] {label[:18]:<18}{kk:>6}{nn:>6}{f'{gx}x{gy}':>12}{gx*gy:>7}"
+            f"{f'{dg.x}x{dg.y}':>11}{auto_cores:>11}{outside:>9}"
+        )
+
+    logger.info(
+        f"[grid] {len(bad_auto)} of {len(slots)} weights would be MISPLACED on the automatic path: "
+        f"{[b[0] for b in bad_auto][:8]}"
+    )
+
+    # --- the regression guard -------------------------------------------------
+    me = getattr(assistant, "masked_embedding", None)
+    assert me is not None, "CME head not built; this test needs use_cme"
+    assert getattr(me, "mm", None) is not None, "MaskedEmbedding has no matmul tuner (matmul_tuner not threaded in)"
+    assert me.mm.enabled, "the CME head's tuner is DISABLED — its centroids linear is on the automatic path"
+
+    h = ttnn.from_torch(
+        torch.zeros(1, 1, ttnn.TILE_SIZE, assistant.masked_embedding.hidden_size, dtype=torch.bfloat16),
+        device=mesh_device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=ttnn.bfloat16,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device) if multi else None,
+    )
+    cpc = me.mm.config_for(h, me.centroids)
+    h.deallocate(True)
+    assert cpc is not None, "the centroids linear gets NO tuned config — the grid mismatch is live again"
+    cgx, cgy = cpc.compute_with_storage_grid_size.x, cpc.compute_with_storage_grid_size.y
+    logger.info(f"[grid] centroids linear resolved config: grid {cgx}x{cgy} per_core_N={cpc.per_core_N}")
+    assert cgx <= 8 and cgy <= 8, f"centroids config escaped the 8x8 rect that shard_l1_width uses: {cgx}x{cgy}"
+
+    # And confirm empirically, by actually pinning it (16 KB/core — always fits).
+    moved = _relocate(slots, mesh_device, to_l1=True, only=("cme_centroids",))
+    assert moved == 1, f"expected to relocate exactly cme_centroids, moved {moved}"
+    mc = me.centroids.memory_config()
+    sgrid = mc.shard_spec.grid
+    bb = sgrid.bounding_box()
+    logger.info(
+        f"[grid] cme_centroids pinned: {mc.buffer_type} / {mc.memory_layout} on {sgrid.num_cores()} cores "
+        f"bbox [{bb.start.x}-{bb.start.y} - {bb.end.x}-{bb.end.y}] shard={list(mc.shard_spec.shape)}"
+    )
+    assert sgrid.num_cores() == cgx * cgy, (
+        f"shard grid has {sgrid.num_cores()} cores but the matmul config asks for {cgx*cgy} — "
+        "16 cores would read unmapped L1 and 16 shards would never be read"
+    )
+    bbw, bbh = bb.end.x - bb.start.x + 1, bb.end.y - bb.start.y + 1
+    assert (bbw, bbh) == (cgx, cgy), f"shard bbox {bbw}x{bbh} != config grid {cgx}x{cgy}"
+    _relocate(slots, mesh_device, to_l1=False, only=("cme_centroids",))
 
 
 @_needs_assistant
@@ -1343,6 +1655,311 @@ def test_per_bank_headroom(mesh_device, reset_seeds):
     logger.info(f"[bank-hw] ===== weight capacity = {lo} KB x num_shard_cores:")
     for c in (8, 16, 32, 48, 64, 110):
         logger.info(f"[bank-hw]        {c:3d}-core shard -> {lo*c/1024:7.1f} MB/device")
+
+
+def _breakdown_cases(mesh_device, tp, mesh_config, ccl, rig, keep):
+    """(label, n/step, builder) for the drafter's op mix.
+
+    EVERY count and shape here comes from ``test_op_shape_discovery``'s per-shape
+    census of one real step, not from reading the model. Shapes matter as much as
+    counts: several ops in this model cost per ROW, so timing a [1,1,32,N] stand-in
+    for a tensor the model uses as [1,1,1,N] over-reports by up to 32x - §1.1 and
+    §6.3 are two instances of exactly that bug. One-row TILE tensors are therefore
+    built one-row here.
+    """
+
+    def dev(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mc=None):
+        x = ttnn.from_torch(t, device=mesh_device, layout=layout, dtype=dtype, memory_config=mc)
+        keep.append(x)
+        return x
+
+    r1_256 = dev(torch.randn(1, 1, 1, 256).bfloat16())
+    r1_256b = dev(torch.randn(1, 1, 1, 256).bfloat16())
+    r1_256s = dev(torch.randn(1, 1, 1, 256).bfloat16(), mc=_rs_cfg(mesh_device, 256))
+    r1_1024 = dev(torch.randn(1, 1, 1, 1024).bfloat16())
+    r1_1024b = dev(torch.randn(1, 1, 1, 1024).bfloat16())
+    r1_512 = dev(torch.randn(1, 1, 1, 512).bfloat16())
+    r1_3072 = dev(torch.randn(1, 1, 1, 3072).bfloat16())
+    r1_2048 = dev(torch.randn(1, 1, 1, 2048).bfloat16())
+    d128 = dev(torch.randn(1, 1, 32, 128).bfloat16())
+    d128b = dev(torch.randn(1, 1, 32, 128).bfloat16())
+    w256x1024 = dev(torch.randn(1, 1, 256, 1024).bfloat16())
+    w256x1536 = dev(torch.randn(1, 1, 256, 1536).bfloat16())
+    w256x2048 = dev(torch.randn(1, 1, 256, 2048).bfloat16())
+    w512x256 = dev(torch.randn(1, 1, 512, 256).bfloat16())
+    w1024x256 = dev(torch.randn(1, 1, 1024, 256).bfloat16())
+    w3072x256 = dev(torch.randn(1, 1, 3072, 256).bfloat16())
+    sel4096 = dev(torch.randn(1, 1, 4096, 256).bfloat16())
+    hcol = dev(torch.randn(1, 1, 256, 1).bfloat16())
+    i32 = dev(torch.randint(0, 2048, (1, 32)), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+    i1 = dev(torch.randint(0, 2048, (1, 1)), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+    i4096 = dev(torch.randint(0, 2048, (1, 4096)), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+    tbl = dev(torch.randn(2048, 128).bfloat16(), layout=ttnn.ROW_MAJOR_LAYOUT)
+    v4096rm = dev(torch.randn(1, 1, 1, 4096), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT)
+    v4096t = dev(torch.randn(1, 1, 1, 4096), dtype=ttnn.float32)
+    mm = DecodeMatmulTuner(mesh_device, enabled=True, label="bd")
+    norm = next((n for n in _walk_norms(rig["assistant"]) if n._sharded_cfg is not None), None)
+
+    cases = [
+        # --- layout churn: 46 device ops, 34 of them the norms' own round trip -
+        ("S2I [1,1,1,256] (norm out)", 17, lambda: ttnn.sharded_to_interleaved(r1_256s, ttnn.DRAM_MEMORY_CONFIG)),
+        ("I2S [1,1,1,256] (norm in)", 17, lambda: ttnn.to_memory_config(r1_256, _rs_cfg(mesh_device, 256))),
+        ("S2I/I2S attention plumbing", 12, lambda: ttnn.to_memory_config(r1_512, _rs_cfg(mesh_device, 512))),
+        # --- the norms themselves ---------------------------------------------
+        ("LayerNorm rms sharded dim256", 17, (lambda: norm.forward(r1_256)) if norm is not None else None),
+        # --- elementwise -------------------------------------------------------
+        ("BinaryNg add [1,1,1,256]", 12, lambda: ttnn.add(r1_256, r1_256b)),
+        ("BinaryNg mul [1,1,1,1024]", 4, lambda: ttnn.mul(r1_1024, r1_1024b)),
+        ("BinaryNg add [1,1,32,128] (CME)", 4, lambda: ttnn.add(d128, d128b)),
+        ("Unary gelu [1,1,1,1024]", 4, lambda: ttnn.gelu(r1_1024, fast_and_approximate_mode=True)),
+        ("Typecast [1,1,32,128]", 5, lambda: ttnn.typecast(d128, ttnn.float32)),
+        ("Copy/clone [1,1,1,1024]", 4, lambda: ttnn.clone(r1_1024)),
+        ("Slice [1,1,1,512] -> half", 4, lambda: ttnn.slice(r1_512, [0, 0, 0, 0], [1, 1, 1, 256])),
+        # --- matmuls: 24 device ops, by (K x N) --------------------------------
+        ("mm wqkv/gate/up 256x1024", 11, lambda: mm.linear(r1_256, w256x1024)),
+        ("mm post_projection 256x1536", 1, lambda: mm.linear(r1_256, w256x1536)),
+        ("mm cme_centroids 256x2048", 1, lambda: mm.linear(r1_256, w256x2048)),
+        ("mm o_proj sliding 512x256", 3, lambda: mm.linear(r1_512, w512x256)),
+        ("mm o_proj glob + down 1024x256", 5, lambda: mm.linear(r1_1024, w1024x256)),
+        ("mm pre_projection 3072x256", 1, lambda: mm.linear(r1_3072, w3072x256)),
+        ("mm CME matvec [4096,256]x[256,1]", 1, lambda: ttnn.matmul(sel4096, hcol, dtype=ttnn.float32)),
+        # --- the CME head's own ops --------------------------------------------
+        ("Embeddings idx[1,32]", 11, lambda: ttnn.embedding(i32, tbl)),
+        ("Embeddings idx[1,1]", 1, lambda: ttnn.embedding(i1, tbl)),
+        ("Embeddings idx[1,4096]", 1, lambda: ttnn.embedding(i4096, tbl)),
+        ("TopK k=32 [1,1,1,2048]", 1, lambda: ttnn.topk(r1_2048, k=32, dim=-1)),
+        ("ArgMax [1,1,1,4096] fp32 RM", 1, lambda: ttnn.argmax(v4096rm, dim=-1, keepdim=False)),
+        ("UntilizeWithUnpadding [1,1,1,4096]", 2, lambda: ttnn.untilize_with_unpadding(v4096t, [0, 0, 0, 4095])),
+        ("Transpose [1,1,1,256]", 2, lambda: ttnn.transpose(r1_256, -2, -1)),
+    ]
+    if tp > 1:
+        cases.append(
+            ("ccl_allreduce [1,1,1,256] (=RS+AG)", 8, lambda: ccl_allreduce(ttnn.clone(r1_256), mesh_config, ccl))
+        )
+    return [(nm, k, f) for nm, k, f in cases if f is not None]
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_op_breakdown(mesh_device, reset_seeds):
+    """Per-op breakdown of the drafter step: count x measured us/call = us/step.
+
+    Counts and shapes come from ``test_op_shape_discovery`` (graph capture of one
+    real step); the cost of each is measured with ``_op_timed`` at that shape.
+    Coverage is reported explicitly - SDPA decode, RoPE, NLPCreateQKVHeads and
+    NLPConcatHeads (16 ops) are not reconstructible standalone without their real
+    KV/rope state, so they land in the residual together with dispatch.
+
+    Read the us/call column against the ~5.7 us per-op floor from §6.5: an op at
+    the floor is paying dispatch, not work, and can only be removed by removing
+    the op.
+    """
+    num_devices, tp, mesh_config = _mesh_bits(mesh_device)
+    ccl = CCLManager(mesh_device) if tp > 1 else None
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    torch.manual_seed(0)
+    _purge_gather_in0("breakdown")
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    keep = []
+    cases = _breakdown_cases(mesh_device, tp, mesh_config, ccl, rig, keep)
+
+    logger.info(f"[breakdown tp={tp}] {'op':<38}{'n':>4}{'us/call':>10}{'us/step':>10}")
+    rows, covered = [], 0
+    for name, n, fn in cases:
+        try:
+            us = _op_timed(mesh_device, fn, protect=tuple(keep))
+        except Exception as ex:  # noqa: BLE001
+            logger.info(f"[breakdown tp={tp}] {name:<38}{n:>4}  FAILED: {str(ex).split('backtrace')[0].strip()[:70]}")
+            continue
+        rows.append((name, n, us, us * n))
+        covered += n
+    for name, n, us, tot in sorted(rows, key=lambda r: -r[3]):
+        logger.info(f"[breakdown tp={tp}] {name:<38}{n:>4}{us:>10.2f}{tot:>10.1f}")
+    acc = sum(r[3] for r in rows)
+    logger.info(f"[breakdown tp={tp}] {'--- accounted':<38}{covered:>4}{'':>10}{acc:>10.1f} us/step")
+    logger.info(f"[breakdown tp={tp}] {'--- unmeasured ops (of 189)':<38}{189-covered:>4}")
+    logger.info(
+        f"[breakdown tp={tp}] top-3 share of accounted: "
+        f"{', '.join(f'{r[0].split()[0]} {r[3]/acc*100:.0f}%' for r in sorted(rows, key=lambda r: -r[3])[:3])}"
+    )
+
+    # --- why is TopK the biggest single op in the step? --------------------
+    # It runs on a 1x1 grid (one core of 110) per the op-grid census, which is the
+    # same shape of defect as the two gathers and the argmax fixed in §6.1/§6.3.
+    # Scaling in width and in k separates "per-element single-core work" from
+    # "fixed cost": per-element cost means the width is what to attack.
+    probe = []
+    for width in (512, 1024, 2048):
+        t = ttnn.from_torch(
+            torch.randn(1, 1, 1, width).bfloat16(), device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16
+        )
+        keep.append(t)
+        for kk in (32, 64):
+            if kk > width:
+                continue
+            try:
+                us = _op_timed(mesh_device, lambda t=t, kk=kk: ttnn.topk(t, k=kk, dim=-1), protect=tuple(keep))
+                probe.append((width, kk, us))
+            except Exception as ex:  # noqa: BLE001
+                logger.info(f"[topk] width={width} k={kk} FAILED: {str(ex).split('backtrace')[0].strip()[:70]}")
+    logger.info(f"[topk] {'width':>7}{'k':>5}{'us/call':>10}{'us per 1k elems':>18}")
+    for width, kk, us in probe:
+        logger.info(f"[topk] {width:>7}{kk:>5}{us:>10.1f}{us/width*1000:>18.1f}")
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_layout_conversion_sites(mesh_device, reset_seeds):
+    """WHERE the 46 layout-conversion ops come from, and what each one is for.
+
+    Graph capture says 25 ShardedToInterleaved + 21 InterleavedToSharded = 46 of
+    the step's 189 ops, i.e. 24% of the op count is pure relayout. "Why so many"
+    is not answerable from a count, so this attributes every conversion to the
+    gemma4 source line that asks for it, by wrapping the three ttnn entry points
+    and walking the Python stack.
+
+    Two caveats on reading the result:
+
+    * a conversion can also be **implicit** - passing ``memory_config=`` to an op
+      whose output layout differs makes ttnn insert the relayout itself, with no
+      Python-level call. Explicit (attributed here) + implicit = the graph's 46,
+      and the residual is printed so the split is visible rather than assumed.
+    * ``ttnn.to_memory_config`` is a no-op when the layout already matches, so a
+      counted call is not necessarily a device op.
+    """
+    import traceback as _tb
+
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    _purge_gather_in0("layout")
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+
+    sites = {}
+    real = {
+        "to_memory_config": ttnn.to_memory_config,
+        "sharded_to_interleaved": ttnn.sharded_to_interleaved,
+        "interleaved_to_sharded": ttnn.interleaved_to_sharded,
+    }
+
+    def _site():
+        """Innermost gemma4 frame that is not this test file."""
+        for fr in reversed(_tb.extract_stack()):
+            f = str(fr.filename)
+            if "demos/gemma4" in f and "tests/" not in f:
+                return f"{f.split('demos/gemma4/')[-1]}:{fr.lineno} {fr.name}"
+        return "<non-gemma4>"
+
+    def wrap(kind, fn):
+        def inner(t, *a, **kw):
+            mc = a[0] if a else kw.get("memory_config")
+            sharded = getattr(mc, "shard_spec", None) is not None if kind == "to_memory_config" else None
+            tag = kind if sharded is None else ("to_mc->sharded" if sharded else "to_mc->interleaved")
+            key = (_site(), tag, "x".join(str(int(d)) for d in t.shape))
+            sites[key] = sites.get(key, 0) + 1
+            return fn(t, *a, **kw)
+
+        return inner
+
+    for k, f in real.items():
+        setattr(ttnn, k, wrap(k, f))
+    try:
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
+            ttnn.synchronize_device(mesh_device)
+            idx = _argmax_token(rig["assistant"], logits, rows=1)
+            ttnn.synchronize_device(mesh_device)
+        finally:
+            graph = ttnn.graph.end_graph_capture()
+        for t in (idx, hn, logits):
+            t.deallocate(True)
+    finally:
+        for k, f in real.items():
+            setattr(ttnn, k, f)
+
+    dev = {"ShardedToInterleavedDeviceOperation": 0, "InterleavedToShardedDeviceOperation": 0}
+    for v in graph:
+        if v.get("node_type") == "function_start":
+            nm = v.get("params", {}).get("name", "")
+            if nm in dev:
+                dev[nm] += 1
+    dev_total = sum(dev.values())
+    explicit = sum(sites.values())
+
+    s2i, i2s = dev["ShardedToInterleavedDeviceOperation"], dev["InterleavedToShardedDeviceOperation"]
+    logger.info(f"[layout] device ops: {s2i} S2I + {i2s} I2S = {dev_total}")
+    logger.info(f"[layout] explicit Python-level calls attributed: {explicit}")
+    logger.info(f"[layout] {'call site':<58}{'kind':<20}{'shape':<14}{'n':>4}")
+    for (site, tag, shape), n in sorted(sites.items(), key=lambda kv: -kv[1]):
+        logger.info(f"[layout] {site[:58]:<58}{tag:<20}{shape:<14}{n:>4}")
+    logger.info(f"[layout] IMPLICIT (ttnn-inserted, no Python call): {dev_total - explicit} of {dev_total}")
+
+
+_SHAPE_RE = re.compile(r"Shape\(\[([0-9, ]+)\]\)")
+
+
+def _op_shapes(argstrs, limit=3):
+    """Distinct leading tensor shapes seen in a node's serialized arguments."""
+    out = []
+    for a in argstrs:
+        for m in _SHAPE_RE.findall(a):
+            sig = "x".join(t.strip() for t in m.split(","))
+            if sig not in out:
+                out.append(sig)
+            break
+    return out[:limit]
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 2)],
+    device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
+)
+def test_op_shape_discovery(mesh_device, reset_seeds):
+    """Every device op in one drafter step, with the SHAPES it actually runs at.
+
+    ``test_op_inventory`` gives counts only, which is not enough to price an op:
+    a per-op breakdown needs the real shape to time against. This dumps
+    (op, count, distinct arg shapes) so the cost cases in
+    ``test_op_breakdown`` are chosen from measurement rather than guessed.
+    """
+    os.environ["GEMMA4_TUNE_MATMULS"] = "1"
+    _purge_gather_in0("shapes")
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+    try:
+        logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
+        ttnn.synchronize_device(mesh_device)
+        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        ttnn.synchronize_device(mesh_device)
+    finally:
+        graph = ttnn.graph.end_graph_capture()
+    for t in (idx, hn, logits):
+        t.deallocate(True)
+
+    per = {}
+    for v in graph:
+        if v.get("node_type") != "function_start":
+            continue
+        nm = v.get("params", {}).get("name", "?")
+        if not ("DeviceOperation" in nm or nm.startswith("ttnn::")):
+            continue
+        sh = (_op_shapes(v.get("arguments", []) or [], limit=1) or ["-"])[0]
+        per[(nm, sh)] = per.get((nm, sh), 0) + 1
+
+    total = sum(per.values())
+    by_op = {}
+    for (nm, sh), n in per.items():
+        by_op[nm] = by_op.get(nm, 0) + n
+    logger.info(f"[shapes] {total} device-op invocations in one drafter step")
+    logger.info(f"[shapes] {'op':<44}{'shape':>16}{'n':>5}")
+    for (nm, sh), n in sorted(per.items(), key=lambda kv: (-by_op[kv[0][0]], -kv[1])):
+        logger.info(f"[shapes] {nm[:44]:<44}{sh:>16}{n:>5}")
 
 
 @_needs_assistant
