@@ -40,6 +40,17 @@ from loguru import logger
 import ttnn
 
 
+def _env_on(name):
+    """``1|true|yes|on`` -> True; unset / anything else -> False.
+
+    A bare ``os.getenv(name)`` truth test makes ``NAME=0`` mean ENABLED, which is
+    the opposite of every other knob in this model (``GEMMA4_TUNE_MATMULS``,
+    ``GEMMA4_WEIGHTS_IN_L1``, ``GEMMA4_SHARD_ACTIVATIONS``). That silently
+    contaminates any A/B run with the variable exported as 0.
+    """
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _largest_divisor(n, cap=8):
     for d in range(min(n, cap), 0, -1):
         if n % d == 0:
@@ -278,7 +289,7 @@ class DecodeMatmulTuner:
         already L1 WIDTH_SHARDED, which `WeightPlacement` decides. So the
         allow-list is `GEMMA4_L1_ONLY`, and no separate knob is needed.
         """
-        if not self.enabled or not os.getenv("GEMMA4_GATHER_IN0"):
+        if not self.enabled or not _env_on("GEMMA4_GATHER_IN0"):
             return None
         if not self._l1_width_sharded(w):
             return None

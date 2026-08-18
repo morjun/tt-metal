@@ -214,6 +214,7 @@ class Gemma4AssistantModel:
                 tensor_cache_path=tensor_cache_path,
                 mesh_config=mesh_config,
                 weight_placement=placement,
+                matmul_tuner=self.mm,
             )
         else:
             # lm_head tied to the assistant's own embed_tokens when a separate

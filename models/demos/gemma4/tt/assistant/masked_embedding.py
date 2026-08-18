@@ -51,6 +51,8 @@ from dataclasses import dataclass
 import torch
 
 import ttnn
+from models.demos.gemma4.tt.matmul_tuning import DISABLED as DISABLED_TUNER
+from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.weight_placement import place_as_tensor
 from models.demos.gemma4.tt.weight_placement import resolve as resolve_placement
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
@@ -108,8 +110,26 @@ class Gemma4TTMaskedEmbedder:
         tensor_cache_path=None,
         mesh_config=None,
         weight_placement=None,
+        matmul_tuner=None,
     ):
         placement = resolve_placement(weight_placement)
+        # The centroids matmul MUST carry an explicit program config whenever its
+        # weight can be L1 WIDTH_SHARDED, and the reason is correctness, not perf.
+        # ttnn's automatic config sets compute_with_storage_grid_size to the FULL
+        # device grid (11x10 on P150) with per_core_N = 1, so the mcast_1d factory
+        # carves 64 cores row-major out of an 11-WIDE rectangle -> x0..10, y0..5.
+        # `shard_l1_width` shards the weight on 8x8. The validator checks only
+        # WIDTH_SHARDED and per_core_N == shard_width_in_tiles
+        # (matmul_device_operation.cpp:1895-1907) and never compares the two core
+        # sets, while set_globally_allocated_address stores ONE scalar address that
+        # is valid on every bank under LOCKSTEP. Result: 16 of the 64 matmul cores
+        # read whatever happens to sit at that address in their own L1, and 16
+        # cores holding real shards are never read. No FATAL, just wrong logits.
+        # GEMMA4_CME_UNTUNED=1 restores the bare `ttnn.linear` for the A/B, same
+        # idiom as GEMMA4_CME_GATHER / GEMMA4_CME_TILED_IDS. Only use it to
+        # attribute a measurement — with a pinnable centroids weight it is the
+        # silently-misplaced configuration described above.
+        self.mm = DISABLED_TUNER if os.getenv("GEMMA4_CME_UNTUNED", "0") == "1" else resolve_tuner(matmul_tuner)
         self.mesh_device = mesh_device
         self.args = assistant_args
         text_args = assistant_args.text_args
@@ -263,7 +283,7 @@ class Gemma4TTMaskedEmbedder:
         C, P, K, N = self.num_centroids, self.vocab_per_centroid, self.top_k, self.num_candidates
 
         # 1. centroid logits [1,1,1,C]
-        centroid_logits = ttnn.linear(h, self.centroids, compute_kernel_config=self.compute_kernel_config)
+        centroid_logits = self.mm.linear(h, self.centroids, compute_kernel_config=self.compute_kernel_config)
 
         # 2. top-k centroids. k=32 is tile-aligned, so topk takes no round-up/slice
         #    path. Indices come back TILE uint16 (width C <= 65535); typecast to

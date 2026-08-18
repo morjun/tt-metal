@@ -450,12 +450,18 @@ def _verify_head_splits(B, H_local, nkv_local, P, head_dim, grid=None):
     if (H_local * P) * head_dim <= 8192:  # not heavy (sliding) — one op fits
         return 1
     # Mirror sdpa_decode_program_factory's core allocation (num_kv_heads == 1)
-    # and CB tile counts; keep grid / max_cores_per_head_batch / k_chunk in sync
-    # with the packed sdpa_program_config. Budget in 2 KB tiles with margin
-    # under the 768-tile (1.5 MB) L1 cap.
+    # and CB tile counts. Budget in 2 KB tiles with margin under the 768-tile
+    # (1.5 MB) L1 cap.
+    #
+    # These MUST track the packed sdpa_program_config built below, so they are
+    # read from the same env vars rather than duplicated as literals. They used
+    # to be hard-coded `16, 64`, which meant setting GEMMA4_SDPA_MAX_CORES or
+    # GEMMA4_SDPA_KCHUNK silently desynchronised the head split from the CB
+    # footprint it is supposed to model — a wrong split, not an error.
     if grid is None:
         grid = 32 if head_dim >= 512 else 64
-    max_cores_per_head, k_chunk = 16, 64
+    max_cores_per_head = int(os.environ.get("GEMMA4_SDPA_MAX_CORES", "16"))
+    k_chunk = int(os.environ.get("GEMMA4_SDPA_KCHUNK", "64"))
     cores_per_head = max(1, min(grid, max_cores_per_head * B) // max(1, B))
     DHt, Sk = head_dim // 32, max(1, k_chunk // 32)
     BUDGET_TILES = 720
