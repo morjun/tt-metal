@@ -173,11 +173,24 @@ class WeightPlacement:
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
-        """Build from ``GEMMA4_WEIGHTS_IN_L1``.
+        """Build from ``GEMMA4_WEIGHTS_IN_L1``, scoped by ``GEMMA4_L1_SCOPES``.
 
         ``sharded`` (recommended) -> WIDTH_SHARDED on the matmul grid;
         ``1``/``l1`` -> interleaved (measured worthless, kept for A/B);
         ``0``/unset -> DRAM.
+
+        **Scoping, and why it defaults to the drafter only.** Both the drafter
+        (``label="draft"``) and the 35-layer target (``label="target"``) call this,
+        so a bare ``GEMMA4_WEIGHTS_IN_L1=sharded`` used to pin BOTH — and pinning
+        the target is structurally broken, not merely unprofitable: its weights
+        are consumed by prefill as well as decode, the tuned config only applies at
+        ``Mt == 1``, and at prefill ttnn auto-selects a config that does not know
+        about the decode-shaped shard. The result is a hard
+        ``input B shard width in tiles (2) must equal per_core_N (1)`` during the
+        first decode after prefill, which made the knob unusable end to end even
+        though the drafter side works. So ``GEMMA4_L1_SCOPES`` defaults to
+        ``draft``; set it to ``draft,target`` or ``all`` to opt the target back in.
+        Same shape as ``DecodeMatmulTuner.from_env``'s scope list.
         """
         raw = (os.getenv("GEMMA4_WEIGHTS_IN_L1") or "").strip().lower()
         mode = default_mode
@@ -187,6 +200,13 @@ class WeightPlacement:
             mode = "l1"
         elif raw in ("0", "false", "no", "off"):
             mode = "dram"
+        scope = kwargs.get("label")
+        if mode != "dram" and scope:
+            allowed = (os.getenv("GEMMA4_L1_SCOPES") or "draft").strip().lower()
+            if allowed not in ("all", "1", "true", "yes", "on"):
+                if scope not in {t.strip() for t in allowed.split(",")}:
+                    logger.info(f"[placement:{scope}] GEMMA4_L1_SCOPES={allowed!r} excludes this scope — staying DRAM")
+                    mode = default_mode
         return cls(mode=mode, **kwargs)
 
     @property
