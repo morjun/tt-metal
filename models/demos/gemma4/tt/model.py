@@ -2151,7 +2151,11 @@ class Gemma4Model:
         # 36% throughput). Having BOTH paths run the SAME device computation makes them
         # identical by construction instead, at no throughput cost.
         _pli_stacked = None
-        if os.environ.get("GEMMA4_DECODE_PLI_DEV") == "1" and self.hidden_size_per_layer_input:
+        # DEFAULT ON, for the parity reason above rather than for speed: the spec paths
+        # run device PLI, so leaving plain decode on host PLI would make every
+        # spec-vs-plain comparison a comparison of two PLI implementations as well.
+        # GEMMA4_DECODE_PLI_DEV=0 restores host PLI to reproduce any pre-flip number.
+        if os.environ.get("GEMMA4_DECODE_PLI_DEV", "1") == "1" and self.hidden_size_per_layer_input:
             _ids = x if x.dtype in (ttnn.uint32, ttnn.int32) else None
             if _ids is not None:
                 if len(_ids.shape) == 4:

@@ -809,9 +809,14 @@ def _run_spec_decode(
     # A/B the cost).
     _trace_env = os.environ.get("GEMMA4_SPEC_TRACE")
     spec._use_trace = enable_trace if _trace_env is None else (_trace_env == "1")
+    # `path=` below is the demo's PRE-dispatch intent and is NOT the route that runs:
+    # generate() reroutes a per-layer-input target to the fused batched trace whenever
+    # GEMMA4_SPEC_FUSED_PLI_DEV is on (spec_decode.py, see generate()), so host and fused
+    # runs used to log the identical line. The authoritative `route=` is read back from
+    # spec._last_route AFTER the call returns; quote that one, never this one.
     logger.info(
         f"Spec-decode generate (draft_len={draft_len}, temp={temperature}, "
-        f"path={'fused' if use_fused else 'host'}, trace={spec._use_trace}, "
+        f"path[intent]={'fused' if use_fused else 'host'}, trace={spec._use_trace}, "
         # The two paths read DIFFERENT seed knobs: the fused trace uses
         # _fused_reseed/_fused_shift_seed, the host loop uses _seed_mode.
         + (
@@ -841,8 +846,17 @@ def _run_spec_decode(
     n_tokens = len(generated)
     n_iters = len(accepts)
     mean_accept = (sum(accepts) / n_iters) if n_iters else 0.0
-    setup_elapsed = getattr(spec, "_last_fused_setup_s", 0.0) if use_fused else 0.0
-    steady_elapsed = getattr(spec, "_last_fused_replay_s", elapsed) if use_fused else elapsed
+    # Gate on whether a fused route ACTUALLY ran, not on the demo's `use_fused` intent.
+    # generate() reroutes a PLI target to _generate_fused_traced_batched, which does set
+    # both timers -- but keying off use_fused ignored them and fell back to `elapsed`,
+    # i.e. WALL time including the 4.38 GiB PLI upload and the trace capture, while every
+    # other fused number on record is steady-state. That silently changed what the
+    # headline tok/s/u meant depending on one env var.
+    route = getattr(spec, "_last_route", None) or ("fused" if use_fused else "host")
+    _fused_ran = route.startswith("fused")
+    setup_elapsed = getattr(spec, "_last_fused_setup_s", 0.0) if _fused_ran else 0.0
+    steady_elapsed = getattr(spec, "_last_fused_replay_s", elapsed) if _fused_ran else elapsed
+    logger.info(f"Spec-decode route={route} (effective; the path[intent] line above is only the demo's guess)")
     # batch=1 single-user: per-user rate == aggregate throughput (kept explicit
     # so the line is coherent with the plain-decode demo's metric format). Match
     # the plain demo's steady-state decode convention by excluding one-time spec

@@ -153,13 +153,31 @@ class SpeculativeDecoder:
         # two-traces-one-queue hang. Data ordering across the two queues is preserved by
         # the existing _trace_barrier drain at each switch point.
         self._draft_cq = int(os.environ.get("GEMMA4_SPEC_DRAFT_CQ", "0"))
-        # GEMMA4_SPEC_FUSED_PLI_DEV=1 builds PLI on device inside the fused trace,
-        # opting into the 4.38 GiB embed_tokens_per_layer table in DRAM. Off by default
-        # because of that allocation, not because of any correctness doubt.
-        self._fused_pli_device = os.environ.get("GEMMA4_SPEC_FUSED_PLI_DEV", "0") == "1"
-        # GEMMA4_SPEC_PLI_DEV=1: use on-device PLI in the ordinary host-loop packed
-        # verify too (diagnostic / A-B against the host PLI baseline).
-        self._pli_dev_host = os.environ.get("GEMMA4_SPEC_PLI_DEV", "0") == "1"
+        # GEMMA4_SPEC_FUSED_PLI_DEV builds PLI on device inside the fused trace, opting
+        # into the 4.38 GiB embed_tokens_per_layer table in DRAM.
+        #
+        # DEFAULT ON. This knob does double duty: generate() consults it to route a
+        # per-layer-input target (E2B/E4B) to the BATCHED fused single trace instead of
+        # the host loop (see generate()), so it is also the host-vs-fused selector. The
+        # last recorded A/B is 31.77 vs 18.4 tok/s/u in favour of fused, taken with this
+        # flag and nothing else. Set it to 0 to reproduce any host-loop number.
+        #
+        # NOTE it is NOT the same knob as GEMMA4_SPEC_FUSED: that one forces the demo's
+        # use_fused, which for a PLI target selects generate_fused -> _fused_body -> the
+        # BATCH-DIM verify (ttnn_verify_forward), which has no pli_on_device at all.
+        self._fused_pli_device = os.environ.get("GEMMA4_SPEC_FUSED_PLI_DEV", "1") == "1"
+        # GEMMA4_SPEC_PLI_DEV: use on-device PLI in the ordinary host-loop packed verify
+        # too. DEFAULT ON, for parity rather than speed -- device and host PLI differ by
+        # ~1 bf16 ULP (PCC 0.9999947), so leaving the host loop on host PLI while the
+        # fused path runs device PLI would compare two different implementations in
+        # every spec-vs-plain number.
+        self._pli_dev_host = os.environ.get("GEMMA4_SPEC_PLI_DEV", "1") == "1"
+        # Which iteration structure the last generate*/ call actually ran. The demo used
+        # to print its own pre-dispatch guess ("path=host"), which is blind to generate()
+        # rerouting a PLI target to the fused batched trace -- so runs on two different
+        # paths logged the same line. Set at the point the decision is made, never
+        # inferred by the caller.
+        self._last_route = None
         # GEMMA4_SPEC_TRACE_BLOCKING=1 replays every trace with blocking=True. This is
         # a DIFFERENT guarantee from the _trace_barrier drain: it waits on that trace's
         # own completion rather than on the device generally, which is what a
@@ -1220,7 +1238,9 @@ class SpeculativeDecoder:
                 "or use generate() (the host loop)."
             )
         if self._use_trace:
+            self._last_route = "fused-traced"
             return self._generate_fused_traced(anchor_token, anchor_pos, max_new_tokens)
+        self._last_route = "fused-eager"
         self._pv_a_prev = -1  # re-seed packed-verify staging for the new anchor/request
         self._last_fused_setup_s = 0.0
         K = self.draft_len
@@ -1947,7 +1967,9 @@ class SpeculativeDecoder:
         if temperature and temperature > 0:
             raise NotImplementedError("batched spec-decode supports greedy only (temperature<=0)")
         if self._use_trace:
+            self._last_route = "fused-batched-traced"
             return self._generate_fused_traced_batched(anchor_tokens, anchor_positions, max_new_tokens, max_seq_len)
+        self._last_route = "fused-batched-eager"
         B = len(anchor_tokens)
         K = self.draft_len
         P = K + 1
@@ -2113,6 +2135,18 @@ class SpeculativeDecoder:
                 self._use_trace = True
 
         traced = self._use_trace
+        self._last_route = "host-loop-traced" if traced else "host-loop-eager"
+        # Force the PLI weight upload BEFORE any capture. init_pli_device_weights is lazy
+        # (compute_pli_device calls it on first use), and a 4.38 GiB host write INSIDE a
+        # trace capture is illegal and fails silently rather than loudly.
+        #
+        # Every capture site here happens to run a compile pass first (_capture_verify_trace
+        # and _verify_packed both call the forward once before begin_trace_capture), so the
+        # lazy init already fires out-of-trace today. This is explicit anyway: the guarantee
+        # is currently an accident of the compile-run pattern, and the failure it prevents is
+        # silent.
+        if traced and self._pli_dev_host and self.target_needs_host_pli:
+            self.target.init_pli_device_weights()
         self._pv_a_prev = -1  # re-seed packed-verify staging for the new anchor/request
         out = []
         accepts = []
