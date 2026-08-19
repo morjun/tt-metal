@@ -852,11 +852,24 @@ def _run_spec_decode(
     # i.e. WALL time including the 4.38 GiB PLI upload and the trace capture, while every
     # other fused number on record is steady-state. That silently changed what the
     # headline tok/s/u meant depending on one env var.
+    # EVERY route now reports steady-state, not just the fused ones. Keying this off
+    # `use_fused` meant the fused arms were quoted steady-state while the host loop was
+    # quoted WALL (its setup and lazy trace capture folded in), so a host-vs-fused
+    # comparison was between two different quantities and biased against the host loop.
     route = getattr(spec, "_last_route", None) or ("fused" if use_fused else "host")
-    _fused_ran = route.startswith("fused")
-    setup_elapsed = getattr(spec, "_last_fused_setup_s", 0.0) if _fused_ran else 0.0
-    steady_elapsed = getattr(spec, "_last_fused_replay_s", elapsed) if _fused_ran else elapsed
+    setup_elapsed = getattr(spec, "_last_fused_setup_s", 0.0) or 0.0
+    steady_elapsed = getattr(spec, "_last_fused_replay_s", None) or elapsed
     logger.info(f"Spec-decode route={route} (effective; the path[intent] line above is only the demo's guess)")
+    # The traced host loop captures its verify trace lazily inside iteration 1 (the
+    # pre-capture block only runs with GEMMA4_SPEC_TRACE_DRAFT=1), so that capture sits
+    # INSIDE steady state. Surface it rather than let it inflate ms/token silently.
+    _first_iter = getattr(spec, "_last_first_iter_s", None)
+    if _first_iter is not None and n_iters > 1:
+        _rest = (steady_elapsed - _first_iter) / (n_iters - 1)
+        logger.info(
+            f"First iteration: {_first_iter * 1000.0:.1f} ms vs {_rest * 1000.0:.1f} ms/iter for the rest "
+            f"({_first_iter / _rest:.1f}x — carries the lazy verify-trace capture)"
+        )
     # batch=1 single-user: per-user rate == aggregate throughput (kept explicit
     # so the line is coherent with the plain-decode demo's metric format). Match
     # the plain demo's steady-state decode convention by excluding one-time spec

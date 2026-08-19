@@ -2148,6 +2148,11 @@ class SpeculativeDecoder:
         if traced and self._pli_dev_host and self.target_needs_host_pli:
             self.target.init_pli_device_weights()
         self._pv_a_prev = -1  # re-seed packed-verify staging for the new anchor/request
+        # The host loop had NO steady-state timer, so the demo fell back to wall time for
+        # it while reporting steady-state for the fused paths -- i.e. the two arms of the
+        # host-vs-fused comparison were different quantities. Same defect class as the
+        # use_fused metric gate; fixing only one of them would just move the bias.
+        _setup_t0 = time.perf_counter()
         out = []
         accepts = []
         # Own (and free) only what we allocate: a caller-provided anchor_hidden
@@ -2189,7 +2194,15 @@ class SpeculativeDecoder:
                 self._capture_draft_trace(anchor_token, anchor_hidden, anchor_pos)
             # Capture (and discard) the packed verify at the shape the loop will use.
             self._verify([anchor_token] * _P, [anchor_pos + j for j in range(_P)])
+        self._last_fused_setup_s = time.perf_counter() - _setup_t0
+        _replay_t0 = time.perf_counter()
+        # Iteration 1 is timed separately: with the default _trace_draft=0 the pre-capture
+        # block above is skipped, so the verify trace is captured LAZILY inside the first
+        # _verify call. Without this, that capture hides inside "steady state" and quietly
+        # inflates ms/token -- exactly the misattribution this measurement exists to remove.
+        self._last_first_iter_s = None
         while len(out) < max_new_tokens:
+            _iter_t0 = time.perf_counter()
             _t0 = time.perf_counter() if prof else 0.0
             drafts, draft_logits = draft_fn(
                 anchor_token, anchor_hidden, anchor_pos, temperature=temperature, top_p=top_p, top_k=top_k
@@ -2273,16 +2286,21 @@ class SpeculativeDecoder:
             if prof:
                 t_acc["seed"] += time.perf_counter() - _t0
 
+            if self._last_first_iter_s is None:
+                self._last_first_iter_s = time.perf_counter() - _iter_t0
+
             for tok in committed:
                 out.append(tok)
                 if tok in self.stop_tokens:
                     if owns_anchor_hidden:
                         anchor_hidden.deallocate(True)
+                    self._last_fused_replay_s = time.perf_counter() - _replay_t0
                     self._log_profile(prof, t_acc, n_iter, len(out))
                     return out, accepts
                 if len(out) >= max_new_tokens:
                     break
 
+        self._last_fused_replay_s = time.perf_counter() - _replay_t0
         if owns_anchor_hidden:
             anchor_hidden.deallocate(True)
         self._log_profile(prof, t_acc, n_iter, len(out))
