@@ -2605,7 +2605,15 @@ def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
     # structural -- which keys, which RoPE position -- never the CONTENTS it reads. Plain
     # decode writes those two positions across two separate decode steps; the packed verify
     # writes all P in one shot before reading any of them.
+    # Token divergence index -> cache position, needed to scope the cache diff to the
+    # region BEFORE the outputs diverge. Past that point every position differs
+    # trivially because the two runs are generating different text.
+    n = min(len(plain), len(fused))
+    i = next((k for k in range(n) if plain[k] != fused[k]), None)
+    p_div = (p0 + 1 + i) if i is not None else None
+
     first_pos = None
+    all_diffs = []  # (pos, layer, K/V, magnitude)
     for lt in plain_kv:
         for nm in (0, 1):
             a, b_ = plain_kv[lt][nm], fused_kv[lt][nm]
@@ -2613,13 +2621,95 @@ def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
             d = (a[..., :n_, :] - b_[..., :n_, :]).abs()
             per = d.amax(dim=(0, 1, 3)) if d.dim() == 4 else d.reshape(n_, -1).amax(-1)
             ch = (per > 0).nonzero().flatten().tolist()
+            for c in ch:
+                all_diffs.append((c, lt, "K" if nm == 0 else "V", float(per[c])))
             if ch and (first_pos is None or ch[0] < first_pos[1]):
                 first_pos = (lt, ch[0], "K" if nm == 0 else "V", float(per[ch[0]]))
     logger.info(f"  first differing CACHE POSITION: {first_pos}")
-    logger.info(f"  (anchor at the diverging iteration was c=132, so c+1=133, c+2=134)")
 
-    n = min(len(plain), len(fused))
-    i = next((k for k in range(n) if plain[k] != fused[k]), None)
+    # EXTENT of the pre-divergence cache difference. One isolated ULP and a drift
+    # running all the way to the divergence imply very different causes.
+    if p_div is not None:
+        pre = sorted([x for x in all_diffs if x[0] < p_div])
+        by_pos = {}
+        for pos_, lt, kv, mag in pre:
+            by_pos.setdefault(pos_, []).append((lt, kv, mag))
+        logger.info(
+            f"  PRE-DIVERGENCE cache diffs (positions < {p_div}, the divergent token's slot): "
+            f"{len(by_pos)} distinct positions, {len(pre)} (position,layer,K/V) entries"
+        )
+        for pos_ in sorted(by_pos):
+            ents = by_pos[pos_]
+            mx = max(e[2] for e in ents)
+            logger.info(
+                f"    pos {pos_:4d}: {len(ents):3d} layer/KV entries, max|diff|={mx:.8f} "
+                f"-> {[(e[0], e[1], round(e[2], 8)) for e in ents[:6]]}"
+                f"{' ...' if len(ents) > 6 else ''}"
+            )
+        if not by_pos:
+            logger.info("    NONE — the cache is bit-identical everywhere before the divergence")
+
+    # ── KV WRITE HISTORY of the first differing position ──────────────────────────
+    # The packed verify writes c..c+K with [anchor_tok] + drafts UNCONDITIONALLY, so a
+    # position is rewritten by every iteration whose range covers it. Two writes of the
+    # SAME token id at the SAME position that disagree = a numerics defect (row index
+    # within the packed batch is the only thing that changed). Two writes of DIFFERENT
+    # token ids, or the same id under different KV context, is expected behaviour and
+    # means this position is not the divergence.
+    ilog = getattr(spec, "_iter_log", None)
+    if ilog and first_pos is not None:
+        K_ = spec.draft_len
+        p_bad = first_pos[1]
+        writes = {}
+        for r in ilog:
+            toks_written = [r["anchor_tok"]] + r["drafts"]
+            for j, t in enumerate(toks_written):
+                writes.setdefault(r["anchor"] + j, []).append((r["it"], r["anchor"], j, t, r["m"]))
+
+        def _plain_at(p):
+            i_ = p - p0 - 1
+            return plain[i_] if 0 <= i_ < len(plain) else None
+
+        logger.info(f"  WRITE HISTORY of position {p_bad} (plain has token {_plain_at(p_bad)} there):")
+        for it_, anc, row, t, m_ in writes.get(p_bad, []):
+            kind = "row0/COMMITTED" if row == 0 else f"row{row}/speculative"
+            logger.info(
+                f"    iter {it_:3d}  anchor={anc:4d}  {kind:16s}  token={t:6d}  m={m_}"
+                f"  {'== plain' if t == _plain_at(p_bad) else '!= plain'}"
+            )
+        ids = [w[3] for w in writes.get(p_bad, [])]
+        repeats = len(ids) != len(set(ids))
+        logger.info(
+            f"    -> {len(ids)} writes, {len(set(ids))} distinct token ids; "
+            f"SAME-TOKEN REWRITE: {'YES' if repeats else 'NO'}"
+        )
+
+        # Discriminator (a) numerics vs (b) different context: for each iteration that
+        # wrote this position, did its drafts at the EARLIER positions match what plain
+        # decode has there? If not, that write saw a different KV context and a
+        # different K is expected rather than anomalous.
+        for it_, anc, row, t, m_ in writes.get(p_bad, []):
+            r = next(x for x in ilog if x["it"] == it_)
+            ctx = [
+                (anc + 1 + j, d, _plain_at(anc + 1 + j), d == _plain_at(anc + 1 + j)) for j, d in enumerate(r["drafts"])
+            ]
+            bad_ctx = [c for c in ctx[:row] if not c[3]]
+            logger.info(
+                f"    iter {it_:3d} context for row {row}: drafts at earlier positions "
+                f"{[(c[0], c[1], c[2]) for c in ctx[:row]]}  -> "
+                f"{'CONTEXT DIFFERS from plain' if bad_ctx else 'context matches plain'}"
+            )
+
+        logger.info(f"  ITERATION LOG (anchor, m, drafts vs target):")
+        for r in ilog:
+            if abs(r["anchor"] - p_bad) <= 3 * (K_ + 1):
+                logger.info(
+                    f"    it {r['it']:3d} anchor={r['anchor']:4d} m={r['m']} "
+                    f"drafts={r['drafts']} target_g={r['g']} committed={r['committed']}"
+                )
+    elif first_pos is not None:
+        logger.info("  (set GEMMA4_ITER_LOG=1 for the per-position KV write history)")
+
     logger.info(f"  plain={len(plain)} tokens  fused={len(fused)} tokens")
     logger.info(f"  plain[:12] = {plain[:12]}")
     logger.info(f"  fused[:12] = {fused[:12]}")
@@ -2630,3 +2720,252 @@ def test_fused_path_matches_plain_decode(mesh_device, reset_seeds):
         logger.info(f"    plain[{max(0,i-3)}:{i+3}] = {plain[max(0,i-3):i+3]}")
         logger.info(f"    fused[{max(0,i-3)}:{i+3}] = {fused[max(0,i-3):i+3]}")
     assert i is None, f"fused path diverges from plain decode at token {i}: {plain[i]} vs {fused[i]}"
+
+
+def test_packed_verify_row2_on_plain_built_cache(mesh_device, reset_seeds):
+    """THE DISCRIMINATOR: does the packed verify's row 2 disagree with plain decode
+    when the KV cache is IDENTICAL by construction?
+
+    test_fused_path_matches_plain_decode shows the fused run diverging at token 85
+    because the packed verify at anchor 132 returns 18922 at ROW 2 where plain decode
+    returns 14787 at that same position. Two candidate causes have never been separated:
+
+      (a) the packed verify's COMPUTATION differs from plain decode's -- P=4 packed into
+          the query-heads dim, explicit additive mask with is_causal=False instead of
+          causal decode SDPA, and rows reading K/V that this same call wrote moments
+          earlier via paged_update_cache.
+      (b) the packed verify reads a DIFFERENT KV CACHE -- the fused run's cache differs
+          from plain's at position 128 (L01, K, 1 bf16 ULP), and that perturbation could
+          propagate into row 2.
+
+    This removes (b) entirely. The cache is built by PLAIN DECODE ONLY, never
+    speculating, so positions 0..anchor are bit-identical to plain's by construction.
+    Then the packed verify runs once at the anchor.
+
+      row 2 returns 18922  -> the cache is exonerated; the packed verify computation is
+                              the cause.
+      row 2 returns 14787  -> the packed verify is correct on a clean cache, so the
+                              cache difference IS causal and the hunt moves to why
+                              L01's K at position 128 differs.
+
+    Two cache variants are run because paged_update_cache writes unconditionally, so
+    prior slot contents should be irrelevant -- variant B checks that assumption rather
+    than assuming it.
+    """
+    model_path = os.getenv("HF_MODEL")
+    if not model_path:
+        pytest.skip("set HF_MODEL (target) to run")
+    if _is_moe_model(model_path):
+        pytest.skip(_MOE_UNSUPPORTED_REASON)
+    if not _is_pli_model(model_path):
+        pytest.skip("needs a PLI checkpoint (gemma-4-E2B/E4B)")
+
+    import torch
+
+    from models.demos.gemma4.demo.text_demo_v2 import create_tt_page_table
+    from models.demos.gemma4.tt.generator import Gemma4Generator
+    from models.demos.gemma4.tt.spec_decode import SpeculativeDecoder
+    from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+    # GEMMA4_ROW2_MAXSEQ sets the packed verify's mask width S_k = ceil(max_seq_len/64)*64,
+    # which IS the SDPA's chunk-leaf count (S_k / k_chunk). Plain decode is bounded by
+    # cur_pos and gets ceil((cur_pos+1)/64) leaves. At 1024 the packed path merges 16
+    # leaves against plain's 3 at anchor 128 and differs by 1 ULP; at 192 both merge 3 and
+    # must be bit-identical. Same anchor, same tokens, same cache -- only the leaf count.
+    max_seq_len, block_size = int(os.environ.get("GEMMA4_ROW2_MAXSEQ", "1024")), 64
+    # Anchor as an index into the plain token stream. 82 reproduces anchor position 132
+    # on the standard long prompt (p0=49 -> position = p0 + 1 + 82 = 132).
+    A = int(os.environ.get("GEMMA4_ROW2_ANCHOR_IDX", "82"))
+    # The third draft the fused run proposed at that anchor. Rows 1 and 2 are fed the
+    # plain tokens (that is what the fused run's accepted drafts were); only row 3's
+    # token is a genuine speculative guess.
+    D3 = int(os.environ.get("GEMMA4_ROW2_D3", "18922"))
+    K = 3
+    P = K + 1
+
+    pac = PagedAttentionConfig(block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size))
+    generator, tt_kv_cache, tokenizer = Gemma4Generator.from_pretrained(
+        mesh_device=mesh_device,
+        model_path=model_path,
+        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        num_layers=None,
+        paged_attention_config=pac,
+        bounded_sliding_kv_cache=False,
+    )
+    page_table = create_tt_page_table(1, pac)
+    spec = SpeculativeDecoder(
+        target_model=generator.model[0],
+        assistant_model=None,
+        mesh_device=mesh_device,
+        tt_kv_cache=tt_kv_cache,
+        page_table_torch=page_table,
+        draft_len=K,
+    )
+
+    prompt = os.environ.get(
+        "GEMMA4_SPEC_PROMPT",
+        "Write a detailed technical explanation of how a modern CPU instruction pipeline works. "
+        "Cover fetch, decode, execute, memory access, and writeback in depth, explain hazards and "
+        "forwarding, and give concrete examples throughout.",
+    )
+    in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
+        [prompt], tokenizer, generator.model_args, True, A + 8, max_prefill_len=max_seq_len
+    )
+    in_pt = torch.stack(in_pt).view(1, -1)
+    p0 = prefill_lens[0] - 1
+    t0 = int(encoded[0][p0])
+    anchor_pos = p0 + 1 + A
+
+    def _prefill():
+        generator.prefill_forward_text(
+            in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, warmup_prefill=False
+        )
+
+    def _plain(n_steps, capture=None, stage_last=False):
+        """Plain decode n_steps tokens from the prompt anchor. Returns the token list.
+        Nothing speculative ever touches the cache.
+
+        ``capture`` is a list of step indices whose full logit rows are kept. Step s has
+        cur = p0+s, so it evaluates the SAME (token, position) pair as packed-verify row
+        j when s == A+1+j. Comparing the LOGITS -- not just the argmax -- is what
+        distinguishes a uniform systematic offset across all rows from a row-specific
+        error, and gives the quantity a fix has to drive to zero."""
+        out, tok, cur = [], torch.tensor([[t0]], dtype=torch.int32), torch.tensor([p0], dtype=torch.int32)
+        want = set(capture or [])
+        cap = {}
+        for s in range(n_steps):
+            if stage_last:
+                # Fingerprint ONLY the final step, whose cur == anchor_pos, so it pairs
+                # with packed-verify row 0. Fingerprinting every step would cost a
+                # device->host read per layer per step.
+                from models.demos.gemma4.tt.attention import operations as _ops
+
+                _ops._STAGE_FP = s == n_steps - 1
+                _ops._CUR_STEP = s
+                _ops._CHAIN = "plain"
+            lg, _ = generator.decode_forward(
+                tok, cur, enable_trace=False, page_table=page_table, kv_cache=tt_kv_cache, sampling_params=None
+            )
+            row = torch.as_tensor(lg).reshape(-1).float()
+            if s in want:
+                cap[s] = row.clone()
+            t = int(torch.argmax(row))
+            out.append(t)
+            tok = torch.tensor([[t]], dtype=torch.int32)
+            cur = cur + 1
+        return (out, cap) if capture is not None else out
+
+    # ── ground truth: plain decode past the anchor ────────────────────────────────
+    _prefill()
+    plain, plain_rows = _plain(A + 5, capture=[A + 1, A + 2, A + 3])
+    plain_row2 = plain_rows[A + 3]
+    logger.info(f"  p0={p0}  anchor index A={A}  anchor position={anchor_pos}")
+    logger.info(f"  plain[{A}:{A+5}] = {plain[A:A+5]}")
+
+    tokens = [plain[A], plain[A + 1], plain[A + 2], D3]
+    positions = [anchor_pos + j for j in range(P)]
+    # row j sits at position anchor+j and predicts the token at anchor+j+1, which plain
+    # decode put at plain[A + j].
+    expect = [plain[A + 1 + j] for j in range(P)]
+    logger.info(f"  packed verify tokens={tokens} positions={positions}")
+    logger.info(f"  plain's answer per row  ={expect}   (row 2 is the one under test)")
+
+    # PLAIN's own margin on the contested pair, from the SAME (token, position). If
+    # plain leads by roughly what the packed verify trails by, the two computations are
+    # a fraction of a logit apart and this is a knife-edge tie, not a structural error.
+    _t_ok, _t_bad = expect[2], D3
+    _pt = torch.topk(plain_row2, 2)
+    logger.info(
+        f"  PLAIN @pos {positions[2]}: top1={int(_pt.indices[0])} ({float(_pt.values[0]):.6f}) "
+        f"top2={int(_pt.indices[1])} ({float(_pt.values[1]):.6f}) margin={float(_pt.values[0]-_pt.values[1]):.6f}"
+    )
+    logger.info(
+        f"  PLAIN on the contested pair: logit({_t_ok})={float(plain_row2[_t_ok]):.6f} "
+        f"logit({_t_bad})={float(plain_row2[_t_bad]):.6f} "
+        f"gap={float(plain_row2[_t_ok] - plain_row2[_t_bad]):.6f}  (positive = plain prefers {_t_ok})"
+    )
+
+    def _packed_rows(label):
+        spec._pv_a_prev = -1
+        lh, h = spec._verify(tokens, positions)
+        h.deallocate(True)
+        lh = torch.as_tensor(lh).float()
+        got, margins = [], []
+        for j in range(P):
+            top = torch.topk(lh[j], 2)
+            got.append(int(top.indices[0]))
+            margins.append(float(top.values[0] - top.values[1]))
+        logger.info(f"  [{label}] packed verify rows -> {got}")
+        for j in range(P):
+            mark = "OK " if got[j] == expect[j] else "BAD"
+            # logit of plain's answer, so a wrong row can be read as a near-miss or a
+            # structurally different result.
+            lp = float(lh[j][expect[j]])
+            lg_ = float(lh[j][got[j]])
+            logger.info(
+                f"    [{label}] row {j} @pos {positions[j]}: got {got[j]:6d} expect {expect[j]:6d} {mark}"
+                f"  top1-top2 margin={margins[j]:.6f}"
+                f"  logit(got)={lg_:.6f} logit(expect)={lp:.6f} gap={lg_ - lp:.6f}"
+            )
+        # LOGIT-LEVEL comparison against plain decode at the same (token, position).
+        # A uniform offset across rows points at something structural in the packed
+        # forward; an offset only on row 2 points at something row-specific.
+        for j in range(P - 1):
+            pr = plain_rows.get(A + 1 + j)
+            if pr is None:
+                continue
+            d = (pr - lh[j]).abs()
+            tk = torch.topk(pr, 5)
+            deltas = [(int(t_), round(float(lh[j][t_] - pr[t_]), 6)) for t_ in tk.indices]
+            logger.info(
+                f"    [{label}] row {j} vs PLAIN @pos {positions[j]}: max|diff|={d.max().item():.6f} "
+                f"mean|diff|={d.mean().item():.6f} nonzero={int((d > 0).sum())}/{d.numel()}"
+            )
+            logger.info(f"      [{label}] row {j} packed-minus-plain on plain's top5: {deltas}")
+        return got
+
+    # ── variant A: cache holds ONLY 0..anchor (nothing written beyond it) ─────────
+    _prefill()
+    pa = _plain(A + 1)
+    assert pa == plain[: A + 1], "plain decode is not reproducible across re-prefill"
+    got_a = _packed_rows("A: cache 0..anchor")
+
+    # ── variant B: cache holds 0..anchor+K with PLAIN values, then overwritten ────
+    _prefill()
+    pb, _ = _plain(A + 5, capture=[A + 3])
+    assert pb == plain, "plain decode is not reproducible across re-prefill"
+    got_b = _packed_rows("B: cache prefilled past anchor")
+
+    logger.info("  ─────────────────────────────────────────────────────────────")
+    if got_a[2] == expect[2] and got_b[2] == expect[2]:
+        logger.info("  ROW 2 IS CORRECT on a plain-built cache -> the KV cache difference IS causal")
+    else:
+        logger.info("  ROW 2 IS WRONG on a plain-built cache -> the KV cache is EXONERATED")
+    if got_a != got_b:
+        logger.info(f"  variant A and B DISAGREE ({got_a} vs {got_b}) -> prior slot contents matter")
+
+    # ── STAGE BISECT (GEMMA4_ROW2_STAGE=1) ────────────────────────────────────────
+    # Plain decode's forward at the anchor position vs the packed verify's ROW 0 -- same
+    # token, same position, same cache. _stage_fp stashes the 1-row (plain) chain's row 0
+    # and diffs the P-row (packed) chain's row 0 against it, keyed by (step, layer, tag),
+    # so the FIRST tag that differs is where the two computations part company. Needs
+    # GEMMA4_STAGE_FP=1 and GEMMA4_STAGE_DIFF=1 in the environment.
+    if os.environ.get("GEMMA4_ROW2_STAGE") == "1":
+        from models.demos.gemma4.tt.attention import operations as _ops
+
+        logger.info("  ══ STAGE BISECT: plain decode @anchor vs packed verify ROW 0 ══")
+        _prefill()
+        _ops._STAGE_FP = False
+        _plain(A + 2, stage_last=True)  # final step has cur == anchor_pos
+        _ops._STAGE_FP = True
+        _ops._CUR_STEP = A + 1  # pair with the plain step just fingerprinted
+        _ops._CHAIN = "packed"
+        spec._pv_a_prev = -1
+        _lh, _h = spec._verify(tokens, positions)
+        _h.deallocate(True)
+        _ops._STAGE_FP = False
+        _ops._CHAIN = None
+        logger.info("  ══ end stage bisect ══")
+
+    assert got_a == expect, f"packed verify disagrees with plain decode on a clean cache: {got_a} vs {expect}"

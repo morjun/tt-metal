@@ -495,12 +495,16 @@ def _log_sdpa_call(tag, **kw):
         return
     from loguru import logger as _l
 
+    from models.demos.gemma4.tt.attention import operations as _ops
+
     parts = []
     for k, v in kw.items():
         if hasattr(v, "shape"):
             v = f"shape{tuple(v.shape)}"
         parts.append(f"{k}={v}")
-    _l.info(f"[sdpa-args] {tag}: " + " ".join(parts))
+    # Layer is load-bearing: the divergence is at layer 0 only, and without it the
+    # 35-layer x N-step log cannot be reduced to the one call that matters.
+    _l.info(f"[sdpa-args] L={_ops._CUR_LAYER:02d} {tag:7s}: " + " ".join(parts))
 
 
 def _write_dbg(tag, pos_tensor, k_tensor):

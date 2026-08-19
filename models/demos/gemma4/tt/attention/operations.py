@@ -68,6 +68,14 @@ _STASH = {}
 # across the whole run.
 _STAGE_AT = os.environ.get("GEMMA4_STAGE_AT")
 _STAGE_AT = tuple(int(x) for x in _STAGE_AT.split(":")) if _STAGE_AT else None
+# Explicit chain identity for GEMMA4_STAGE_DIFF. The old rule was "flat.shape[0] == 1 means
+# the reference chain", which is WRONG for every head-width tensor: plain decode's qk_norm /
+# rope / sdpa_q have num_heads rows (8 at tp=1), not 1, so plain was misfiled as the packed
+# chain and those tags either never stashed a reference or diffed plain against plain,
+# producing large bogus deltas. Those are exactly the stages between xqkv_out (bit-identical)
+# and attn_out (first divergence), i.e. the entire remaining search space. The caller now
+# states which chain it is running; None falls back to the old heuristic.
+_CHAIN = None
 
 
 def _stage_gate():
@@ -97,7 +105,8 @@ def _stage_fp(tag, t):
     if os.environ.get("GEMMA4_STAGE_DIFF") == "1":
         key = (_CUR_STEP, _CUR_LAYER, tag)
         cur = row0.float()
-        if flat.shape[0] == 1:
+        _is_ref = (_CHAIN == "plain") if _CHAIN is not None else (flat.shape[0] == 1)
+        if _is_ref:
             _STASH[key] = cur
         elif key in _STASH:
             ref = _STASH[key]
@@ -108,7 +117,10 @@ def _stage_fp(tag, t):
                 f"[diff] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} {tag:14s} "
                 f"differing={len(idx)}/{n} max|d|={dv.max().item():.8f} first_idx={idx[:6]}"
             )
-    _lg.info(f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} rows={flat.shape[0]:4d} {tag:14s} row0_md5={d}{_vals}")
+    _lg.info(
+        f"[stage] s={_CUR_STEP:03d} L={_CUR_LAYER:02d} chain={_CHAIN or '?':6s} rows={flat.shape[0]:4d} "
+        f"shape={tuple(r.shape)} {tag:14s} row0_md5={d}{_vals}"
+    )
 
 
 def _stage_fp_full(tag, t):

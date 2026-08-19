@@ -1777,6 +1777,15 @@ class SpeculativeDecoder:
         H = tr["H"]
         window = tr["window"]
 
+        # GEMMA4_ITER_LOG=1: record every iteration's (anchor, anchor token, drafts,
+        # target argmaxes, accepted count) so the KV WRITE HISTORY of any cache position
+        # can be reconstructed after the run. The packed verify writes c..c+K with
+        # [anchor_tok] + drafts unconditionally (accepted or not), so a position is
+        # written once per iteration whose range covers it. This is what distinguishes
+        # "the same token was written twice and the second write differs" (a numerics
+        # defect) from "the two writes saw different KV context" (expected).
+        self._iter_log = [] if os.environ.get("GEMMA4_ITER_LOG") == "1" else None
+
         first = True
         replay_t0 = time.perf_counter()
         while not all(done):
@@ -1816,7 +1825,43 @@ class SpeculativeDecoder:
                     wi.deallocate(True)
             first = False
 
+            # GEMMA4_REPLAY_SNAP=<pos>: snapshot one cache row immediately BEFORE and AFTER a
+            # single trace replay. Host-side probes inside the traced body are blind -- Python
+            # runs only at capture, not across replays -- so this observes the write from
+            # outside the trace instead, which is the only way to see what the fused path
+            # actually puts at a given position.
+            _snap_pos = os.environ.get("GEMMA4_REPLAY_SNAP")
+            _snap_before = None
+            if _snap_pos is not None and int(_snap_pos) in range(pos[0], pos[0] + P):
+                _sp = int(_snap_pos)
+                _li = int(os.environ.get("GEMMA4_REPLAY_SNAP_LAYER", "1"))
+                _kc = self.target.tt_kv_cache[_li][0]
+                # block SIZE from the cache shape [num_blocks, nkv, block_size, head_dim].
+                # (_pv_blk is the block COUNT and is only set by _pv_setup, which the fused
+                # path does not call.)
+                _blk = int(_kc.shape[2])
+                _pt_row = self.page_table_torch[0]
+                _b, _o = int(_pt_row[_sp // _blk]), _sp % _blk
+
+                def _read_row():
+                    _t = ttnn.to_torch(ttnn.get_device_tensors(_kc)[0]).float()
+                    return _t[_b, 0, _o].clone()
+
+                _snap_before = _read_row()
+
             ttnn.execute_trace(self.mesh_device, tr["id"], cq_id=0, blocking=self._trace_blocking)
+
+            if _snap_before is not None:
+                from loguru import logger as _sl
+
+                _after = _read_row()
+                _d = (_after - _snap_before).abs()
+                _sl.info(
+                    f"[replay-snap] pos={_snap_pos} layer={_li} anchor={pos[0]} "
+                    f"changed={int((_d > 0).sum())}/{_d.numel()} max|d|={_d.max().item():.8f}"
+                )
+                _sl.info(f"[replay-snap]   before first6={[round(float(x), 6) for x in _snap_before[:6]]}")
+                _sl.info(f"[replay-snap]   after  first6={[round(float(x), 6) for x in _after[:6]]}")
 
             vx = (
                 ttnn.to_torch(ttnn.get_device_tensors(tr["verify_x"])[0])
@@ -1842,6 +1887,20 @@ class SpeculativeDecoder:
                         f"vx_row0={int(vx[b * P])} drafts={drafts} target_g={g} m={m}"
                     )
                 committed = drafts[:m] + [g[m]]
+                if self._iter_log is not None:
+                    self._iter_log.append(
+                        {
+                            "b": b,
+                            "it": len(accepts[b]),
+                            "anchor": pos[b],
+                            "anchor_tok": toks[b],
+                            "drafts": list(drafts),
+                            "g": list(g),
+                            "m": m,
+                            "committed": list(committed),
+                            "done": done[b],
+                        }
+                    )
                 # Route through _fused_shift_seed_row instead of hardcoding m+1. The
                 # hardcoded row was the SHIFT seed (hidden at p+m+1) while
                 # _fused_shift_seed already defaults to "current" (row m) -- so this
