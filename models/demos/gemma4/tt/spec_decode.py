@@ -136,6 +136,8 @@ class SpeculativeDecoder:
         # mesh-deadlock case described in generate(). Only the PLI host-loop path
         # consults this (every other traced path fuses draft+verify into one trace).
         self._trace_draft = os.environ.get("GEMMA4_SPEC_TRACE_DRAFT", "0") == "1"
+        # Validated in generate(), not here: _use_trace is set by the demo AFTER
+        # construction, so the dangerous combination is not yet knowable at this point.
         # Drain the queue when switching between distinct traces (see _trace_barrier).
         self._trace_sync = os.environ.get("GEMMA4_SPEC_TRACE_SYNC", "0") == "1"
         # GEMMA4_SPEC_TRACE_VERIFY=0 runs the packed verify EAGERLY while still
@@ -2027,6 +2029,59 @@ class SpeculativeDecoder:
             anchor_h[b].deallocate(True)
         return outs, accepts
 
+    # ── ONE TRACE. NEVER TWO. ────────────────────────────────────────────────
+    #: Escape hatch for deliberately reproducing the hang (e.g. for a tt-metal bug
+    #: report). Setting it WILL wedge the board; recovery needs `tt-smi -r`.
+    _ALLOW_TWO_TRACES_ENV = "GEMMA4_ALLOW_TRACE_ALTERNATION_HANG"
+
+    def _assert_single_trace(self):
+        """Refuse a traced drafter alongside a traced verify.
+
+        Two distinct traces alternating on one command queue HANGS the mesh: the first
+        pure replay of the verify trace following a draft replay never returns, the board
+        wedges, and every later run fails with `Read 0xffffffff over PCIe` until
+        `tt-smi -r`. This is settled, not open -- e7ed645a170 (2026-08-04) characterised it
+        and ruled out every fix by measurement: synchronize_device at both switch points,
+        blocking replay, a 900 MB trace region, a separate command queue (hangs EARLIER),
+        and capturing both traces before any replay. It is not CCL-related; at tp=1 zero
+        CCL ops are emitted and it still hangs. The watcher shows every core idle at `GW`
+        with no fault, i.e. a launch-message desync in tt-metal's trace/dispatch layer.
+        No model-level workaround exists.
+
+        **The fused single-trace iteration exists precisely because of this.** It captures
+        the K drafter steps AND the packed verify in ONE trace, so the alternation cannot
+        occur by construction; that is its primary design reason, not the throughput win.
+
+        Supported configurations are exactly:
+          * GEMMA4_SPEC_FUSED_PLI_DEV=1  -> the fused single trace  (DEFAULT, preferred)
+          * traced verify + EAGER drafter                            (host-loop fallback)
+          * fully eager
+        """
+        if not (self._use_trace and self._trace_draft and self._trace_verify):
+            return
+        if os.environ.get(self._ALLOW_TWO_TRACES_ENV) == "1":
+            from loguru import logger as _lg
+
+            _lg.error(
+                f"{self._ALLOW_TWO_TRACES_ENV}=1: running the KNOWN-HANGING two-trace "
+                "configuration on purpose. The board will need `tt-smi -r`."
+            )
+            return
+        raise RuntimeError(
+            "REFUSED: traced drafter + traced verify is the two-alternating-traces HANG.\n"
+            "\n"
+            "  GEMMA4_SPEC_TRACE_DRAFT=1 with a traced verify wedges the board "
+            "(`Read 0xffffffff over PCIe`); recovery requires `tt-smi -r`.\n"
+            "  Characterised in e7ed645a170 (2026-08-04); every fix ruled out by measurement.\n"
+            "\n"
+            "  Use instead:\n"
+            "    GEMMA4_SPEC_FUSED_PLI_DEV=1   the fused single trace (default, fastest)\n"
+            "    GEMMA4_SPEC_TRACE_DRAFT=0     traced verify + eager drafter\n"
+            "    GEMMA4_SPEC_TRACE_VERIFY=0    traced drafter + eager verify\n"
+            "\n"
+            f"  To reproduce the hang deliberately, set {self._ALLOW_TWO_TRACES_ENV}=1."
+        )
+
     def generate(
         self, anchor_token, anchor_pos, max_new_tokens, anchor_hidden=None, temperature=0.0, top_p=1.0, top_k=0
     ):
@@ -2088,6 +2143,8 @@ class SpeculativeDecoder:
                 # tracing only it captures most of the win at no risk.
                 # GEMMA4_SPEC_TRACE_DRAFT=1 opts into the traced drafter to A/B it.
                 self._trace_draft = os.environ.get("GEMMA4_SPEC_TRACE_DRAFT", "0") == "1"
+                # ONE TRACE. NEVER TWO. Refuse before any device work happens.
+                self._assert_single_trace()
 
         # NOTE the `not greedy` guard below, and why it is load-bearing.
         #
@@ -2161,6 +2218,7 @@ class SpeculativeDecoder:
         owns_anchor_hidden = (anchor_hidden is None) and not traced
         if anchor_hidden is None:
             anchor_hidden = self.seed(anchor_token, anchor_pos)
+        self._assert_single_trace()  # ONE TRACE. NEVER TWO. (see the method docstring)
         draft_fn = self._draft_traced if (self._use_trace and self._trace_draft) else self._draft
         # GEMMA4_SPEC_PROFILE=1 accumulates wall-clock per phase. Worth having
         # permanently: traced and untraced measured within 0.5% of each other at
