@@ -329,6 +329,33 @@ def test_sharded_l1_weight(mesh_device, reset_seeds):
                 f"[shard]    g gather, in1 DRAM int {us_g if us_g is None else f'{us_g:8.2f} us'}  pcc={pcc_g}  {_rel(us_g)}"
             )
 
+            # i: SAME gather_in0 dataflow as e and g, but the weight is L1
+            # INTERLEAVED — i.e. resident in SRAM but striped over all 110 cores,
+            # so a compute core reads most of it over the NoC from a NEIGHBOUR's L1.
+            # This is the arm that would separate "SRAM locality" from "SRAM at all":
+            #   e = local L1   |   i = remote L1   |   g = DRAM
+            # If it FATALs, the separation is not expressible under the ring and the
+            # e/g delta cannot be attributed to locality-vs-bandwidth by this test.
+            def build_i():
+                x = _sharded(mesh_device, x_t, ttnn.BufferType.L1, grid, [M, K // cores])
+                w = l1i(w_t)
+                return [x, w], (
+                    lambda: ttnn.linear(
+                        x, w, program_config=pc1d(Kt_per_core, mcast=False, gather=True), memory_config=out_mc
+                    )
+                )
+
+            us_i, pcc_i = _try(mesh_device, build_i, gold)
+            logger.info(
+                f"[shard]    i gather, in1 L1 int   {us_i if us_i is None else f'{us_i:8.2f} us'}  pcc={pcc_i}  {_rel(us_i)}"
+            )
+            if us_i is None:
+                logger.info("[shard]    >>> arm i UNSUPPORTED: ring forbids an L1-INTERLEAVED weight")
+            elif us_e is not None and us_g is not None:
+                logger.info(
+                    f"[shard]    >>> remote-vs-local L1: i/e = {us_i/us_e:.3f} | remote-vs-DRAM: i/g = {us_i/us_g:.3f}"
+                )
+
             if us_e is not None and us_g is not None:
                 logger.info(
                     f"[shard]    >>> SRAM locality effect at fixed dataflow: e/g = {us_e/us_g:.3f} "
