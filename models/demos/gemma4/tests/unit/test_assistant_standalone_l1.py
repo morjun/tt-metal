@@ -78,6 +78,10 @@ _needs_assistant = pytest.mark.skipif(not ASSISTANT_PATH, reason="set GEMMA4_ASS
 
 BLOCK_SIZE = 64
 DEFAULT_CONTEXT = 512
+#: Timer SAMPLE COUNT — how many times a captured trace is REPLAYED, not how much
+#: work is in it (that is K). 50 replays of a ~1.2 ms iteration is ~60 ms of wall,
+#: comfortably above host-timer granularity and cheap enough to run per arm. Nothing
+#: derives the 50; 30 is noisier, 100 is slower, both are correct.
 TRACE_REPS = 50
 
 
@@ -2568,7 +2572,11 @@ def test_second_gather_alternatives(mesh_device, reset_seeds):
 
 @_needs_assistant
 @parametrize_mesh_with_fabric(
-    mesh_shapes=[(1, 2)],
+    # (1,1) added 2026-08-25: the plan prefers tp=1, and nothing in this A/B needs two
+    # devices — the drafter derives tp from the mesh and CCL degenerates to a no-op at
+    # tp=1. At tp=1 the per-device weights are FULL width, so the same MB budget pins a
+    # different fraction; that is the point of running both.
+    mesh_shapes=[(1, 1), (1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
 def test_fused_k_step_dram_vs_l1(mesh_device, reset_seeds):
