@@ -51,7 +51,35 @@ def _env_on(name):
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _largest_divisor(n, cap=8):
+def _block_cap():
+    """Ceiling on ``in0_block_w``. Default 8; ``GEMMA4_MM_BLOCK_CAP`` overrides.
+
+    The 8 is a heuristic, not a ttnn rule — the only hard constraints are
+    ``Kt % in0_block_w == 0`` and, for a width-sharded in0,
+    ``in0_shard_width_tiles % in0_block_w == 0``. MEASURED isolated on
+    pre_projection 3072x256 (MEASUREMENT_RECORD.md 9d): the cap costs **-31.3%**
+    with a pinned weight (6 -> 12) and **-35.2%** on the all-interleaved default
+    (8 -> 32). It is left at 8 because raising it is NOT free:
+
+      * the CBs grow linearly (in0 CB = in0_block_w x 2 tiles, and the in1 CB
+        matches it when the weight is interleaved), so blk=48 wants 384 KB/core
+        against a ~320 KB budget and collides with weight pinning;
+      * it is NOT bit-neutral — reblocking changes the K accumulation order, so
+        it moves generated tokens and therefore drafter acceptance, exactly like
+        the tuner itself (see ``from_env``'s caveat).
+
+    Note the scope: with ``GEMMA4_TUNE_MATMULS`` unset the tuner runs on the
+    TARGET only (``DEFAULT_SCOPES``), so changing this knob moves the 35-layer
+    target by default and the drafter only when the tuner is force-enabled.
+    """
+    try:
+        return max(1, int(os.getenv("GEMMA4_MM_BLOCK_CAP", "8")))
+    except ValueError:
+        return 8
+
+
+def _largest_divisor(n, cap=None):
+    cap = _block_cap() if cap is None else cap
     for d in range(min(n, cap), 0, -1):
         if n % d == 0:
             return d
@@ -99,7 +127,7 @@ def derive_decode_1d_config(m, k, n, max_x=8, max_y=8, in0_shard_tiles=None):
         return None
     blk = _largest_divisor(kt)
     if in0_shard_tiles:
-        blk = _largest_divisor(in0_shard_tiles, cap=min(8, in0_shard_tiles))
+        blk = _largest_divisor(in0_shard_tiles, cap=min(_block_cap(), in0_shard_tiles))
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
         in0_block_w=blk,
