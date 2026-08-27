@@ -28,6 +28,7 @@ most likely a malformed shard spec on our side rather than a ttnn defect, but it
 was not chased down.
 """
 
+import os
 import time
 
 import torch
@@ -661,7 +662,23 @@ def test_in0_block_w_cap_sweep(mesh_device, reset_seeds):
     """
     torch.manual_seed(0)
     T = ttnn.TILE_SIZE
-    M, K, N = 32, 3072, 256
+    # tp=1 drafter shapes whose Kt > 8, i.e. the ones the cap actually binds.
+    # GEMMA4_CAP_SWEEP_SHAPE picks one; default sweeps all three.
+    _SHAPES = {
+        "pre_projection": (32, 3072, 256),
+        "down_proj": (32, 2048, 256),
+        "o_proj": (32, 1024, 256),
+    }
+    _pick = os.getenv("GEMMA4_CAP_SWEEP_SHAPE")
+    for _name, (M, K, N) in _SHAPES.items():
+        if _pick and _pick != _name:
+            continue
+        logger.info(f"[cap] ############ {_name} {K}x{N} ############")
+        _sweep_one(mesh_device, M, K, N, _name)
+
+
+def _sweep_one(mesh_device, M, K, N, shape_name):
+    T = ttnn.TILE_SIZE
     Mt, Kt, Nt = M // T, K // T, N // T
     gx, gy = _pick_grid(Nt)  # model's grid: from Nt alone -> 8x1
     cores = gx * gy
