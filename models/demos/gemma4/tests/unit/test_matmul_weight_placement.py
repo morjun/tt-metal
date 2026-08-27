@@ -639,3 +639,103 @@ def test_target_shapes_l1_weight(mesh_device, reset_seeds):
             f"(if EVERYTHING fit: -{(tot_d-tot_l)/1000:.2f} ms)"
         )
         logger.info(f"[tp={tp}] greedy fill of {budget:.0f} MB usable L1: used {used:.1f} MB -> saves {got:.0f} us")
+
+
+# ── does _largest_divisor's cap=8 cost us barriers? sweep in0_block_w ─────────
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_in0_block_w_cap_sweep(mesh_device, reset_seeds):
+    """Sweep in0_block_w past the tuner's cap=8, on pre_projection.
+
+    `matmul_tuning._largest_divisor(n, cap=8)` clamps in0_block_w to 8. Nothing in
+    ttnn requires that: the only rules are `Kt % in0_block_w == 0` and, for a
+    width-sharded in0, `W % in0_block_w == 0`. At pre_projection (Kt=96) with the
+    activation sharded over 8 cores (W=12) the cap forces 6 where 12 is legal,
+    which is 16 K-blocks instead of 8. This measures whether removing the clamp
+    would actually pay, and where it stops paying.
+
+    Three arms, each sweeping every LEGAL in0_block_w for its layout. The in0
+    reshard is built outside the timed region (as in arm e), so this isolates the
+    blocking, not the cost of getting there.
+    """
+    torch.manual_seed(0)
+    T = ttnn.TILE_SIZE
+    M, K, N = 32, 3072, 256
+    Mt, Kt, Nt = M // T, K // T, N // T
+    gx, gy = _pick_grid(Nt)  # model's grid: from Nt alone -> 8x1
+    cores = gx * gy
+    grid = _grid_set(gx, gy)
+    per_core_N = Nt // cores
+    W_TILES = Kt // cores  # activation sharded over the same 8 cores -> 12
+
+    x_t = torch.randn(1, 1, M, K).bfloat16()
+    w_t = torch.randn(1, 1, K, N).bfloat16()
+    gold = x_t.float() @ w_t.float()
+
+    def pc(blk):
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=Mt,
+            per_core_N=per_core_N,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+
+    out_mc = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(grid, [M, N // cores], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+
+    def dram(t):
+        return ttnn.from_torch(
+            t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+
+    all_div = [d for d in range(1, Kt + 1) if Kt % d == 0]
+    w_div = [d for d in range(1, W_TILES + 1) if W_TILES % d == 0]
+
+    arms = [
+        ("A  in0 DRAM-int  / in1 DRAM-int", all_div, False, False),
+        ("B  in0 L1-shard  / in1 DRAM-int", w_div, True, False),
+        ("C  in0 L1-shard  / in1 L1-shard", w_div, True, True),
+    ]
+    tile_b = T * T * 2  # bf16
+    for label, divs, shard_in0, shard_in1 in arms:
+        logger.info(
+            f"[cap] === {label} | K={K} N={N} Kt={Kt} grid {gx}x{gy}={cores} per_core_N={per_core_N}"
+            + (f" W={W_TILES}" if shard_in0 else "")
+        )
+        base = None
+        for blk in divs:
+
+            def build(b=blk, si0=shard_in0, si1=shard_in1):
+                x = _sharded(mesh_device, x_t, ttnn.BufferType.L1, grid, [M, K // cores]) if si0 else dram(x_t)
+                w = _sharded(mesh_device, w_t, ttnn.BufferType.L1, grid, [K, N // cores]) if si1 else dram(w_t)
+                mc = out_mc if si1 else None
+                kw = {"memory_config": mc} if mc is not None else {}
+                return [x, w], (lambda: ttnn.linear(x, w, program_config=pc(b), **kw))
+
+            us, pcc = _try(mesh_device, build, gold)
+            if us is None:
+                logger.info(f"[cap]   in0_block_w={blk:>3}  blocks={Kt//blk:>3}  FAILED: {pcc}")
+                continue
+            if base is None:
+                base = us
+            in0_cb = blk * 2 * tile_b / 1024
+            in1_cb = (per_core_N * Kt if shard_in1 else per_core_N * blk * 2) * tile_b / 1024
+            star = (
+                "  <- tuner picks this"
+                if blk == min(8, (W_TILES if shard_in0 else Kt))
+                or (shard_in0 and blk == max(d for d in divs if d <= 8))
+                else ""
+            )
+            logger.info(
+                f"[cap]   in0_block_w={blk:>3}  blocks={Kt//blk:>3}  {us:8.2f} us  {(us-base)/base*100:+6.1f}%"
+                f"  CB in0={in0_cb:5.0f}KB in1={in1_cb:5.0f}KB  pcc={pcc:.5f}{star}"
+            )
