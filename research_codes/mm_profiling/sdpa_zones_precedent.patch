@@ -1,0 +1,228 @@
+diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+index 1f3c8576e45..ee74620f48e 100644
+--- a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
++++ b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+@@ -22,6 +22,18 @@
+ #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
+ #include "ttnn/operations/transformer/sdpa/device/kernels/compute/compute_common.hpp"
+ #include "api/compute/pack_untilize.h"
++
++// Profiling-only scaffolding: guarded behind SDPA_PROFILE_ZONES. To DISABLE, comment out the
++// #define below (SDPA_ZONE becomes empty, build byte-identical). The build-key hash does not
++// include kernel source, so after toggling this you MUST wipe ~/.cache/tt-metal-cache/.
++#define SDPA_PROFILE_ZONES 1  // PROFILING SCAFFOLDING — comment out + `rm -rf ~/.cache/tt-metal-cache` to disable
++#if defined(SDPA_PROFILE_ZONES)
++#include "tools/profiler/kernel_profiler.hpp"
++#define SDPA_ZONE(name) DeviceZoneScopedN(name)
++#else
++#define SDPA_ZONE(name)
++#endif
++
+ constexpr uint32_t MAX_PACK_UNTILIZE_WIDTH = 8;
+ #include "ttnn/kernel_lib/tilize_helpers.hpp"
+ #include "ttnn/kernel_lib/untilize_helpers.hpp"
+@@ -323,6 +335,7 @@ void kernel_main() {
+ 
+         // Loop through all K chunks
+         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
++            SDPA_ZONE("CMP_CHUNK");  // per-chunk compute envelope (TRISC) for read/compute overlay
+             // Reconfig register DF
+             reconfig_data_format(cb_k_in, cb_q_in);
+             pack_reconfig_data_format(cb_qk_im);
+@@ -344,23 +357,26 @@ void kernel_main() {
+                     mask_cb_to_use = cb_sliding_window_mask_in;  // Use sliding window mask buffer
+                 }
+ 
+-                matmul_blocks(
+-                    cb_q_in,
+-                    cb_k_in,
+-                    cb_qk_im,
+-                    Sq_chunk_t,
+-                    Sk_chunk_t_dynamic,
+-                    DHt,
+-                    qk_num_blocks,
+-                    qk_in0_num_subblocks_dynamic,
+-                    qk_in1_num_subblocks_dynamic,
+-                    qk_in0_block_w,
+-                    qk_subblock_h_dynamic,
+-                    qk_subblock_w_dynamic,
+-                    true,
+-                    add_mask_fusion,
+-                    mask_cb_to_use,
+-                    cb_zero_in);
++                {
++                    SDPA_ZONE("QK_MM");  // FPU: QK^T matmul
++                    matmul_blocks(
++                        cb_q_in,
++                        cb_k_in,
++                        cb_qk_im,
++                        Sq_chunk_t,
++                        Sk_chunk_t_dynamic,
++                        DHt,
++                        qk_num_blocks,
++                        qk_in0_num_subblocks_dynamic,
++                        qk_in1_num_subblocks_dynamic,
++                        qk_in0_block_w,
++                        qk_subblock_h_dynamic,
++                        qk_subblock_w_dynamic,
++                        true,
++                        add_mask_fusion,
++                        mask_cb_to_use,
++                        cb_zero_in);
++                }
+ 
+                 /* QK += MASK */
+                 // Apply block padding mask for every chunk when block_size < TILE_HEIGHT.
+@@ -435,23 +451,26 @@ void kernel_main() {
+                 /* OUT_IM = QK @ V_CHUNK */
+                 reconfig_data_format(cb_v_in, cb_qk_im);  // DEBUG
+                 pack_reconfig_data_format(cb_out_im);
+-                matmul_blocks(
+-                    cb_qk_im,
+-                    cb_v_in,
+-                    cb_out_mm,
+-                    Sq_chunk_t,
+-                    vDHt,
+-                    Sk_chunk_t_dynamic,
+-                    out_num_blocks_dynamic,
+-                    out_in0_num_subblocks,
+-                    out_in1_num_subblocks,
+-                    out_in0_block_w_dynamic,
+-                    out_subblock_h,
+-                    out_subblock_w,
+-                    false /*transpose*/,
+-                    false,
+-                    cb_mask_in,
+-                    cb_zero_in);
++                {
++                    SDPA_ZONE("PV_MM");  // FPU: scores @ V matmul
++                    matmul_blocks(
++                        cb_qk_im,
++                        cb_v_in,
++                        cb_out_mm,
++                        Sq_chunk_t,
++                        vDHt,
++                        Sk_chunk_t_dynamic,
++                        out_num_blocks_dynamic,
++                        out_in0_num_subblocks,
++                        out_in1_num_subblocks,
++                        out_in0_block_w_dynamic,
++                        out_subblock_h,
++                        out_subblock_w,
++                        false /*transpose*/,
++                        false,
++                        cb_mask_in,
++                        cb_zero_in);
++                }
+ 
+                 // Reconfig register DF
+                 reconfig_data_format_srca(cb_out_im);
+diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+index 6cba9f9d708..ef6d199d973 100644
+--- a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
++++ b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+@@ -14,6 +14,17 @@
+ #include "api/tensor/noc_traits.h"
+ #include <vector>
+ #include "../../../../sdpa/device/kernels/dataflow/dataflow_common.hpp"
++
++// Profiling-only scaffolding: guarded behind SDPA_PROFILE_ZONES. To DISABLE, comment out the
++// #define below (SDPA_ZONE becomes empty, build byte-identical). The build-key hash does not
++// include kernel source, so after toggling this you MUST wipe ~/.cache/tt-metal-cache/.
++#define SDPA_PROFILE_ZONES 1  // PROFILING SCAFFOLDING — comment out + `rm -rf ~/.cache/tt-metal-cache` to disable
++#if defined(SDPA_PROFILE_ZONES)
++#include "tools/profiler/kernel_profiler.hpp"
++#define SDPA_ZONE(name) DeviceZoneScopedN(name)
++#else
++#define SDPA_ZONE(name)
++#endif
+ /******************************************************************************
+  *                                                                             *
+  *                   Common Functions for Dataflow Kernels                     *
+@@ -622,6 +633,7 @@ uint32_t read_k(
+     volatile tt_l1_ptr uint32_t* page_table_ptr_u32,
+     uint32_t& barrier_count,
+     const KMcastParams& mcast_params = {}) {
++    SDPA_ZONE("RD_K");  // NCRISC: whole per-chunk K read (paged read_k path)
+     Noc noc;
+     CircularBuffer cb_k(cb_k_in);
+     cb_k.reserve_back(k_chunk_tiles);
+@@ -754,6 +766,7 @@ void read_v(
+     uint32_t& barrier_count,
+     uint32_t k_base_read_ptr = 0,
+     uint32_t k_tile_bytes = 0) {
++    SDPA_ZONE("RD_V");  // NCRISC: whole per-chunk V read (paged read_v path)
+     Noc noc;
+     CircularBuffer cb_v(cb_v_in);
+     cb_v.reserve_back(v_chunk_tiles);
+@@ -849,25 +862,30 @@ void read_kv_mask_chunks(
+ 
+     uint32_t barrier_count = 0;
+     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
++        SDPA_ZONE("RD_CHUNK");  // NCRISC: whole per-chunk K+mask+V read
+         // Read K chunk transposed
+         cb_k.reserve_back(k_chunk_tiles);
+         uint32_t k_write_ptr = cb_k.get_write_ptr();
+         uint32_t k_base_read_ptr = k_write_ptr;
+         barrier_count = 0;
+-        for (uint32_t col = 0; col < DHt; ++col) {
+-            uint32_t k_tile_id = k_start_tile_id + col;
+-            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+-                noc.async_read(k_reader, CoreLocalMem<uint32_t>(k_write_ptr), k_tile_bytes, {.page_id = k_tile_id}, {});
+-                if (++barrier_count == barrier_threshold) {
+-                    noc.async_read_barrier();
+-                    barrier_count = 0;
++        {
++            SDPA_ZONE("RD_K");  // NCRISC: whole per-chunk K read + barrier
++            for (uint32_t col = 0; col < DHt; ++col) {
++                uint32_t k_tile_id = k_start_tile_id + col;
++                for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
++                    noc.async_read(
++                        k_reader, CoreLocalMem<uint32_t>(k_write_ptr), k_tile_bytes, {.page_id = k_tile_id}, {});
++                    if (++barrier_count == barrier_threshold) {
++                        noc.async_read_barrier();
++                        barrier_count = 0;
++                    }
++                    k_tile_id += DHt;
++                    k_write_ptr += k_tile_bytes;
+                 }
+-                k_tile_id += DHt;
+-                k_write_ptr += k_tile_bytes;
+             }
++            noc.async_read_barrier();
++            cb_k.push_back(k_chunk_tiles);
+         }
+-        noc.async_read_barrier();
+-        cb_k.push_back(k_chunk_tiles);
+ 
+         if constexpr (use_attention_mask) {
+             mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
+@@ -875,6 +893,8 @@ void read_kv_mask_chunks(
+         }
+ 
+         // Read V chunk (transpose of K), from K's L1 buffer
++        {
++            SDPA_ZONE("RD_V");  // NCRISC: whole per-chunk V read + barrier
+         if constexpr (reuse_k) {
+             cb_v.reserve_back(v_chunk_tiles);
+             uint32_t v_write_ptr = cb_v.get_write_ptr();
+@@ -917,6 +937,7 @@ void read_kv_mask_chunks(
+         }
+         noc.async_read_barrier();
+         cb_v.push_back(v_chunk_tiles);
++        }  // end RD_V zone
+ 
+         // Update the starting tile id for next iteration
+         k_start_tile_id += k_chunk_tiles;
+diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+index 2be08c66bdc..c93fb6e037e 100644
+--- a/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
++++ b/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+@@ -293,6 +293,7 @@ void kernel_main() {
+ 
+         if constexpr (is_paged_attention) {
+             for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
++                SDPA_ZONE("RD_CHUNK");  // NCRISC: whole per-chunk K+mask+V read (paged path)
+                 const uint32_t k_chunk_start_row_num = k_chunk * Sk_chunk_t_dynamic;
+                 uint64_t k_base_read_ptr;
+ 
