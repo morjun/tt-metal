@@ -244,6 +244,30 @@ class Gemma4ModelArgs:
         return cache_path
 
 
+def _cme_top_k(hf_config):
+    """CME head's top-k, with a ``GEMMA4_CME_TOPK`` override for sweeping it.
+
+    ``k`` is the ONLY free knob in the CME head. ``num_centroids`` is not: the
+    centroid matrix and the token-ordering table both come straight out of the
+    checkpoint (``masked_embedding.centroids.weight`` /
+    ``masked_embedding.token_ordering``), so changing it would need a different
+    checkpoint, not a different config.
+
+    ``k`` sets ``num_candidates = k * (vocab_size / num_centroids)``, so it scales
+    ``ttnn.topk`` (linear in k) AND the candidate-sized tail ops. It is NOT
+    bit-neutral: a smaller candidate set can exclude the true argmax, so any sweep
+    must report accepted-``m`` beside the timing.
+    """
+    k = int(getattr(hf_config, "centroid_intermediate_top_k", 32))
+    override = os.getenv("GEMMA4_CME_TOPK")
+    if override:
+        k = int(override)
+        if k < 1:
+            raise ValueError(f"GEMMA4_CME_TOPK must be >= 1, got {k}")
+        logger.info(f"[cme] top_k overridden by GEMMA4_CME_TOPK: {k}")
+    return k
+
+
 @dataclass
 class Gemma4AssistantArgs:
     """Model args for a Gemma4 ``it-assistant`` MTP/EAGLE drafter.
@@ -279,7 +303,7 @@ class Gemma4AssistantArgs:
             backbone_hidden_size=int(hf_config.backbone_hidden_size),
             use_ordered_embeddings=bool(getattr(hf_config, "use_ordered_embeddings", False)),
             num_centroids=int(getattr(hf_config, "num_centroids", 2048)),
-            centroid_intermediate_top_k=int(getattr(hf_config, "centroid_intermediate_top_k", 32)),
+            centroid_intermediate_top_k=_cme_top_k(hf_config),
         )
 
     @staticmethod
