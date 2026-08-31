@@ -2824,8 +2824,16 @@ def test_profile_eager_step(mesh_device, reset_seeds):
     by tracing; only host dispatch is.
     """
     arm = os.getenv("GEMMA4_L1_ARM", "dram").strip().lower()
-    rig = _build_standalone(mesh_device, "l1" if arm == "l1" else "dram")
+    if arm not in ("dram", "l1", "l1_sharded"):
+        raise ValueError(f"GEMMA4_L1_ARM must be dram | l1 | l1_sharded, got {arm!r}")
+    rig = _build_standalone(mesh_device, arm)
     logger.info(f"[profile] arm={arm} pinned={rig['placement'].summary()['l1_bytes']/(1<<20):.2f} MB/device")
+    # Report what the weights ACTUALLY became, not what the arm was called: an arm
+    # name is a request, and _build_standalone force-enables the tuner for sharded
+    # (:266). Read it back off the tensors so the profile is self-describing.
+    for owner, attr, label in _weight_slots(rig["assistant"])[:3]:
+        mc = getattr(owner, attr).memory_config()
+        logger.info(f"[profile]   {label}: {mc.buffer_type.name} {mc.memory_layout.name}")
     for _ in range(5):
         lg, hn = rig["assistant"].step(*_step_args(rig))
         ttnn.synchronize_device(mesh_device)

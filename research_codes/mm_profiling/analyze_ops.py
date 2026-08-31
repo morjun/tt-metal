@@ -48,8 +48,18 @@ def _f(v):
         return None
 
 
-def load(path):
+def load(path, device=None):
     rows = list(csv.DictReader(open(path)))
+    # A multi-device run interleaves every device's ops in one CSV, which breaks the
+    # constant-stride rep detection below. Analyse one device at a time; per-core
+    # durations are per device anyway, so this loses nothing.
+    devs = sorted({r.get("DEVICE ID") for r in rows if r.get("DEVICE ID") is not None})
+    if len(devs) > 1:
+        pick = device if device is not None else devs[0]
+        if pick not in devs:
+            sys.exit(f"{path}: DEVICE ID {pick!r} not present; have {devs}")
+        rows = [r for r in rows if r.get("DEVICE ID") == pick]
+        print(f"  multi-device run: devices {devs}, analysing DEVICE ID {pick} ({len(rows)} rows)")
     if not rows:
         sys.exit(f"{path}: empty")
     if DUR not in rows[0]:
@@ -132,9 +142,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--top", type=int, default=20, help="how many ops to list in the hot list")
+    ap.add_argument("--device", default=None, help="DEVICE ID to analyse (multi-device runs); default: the lowest")
     args = ap.parse_args()
 
-    rows = load(args.csv)
+    rows = load(args.csv, args.device)
     start, period, reps = find_period(rows)
     setup = start
     print(f"{args.csv}")
