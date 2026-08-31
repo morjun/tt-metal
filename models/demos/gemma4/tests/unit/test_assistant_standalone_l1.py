@@ -1126,7 +1126,10 @@ def test_same_build_placement_ab(mesh_device, reset_seeds):
 
 @_needs_assistant
 @parametrize_mesh_with_fabric(
-    mesh_shapes=[(1, 2)],
+    # 1x1 added 2026-08-31: tp is derived (`tp = mesh_device.shape[1] if num_devices > 1 else 1`),
+    # so 1x2-only was a decorator choice, not a requirement. The tp=1 arm is what separates the
+    # pinning regression from CCL -- at tp=1 there are no CCL ops at all.
+    mesh_shapes=[(1, 1), (1, 2)],
     device_params_extra={"trace_region_size": int(os.getenv("GEMMA4_TRACE_REGION_SIZE", 400_000_000))},
 )
 def test_per_matmul_ledger(mesh_device, reset_seeds):
