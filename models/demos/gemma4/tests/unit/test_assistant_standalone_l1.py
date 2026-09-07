@@ -82,7 +82,10 @@ DEFAULT_CONTEXT = 512
 #: work is in it (that is K). 50 replays of a ~1.2 ms iteration is ~60 ms of wall,
 #: comfortably above host-timer granularity and cheap enough to run per arm. Nothing
 #: derives the 50; 30 is noisier, 100 is slower, both are correct.
-TRACE_REPS = 50
+TRACE_REPS = int(os.getenv("GEMMA4_TRACE_REPS", "50"))
+#: Lowering it is how a TRACED run is made short enough to fit the device profiler's DRAM
+#: buffer (~1461 program launches). At 2, one arm is 2 x K x 167 = ~1002 launches and fits;
+#: at the default 50 any traced capture truncates at 0.24%. See MEASUREMENT_RECORD.md 6.26.
 
 
 class _TargetStub:
@@ -1179,6 +1182,18 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
         ("post_projection", 1, 48),
         ("cme_centroids", 1, 64),
     ]
+    only = (os.getenv("GEMMA4_LEDGER_ONLY") or "").strip()
+    if only:
+        # Restrict the sweep to named classes. Needed to make a TRACED run short enough
+        # for the device profiler's DRAM buffer (~1461 launches); the full 8-class sweep
+        # is ~601k. MEASUREMENT_RECORD.md 6.26.
+        want = {c.strip() for c in only.split(",") if c.strip()}
+        unknown = want - {c[0] for c in classes}
+        if unknown:
+            raise ValueError(f"GEMMA4_LEDGER_ONLY: unknown classes {sorted(unknown)}")
+        classes = [c for c in classes if c[0] in want]
+        logger.info(f"[ledger2] restricted to {sorted(want)} (GEMMA4_LEDGER_ONLY)")
+
     if _env_on("GEMMA4_LEDGER_REVERSE"):
         classes = list(reversed(classes))
         logger.info("[ledger2] sweep order REVERSED (GEMMA4_LEDGER_REVERSE)")
