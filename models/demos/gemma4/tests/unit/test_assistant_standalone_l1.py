@@ -2896,6 +2896,16 @@ def test_trace_command_stream_size(mesh_device, reset_seeds):
     if n_ops:
         progs = k * n_ops
         logger.info(f"[tracecmd] programs={progs}  bytes/program={size / progs:.1f}")
+    # Replay the trace a FEW times, so a dispatch-core profile of this process contains
+    # a clean traced cadence and still fits the profiler's DRAM buffer (~1461 launches).
+    # K=1 x 5 replays = ~835 launches. The big harnesses blow the buffer during setup;
+    # this one does nothing else.  MEASUREMENT_RECORD.md 6.30.
+    replays = int(os.getenv("GEMMA4_TRACE_REPLAYS", "5"))
+    for _ in range(replays):
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(mesh_device)
+    logger.info(f"[tracecmd] replayed {replays}x  (~{replays * k * 167} launches)")
+
     ttnn.release_trace(mesh_device, tid)
     assert size > 0, "trace buffer did not grow -- TRACE region not being used?"
 
