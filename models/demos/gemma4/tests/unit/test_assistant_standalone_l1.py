@@ -85,7 +85,7 @@ DEFAULT_CONTEXT = 512
 TRACE_REPS = int(os.getenv("GEMMA4_TRACE_REPS", "50"))
 #: Lowering it is how a TRACED run is made short enough to fit the device profiler's DRAM
 #: buffer (~1461 program launches). At 2, one arm is 2 x K x 167 = ~1002 launches and fits;
-#: at the default 50 any traced capture truncates at 0.24%. See MEASUREMENT_RECORD.md 6.26.
+#: at the default 50 any traced capture truncates at 0.24%. See MEASUREMENT_RECORD.md 6P.13.
 
 
 class _TargetStub:
@@ -1186,7 +1186,7 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
     if only:
         # Restrict the sweep to named classes. Needed to make a TRACED run short enough
         # for the device profiler's DRAM buffer (~1461 launches); the full 8-class sweep
-        # is ~601k. MEASUREMENT_RECORD.md 6.26.
+        # is ~601k. MEASUREMENT_RECORD.md 6P.13.
         want = {c.strip() for c in only.split(",") if c.strip()}
         unknown = want - {c[0] for c in classes}
         if unknown:
@@ -1775,7 +1775,7 @@ def test_op_breakdown(mesh_device, reset_seeds):
     NLPConcatHeads (16 ops) are not reconstructible standalone without their real
     KV/rope state, so they land in the residual together with dispatch.
 
-    Read the us/call column against the ~5.7 us per-op floor from §6.5: an op at
+    Read the us/call column against the ~5.7 us per-op floor from §6P.3: an op at
     the floor is paying dispatch, not work, and can only be removed by removing
     the op.
     """
@@ -2830,7 +2830,7 @@ def test_cme_digit_gather_vs_legacy(mesh_device, reset_seeds):
 def test_trace_command_stream_size(mesh_device, reset_seeds):
     """Measure the RECORDED DISPATCH COMMAND STREAM statically, with no profiler.
 
-    MEASUREMENT_RECORD.md 6.25/6.26 measure per-program dispatch cadence with
+    MEASUREMENT_RECORD.md 6P.12/6.26 measure per-program dispatch cadence with
     ``--profile-dispatch-cores``, which caps traced captures at ~1461 launches and
     inflates the baseline 5%.  This measures the dispatcher's *work* instead of its
     *time*: a trace is the recorded command stream, it lives in the TRACE region, and
@@ -2899,7 +2899,7 @@ def test_trace_command_stream_size(mesh_device, reset_seeds):
     # Replay the trace a FEW times, so a dispatch-core profile of this process contains
     # a clean traced cadence and still fits the profiler's DRAM buffer (~1461 launches).
     # K=1 x 5 replays = ~835 launches. The big harnesses blow the buffer during setup;
-    # this one does nothing else.  MEASUREMENT_RECORD.md 6.30.
+    # this one does nothing else.  MEASUREMENT_RECORD.md 6P.14.
     replays = int(os.getenv("GEMMA4_TRACE_REPLAYS", "5"))
     for _ in range(replays):
         ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)

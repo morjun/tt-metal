@@ -3,7 +3,7 @@
 --profile-dispatch-cores.
 
 Answers: how much time do the DISPATCH cores spend, as opposed to the compute
-kernels that analyze_ops.py measures?  MEASUREMENT_RECORD.md 6.23/6.24 record a
+kernels that analyze_ops.py measures?  MEASUREMENT_RECORD.md 6P.10/6.24 record a
 kernel-vs-step divergence that no per-op kernel profile can see; this is the
 instrument named for it (11.2 item 13).
 

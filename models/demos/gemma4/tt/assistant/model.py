@@ -294,7 +294,7 @@ class Gemma4AssistantModel:
         # The CME head (topk / transpose / embedding) and post_projection both
         # want an interleaved operand; one conversion serves both, and it
         # replaces the S2I the norm used to do unconditionally.
-        normed = self.act_shard.from_stream(normed)
+        normed = self.act_shard.from_stream(normed)  # from_stream = back to interleaved
         h.deallocate(True)
 
         logits = None
