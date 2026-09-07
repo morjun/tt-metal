@@ -334,21 +334,36 @@ class DecodeMatmulTuner:
         already L1 WIDTH_SHARDED, which `WeightPlacement` decides. So the
         allow-list is `GEMMA4_L1_ONLY`, and no separate knob is needed.
         """
-        if not self.enabled or not _env_on("GEMMA4_GATHER_IN0"):
+        dbg = _env_on("GEMMA4_GATHER_DEBUG")
+
+        def _no(why):
+            if dbg:
+                logger.info(f"[gather] SKIP {tuple(x.shape)[-1]}x{tuple(w.shape)[-1]}: {why}")
             return None
+
+        if not self.enabled:
+            return _no("tuner disabled")
+        if not _env_on("GEMMA4_GATHER_IN0"):
+            return _no("GEMMA4_GATHER_IN0 not set")
         if not self._l1_width_sharded(w):
-            return None
+            return _no(
+                f"weight not L1 WIDTH_SHARDED ({w.memory_config().buffer_type.name}/"
+                f"{w.memory_config().memory_layout.name})"
+            )
         k, n = int(x.shape[-1]), int(w.shape[-1])
         pc = derive_decode_1d_gather_config(1, k, n, self._max_x, self._max_y)
         if pc is None:
-            return None
+            return _no(f"no gather config for K={k} N={n} grid<={self._max_x}x{self._max_y}")
         specs = gather_shard_specs(k, n, self._max_x, self._max_y)
         if specs is None:
-            return None
+            return _no("gather_shard_specs returned None")
         in0_spec, in1_spec, out_spec = specs
         # The weight must sit on exactly the grid the ring expects.
-        if list(w.memory_config().shard_spec.shape) != list(in1_spec.shard_spec.shape):
-            return None
+        have, want = list(w.memory_config().shard_spec.shape), list(in1_spec.shard_spec.shape)
+        if have != want:
+            return _no(f"weight shard shape {have} != ring's {want}")
+        if dbg:
+            logger.info(f"[gather] TAKE {k}x{n}")
         return pc, in0_spec, out_spec
 
     def linear(self, x, w, **kwargs):
