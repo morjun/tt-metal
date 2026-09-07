@@ -2826,6 +2826,62 @@ def test_cme_digit_gather_vs_legacy(mesh_device, reset_seeds):
 
 
 @_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_trace_command_stream_size(mesh_device, reset_seeds):
+    """Measure the RECORDED DISPATCH COMMAND STREAM statically, with no profiler.
+
+    MEASUREMENT_RECORD.md 6.25/6.26 measure per-program dispatch cadence with
+    ``--profile-dispatch-cores``, which caps traced captures at ~1461 launches and
+    inflates the baseline 5%.  This measures the dispatcher's *work* instead of its
+    *time*: a trace is the recorded command stream, it lives in the TRACE region, and
+    its size is exactly what the prefetcher must stream from DRAM and the dispatcher
+    must process.  No profiler, no cap, no perturbation.
+
+    Bytes-per-program is a proxy for dispatch cost, not a timing.  What it answers is
+    the RELATIVE question 6.26 could not: do the ops ``gather_in0`` adds carry more or
+    less dispatcher work than the average op?
+
+    Run one arm per invocation:
+        GEMMA4_L1_ARM=l1_sharded GEMMA4_L1_ONLY=down_proj [GEMMA4_GATHER_IN0=1] \
+          pytest -k 1x1 ...::test_trace_command_stream_size
+    """
+    k = int(os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3"))
+    arm = os.getenv("GEMMA4_L1_ARM", "dram").strip().lower()
+    rig = _build_standalone(mesh_device, arm)
+
+    def trace_bytes():
+        v = ttnn._ttnn.device.GetMemoryView(mesh_device, ttnn.BufferType.TRACE)
+        return v.total_bytes_allocated_per_bank * v.num_banks
+
+    def body():
+        for _ in range(k):
+            rig["assistant"].step(*_step_args(rig))
+
+    body()  # compile everything before capture
+    ttnn.synchronize_device(mesh_device)
+
+    before = trace_bytes()
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    body()
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    ttnn.synchronize_device(mesh_device)
+    after = trace_bytes()
+    size = after - before
+
+    # op count for the same body, counted the way 6.18 counts it
+    n_ops = int(os.getenv("GEMMA4_OPS_PER_STEP", "0"))
+    logger.info(
+        f"[tracecmd] arm={arm} gather={os.getenv('GEMMA4_GATHER_IN0', '0')} k={k} "
+        f"trace_bytes={size} ({size / 1024:.1f} KiB)"
+    )
+    if n_ops:
+        progs = k * n_ops
+        logger.info(f"[tracecmd] programs={progs}  bytes/program={size / progs:.1f}")
+    ttnn.release_trace(mesh_device, tid)
+    assert size > 0, "trace buffer did not grow -- TRACE region not being used?"
+
+
+@_needs_assistant
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1), (1, 2)], device_params_extra={"trace_region_size": 200_000_000})
 def test_profile_eager_step(mesh_device, reset_seeds):
     """Eager (untraced) drafter steps, for per-op device times under the profiler.
