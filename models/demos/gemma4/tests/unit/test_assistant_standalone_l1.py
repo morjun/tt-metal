@@ -2849,8 +2849,13 @@ def test_trace_command_stream_size(mesh_device, reset_seeds):
     arm = os.getenv("GEMMA4_L1_ARM", "dram").strip().lower()
     rig = _build_standalone(mesh_device, arm)
 
-    def trace_bytes():
+    def trace_bytes(tag=""):
         v = ttnn._ttnn.device.GetMemoryView(mesh_device, ttnn.BufferType.TRACE)
+        if tag:
+            logger.info(
+                f"[tracecmd] {tag}: banks={v.num_banks} alloc/bank={v.total_bytes_allocated_per_bank} "
+                f"free/bank={v.total_bytes_free_per_bank} total/bank={v.total_bytes_per_bank}"
+            )
         return v.total_bytes_allocated_per_bank * v.num_banks
 
     def body():
@@ -2860,12 +2865,26 @@ def test_trace_command_stream_size(mesh_device, reset_seeds):
     body()  # compile everything before capture
     ttnn.synchronize_device(mesh_device)
 
-    before = trace_bytes()
+    # Count the ops the traced body actually issues. A trace records one command set
+    # per program, so bytes/program is only meaningful against a measured op count --
+    # never an assumed one (MEASUREMENT_RECORD.md 6.28).
+    ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+    body()
+    ttnn.synchronize_device(mesh_device)
+    g = ttnn.graph.end_graph_capture()
+    n_dev = sum(
+        1
+        for nd in g
+        if nd.get("node_type") == "function_start" and nd.get("params", {}).get("name", "").startswith("ttnn::prim")
+    )
+    logger.info(f"[tracecmd] graph ops in body: total_nodes={len(g)} device_ops={n_dev}")
+
+    before = trace_bytes("before")
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     body()
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
     ttnn.synchronize_device(mesh_device)
-    after = trace_bytes()
+    after = trace_bytes("after")
     size = after - before
 
     # op count for the same body, counted the way 6.18 counts it
