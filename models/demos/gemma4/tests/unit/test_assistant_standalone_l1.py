@@ -394,6 +394,34 @@ def _argmax_token(assistant, logits, rows=1):
     return idx
 
 
+def _make_fused_k_body(rig, k, mode="full"):
+    """Canonical traced workload; construction emits no device operations."""
+    if k < 1 or mode not in {"full", "no_argmax", "backbone"}:
+        raise ValueError("invalid K or body mode")
+    assistant = rig["assistant"]
+    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
+    pu, pi = rig["pos_uint32"], rig["pos_int32"]
+    want_logits = mode != "backbone"
+
+    def body():
+        tok, h = rig["token"], rig["hidden"]
+        last = None
+        for _ in range(k):
+            logits, h = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=want_logits)
+            if mode == "full":
+                last = _argmax_token(assistant, logits, rows=1)
+                logits.deallocate(True)
+                # ROW_MAJOR reshape is a free VIEW of `last`. Never deallocate
+                # either one: freeing the view hands its storage back and a later
+                # replay reads zeros (the verify_x bug in spec_decode.py:1641).
+                tok = ttnn.reshape(last, (1, 1))
+            elif logits is not None:
+                logits.deallocate(True)
+        return last, h
+
+    return body
+
+
 def _time_fused_k_steps(mesh_device, rig, k, reps=TRACE_REPS, mode="full"):
     """K drafter steps CHAINED inside ONE trace. Zero host work between replays.
 
@@ -420,26 +448,7 @@ def _time_fused_k_steps(mesh_device, rig, k, reps=TRACE_REPS, mode="full"):
 
     Returns (ms per K-step iteration, capture seconds).
     """
-    assistant = rig["assistant"]
-    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
-    pu, pi = rig["pos_uint32"], rig["pos_int32"]
-    want_logits = mode != "backbone"
-
-    def body():
-        tok, h = rig["token"], rig["hidden"]
-        last = None
-        for _ in range(k):
-            logits, h = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=want_logits)
-            if mode == "full":
-                last = _argmax_token(assistant, logits, rows=1)
-                logits.deallocate(True)
-                # ROW_MAJOR reshape is a free VIEW of `last`. Never deallocate
-                # either one: freeing the view hands its storage back and a later
-                # replay reads zeros (the verify_x bug in spec_decode.py:1641).
-                tok = ttnn.reshape(last, (1, 1))
-            elif logits is not None:
-                logits.deallocate(True)
-        return last, h
+    body = _make_fused_k_body(rig, k, mode)
 
     idx, h = body()  # compile
     ttnn.synchronize_device(mesh_device)
@@ -1165,7 +1174,7 @@ def test_per_matmul_ledger(mesh_device, reset_seeds):
     capture/release cycles in one process at a FIXED order, so any capture-index
     effect is aliased onto class identity; the two orders disambiguate that.
     """
-    k = 3
+    k = int(os.getenv("GEMMA4_LEDGER_K", "3"))
     reps = int(os.getenv("GEMMA4_AB_REPS", "50"))
     os.environ["GEMMA4_TUNE_MATMULS"] = "1"
     _purge_gather_in0("ledger2")
@@ -2827,6 +2836,152 @@ def test_cme_digit_gather_vs_legacy(mesh_device, reset_seeds):
 
 @_needs_assistant
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_gather_matched_trace(mesh_device, reset_seeds):
+    """Full recurrent ledger body, one arm/process and one live trace.
+
+    GEMMA4_DIAG_MODE=graph is a separate, untimed metadata capture.
+    Timing preserves the ledger's DRAM capture -> down_proj relocation history.
+    """
+    import json
+    from pathlib import Path
+
+    from research_codes.mm_profiling.gather_measurement import append_record, provenance, readings, snapshot, stabilize
+
+    k = int(os.getenv("GEMMA4_LEDGER_K", "3"))
+    counts = [int(n) for n in os.getenv("GEMMA4_DIAG_REPLAYS", "20").split(",")]
+    warmup = int(os.getenv("GEMMA4_DIAG_WARMUP", "3"))
+    output = os.environ["GEMMA4_DIAG_OUT"]
+    bus = os.getenv("GEMMA4_DIAG_BUS", "0000:17:00.0")
+    mode = os.getenv("GEMMA4_DIAG_MODE", "timing")
+    if mode not in {"timing", "graph", "capture_graph", "validate"} or min(counts) < 1 or warmup < 0:
+        raise ValueError("invalid diagnostic configuration")
+    assert os.environ.get("GEMMA4_TUNE_MATMULS") == "1"
+    assert os.environ.get("GEMMA4_SHARD_ACTIVATIONS") == "0"
+    assert os.environ.get("GEMMA4_GATHER_IN0") in {"0", "1"}
+    manifest = provenance()
+    manifest.update(
+        k=k, warmup=warmup, mode=mode, bus_id=bus, arm="ring" if os.environ["GEMMA4_GATHER_IN0"] == "1" else "mcast"
+    )
+    append_record(output, {"event": "start", **manifest})
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
+    manifest["rope_cache_order"] = list(rig["assistant"].rope_caches_2d)
+    # Reproduce the pre-L1 capture performed by the existing ledger.
+    _time_fused_k_steps(mesh_device, rig, k, reps=20)
+    moved = _relocate(_weight_slots(rig["assistant"]), mesh_device, to_l1=True, only=("down_proj",))
+    assert moved == 4, f"expected four down_proj weights, moved {moved}"
+    body = _make_fused_k_body(rig, k)
+    observed_plans = []
+    original_plan = rig["assistant"].mm._gather_plan
+
+    def observe_plan(x, w):
+        plan = original_plan(x, w)
+        observed_plans.append(
+            {
+                "x_shape": list(x.shape),
+                "w_shape": list(w.shape),
+                "ring": plan is not None,
+                "config": repr(plan[0]) if plan is not None else None,
+            }
+        )
+        return plan
+
+    rig["assistant"].mm._gather_plan = observe_plan
+
+    def release(outputs):
+        for t in outputs:
+            if t is not None:
+                t.deallocate(True)
+
+    def host(outputs):
+        return [ttnn.to_torch(t).clone() for t in outputs]
+
+    outputs = body()
+    ttnn.synchronize_device(mesh_device)
+    expected = host(outputs) if mode == "validate" else None
+    release(outputs)
+    if mode == "graph":
+        observed_plans.clear()
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        outputs = body()
+        ttnn.synchronize_device(mesh_device)
+        graph = ttnn.graph.end_graph_capture()
+        Path(output + ".graph.json").write_text(json.dumps(graph, indent=2))
+        release(outputs)
+        append_record(
+            output, {"event": "graph", **manifest, "graph_path": output + ".graph.json", "matmul_plans": observed_plans}
+        )
+        return
+
+    observed_plans.clear()
+    if mode == "capture_graph":
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        # Python argument formatting can read tensors nested in lists. C++ graph
+        # metadata is sufficient here; device reads are forbidden in a trace.
+        ttnn.graph.disable_python_io_recording()
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    outputs = body()
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    ttnn.synchronize_device(mesh_device)
+    try:
+        expected_ring = 4 * k if manifest["arm"] == "ring" else 0
+        assert sum(p["ring"] for p in observed_plans) == expected_ring, "unexpected ring engagement"
+        append_record(
+            output,
+            {"event": "capture", **manifest, "matmul_plans": observed_plans, "l1_state": _l1_bank_state(mesh_device)},
+        )
+        if mode == "capture_graph":
+            graph = ttnn.graph.end_graph_capture()
+            graph_path = output + ".graph.json"
+            Path(graph_path).write_text(json.dumps(graph, indent=2))
+            append_record(
+                output,
+                {
+                    "event": "capture_graph",
+                    **manifest,
+                    "graph_path": graph_path,
+                    "scope": "Host graph during actual trace capture; not command payload",
+                },
+            )
+            return
+        for _ in range(warmup):
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+        ttnn.synchronize_device(mesh_device)
+        if mode == "validate":
+            for _ in range(3):
+                ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
+                actual = host(outputs)
+                assert all(torch.equal(a, b) for a, b in zip(expected, actual)), "replay output changed"
+            append_record(output, {"event": "validation", **manifest, "equal": True})
+            return
+        for n in counts:
+            pre = stabilize(bus)
+            t0 = time.perf_counter_ns()
+            for _ in range(n):
+                ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+            ttnn.synchronize_device(mesh_device)
+            elapsed = time.perf_counter_ns() - t0
+            post = snapshot()
+            valid = readings(pre[-1], bus)[0] == readings(post, bus)[0]
+            append_record(
+                output,
+                {
+                    "event": "timing",
+                    **manifest,
+                    "replays": n,
+                    "elapsed_ns": elapsed,
+                    "trace_us": elapsed / n / 1000,
+                    "valid_clock": valid,
+                    "pre": pre,
+                    "post": post,
+                },
+            )
+    finally:
+        ttnn.release_trace(mesh_device, tid)
+        release(outputs)
+
+
+@_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
 def test_trace_command_stream_size(mesh_device, reset_seeds):
     """Measure the RECORDED DISPATCH COMMAND STREAM statically, with no profiler.
 
@@ -2872,12 +3027,29 @@ def test_trace_command_stream_size(mesh_device, reset_seeds):
     body()
     ttnn.synchronize_device(mesh_device)
     g = ttnn.graph.end_graph_capture()
-    n_dev = sum(
-        1
+    # Same filter as test_op_inventory (:1441): device ops are named either
+    # "...DeviceOperation" or "ttnn::<op>".  "ttnn::prim" alone matches nothing.
+    op_order = [
+        nm
         for nd in g
-        if nd.get("node_type") == "function_start" and nd.get("params", {}).get("name", "").startswith("ttnn::prim")
-    )
+        if nd.get("node_type") == "function_start"
+        for nm in [nd.get("params", {}).get("name", "")]
+        if "DeviceOperation" in nm or nm.startswith("ttnn::")
+    ]
+    n_dev = len(op_order)
     logger.info(f"[tracecmd] graph ops in body: total_nodes={len(g)} device_ops={n_dev}")
+    # Dump the ORDERED device-op sequence for this arm. The dispatch-core burst parser
+    # aligns SEND_GO_SIGNAL launches to ops positionally WITHIN an arm; there is no join
+    # key on the dispatch rows (run host ID is 0, trace id empty -- 6P.12). Cross-arm
+    # positional matching is INVALID once the ring inserts 8 ops, which is what
+    # 6P.18 sends this run to settle, so each arm carries its own sequence.
+    seq_path = os.getenv("GEMMA4_OP_ORDER_OUT", "")
+    if seq_path:
+        import json
+
+        with open(seq_path, "w") as fh:
+            json.dump({"arm": arm, "gather": os.getenv("GEMMA4_GATHER_IN0", "0"), "k": k, "ops": op_order}, fh)
+        logger.info(f"[tracecmd] wrote op order -> {seq_path}")
 
     before = trace_bytes("before")
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
