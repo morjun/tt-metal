@@ -1,0 +1,29 @@
+rounds: [1, 2, 3, 4, 5, 6]   cells: 24
+AICLK values across the campaign: {'1350'}   cells with an internal clock change: 0
+replays per cell: [400]
+
+Absolute K=3 ring trace time, us (one 400-replay aggregate per cell)
+cond       |         r1         r2         r3         r4         r5         r6 |     median                 range
+ringbase   |    3194.09    3193.76    3193.98    3194.10    3193.99    3194.33 |    3194.04 [  3193.76,  3194.33]
+bottomup   |    3186.23    3186.02    3186.52    3186.01    3186.24    3186.42 |    3186.24 [  3186.01,  3186.52]
+early      |    3196.34    3195.95    3196.07    3196.47    3196.35    3196.36 |    3196.35 [  3195.95,  3196.47]
+late       |    3185.70    3186.01    3185.80    3185.86    3185.98    3185.21 |    3185.83 [  3185.21,  3186.01]
+
+Paired responses, us (positive = the first condition is slower)
+contrast               |         r1         r2         r3         r4         r5         r6 |     median                 range
+bottomup - ringbase    |      -7.86      -7.74      -7.45      -8.08      -7.74      -7.90 |      -7.80 [    -8.08,    -7.45]  0/6 positive <- ANCHOR, must reproduce -7.59
+early - late           |     +10.64      +9.94     +10.27     +10.60     +10.37     +11.15 |     +10.48 [    +9.94,   +11.15]  6/6 positive <- PRIMARY: wait position
+early - bottomup       |     +10.11      +9.93      +9.55     +10.45     +10.11      +9.94 |     +10.02 [    +9.55,   +10.45]  6/6 positive (position + 2 commands)
+late - bottomup        |      -0.53      -0.01      -0.72      -0.15      -0.26      -1.21 |      -0.39 [    -1.21,    -0.01]  0/6 positive (2 commands only)
+early - ringbase       |      +2.25      +2.19      +2.09      +2.37      +2.37      +2.04 |      +2.22 [    +2.04,    +2.37]  6/6 positive
+
+Foreign host CPU during each cell (median %)
+cond       |         r1         r2         r3         r4         r5         r6
+ringbase   |        238        292        303        270        282        315
+bottomup   |        257        299        264        294        282        311
+early      |        274        326        258        294        253        259
+late       |        297        293        324        270        264        290
+
+ANCHOR bottomup - ringbase = -7.80 us (6P.38 measured -7.59 [-8.47, -7.18]); reproduces
+PRIMARY early - late = +10.48 us. Pre-registered prediction: positive if delaying these two waits contributes to the ring speedup.
+As a share of the 7.80 us bottom-up ring speedup: 134.4%. This is sensitivity to two wait positions, NOT automatically an additive component of the ring/multicast gap.
