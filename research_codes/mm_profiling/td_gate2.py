@@ -29,6 +29,27 @@ def clock(row):
     return (info[0].get("telemetry") or {}).get("aiclk") if isinstance(info[0], dict) else None
 
 
+def foreign_cpu(d):
+    """Median foreign host CPU seen while this cell ran.
+
+    A co-user saturating the CPU is not a device holder, so it does not trip the
+    withdrawal condition, but it can still perturb the host side of a traced
+    replay. The paired design protects the contrast only if base and intervention
+    cells of a pair saw comparable load, which is checked rather than assumed."""
+    f = os.path.join(d, "occ.jsonl")
+    if not os.path.exists(f):
+        return None
+    v = []
+    for line in open(f):
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("at") == "during":
+            v.append(r["foreign_cpu_pct"])
+    return statistics.median(v) if v else None
+
+
 def read_cell(d):
     """Median trace_us over the cell's timing records, plus its clock."""
     f = os.path.join(d, "cell.jsonl")
@@ -45,7 +66,7 @@ def read_cell(d):
         clk = clock(r) or clk
     if not times:
         return None
-    return {"us": statistics.median(times), "n": len(times), "clock": clk, "valid": ok}
+    return {"us": statistics.median(times), "n": len(times), "clock": clk, "valid": ok, "cpu": foreign_cpu(d)}
 
 
 cells = {}
@@ -79,6 +100,23 @@ def clock_ok(*cs):
     cl = {c["clock"] for c in cs if c}
     return all(c is not None for c in cs) and len(cl) == 1
 
+
+print("\n0. Foreign host CPU during each cell (median %), and the base-vs-intervention")
+print("   imbalance within each pair. A large imbalance would break the pairing.")
+print(f"{'K':>2s} {'arm':>7s} | " + " ".join(f"{'r'+str(r):>13s}" for r in rounds))
+worst = 0.0
+for K in Ks:
+    for a, nm in ((0, "mcast"), (1, "ring")):
+        row = []
+        for rd in rounds:
+            b, i = get(rd, K, a, "base"), get(rd, K, a, "iv")
+            if b and i and b["cpu"] is not None and i["cpu"] is not None:
+                worst = max(worst, abs(i["cpu"] - b["cpu"]))
+                row.append(f"{b['cpu']:6.0f}/{i['cpu']:<6.0f}")
+            else:
+                row.append(f"{'-':>13s}")
+        print(f"{K:2d} {nm:>7s} | " + " ".join(row))
+print(f"   largest within-pair CPU imbalance: {worst:.0f} percentage points")
 
 print("\n1. ABSOLUTE per-arm response (intervention - base), us/trace. " "Positive = intervention slower.")
 print(f"{'K':>2s} {'arm':>7s} | " + " ".join(f"{'r'+str(r):>9s}" for r in rounds) + f" | {'median':>8s} {'range':>18s}")
