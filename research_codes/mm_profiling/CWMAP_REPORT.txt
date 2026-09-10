@@ -1,0 +1,47 @@
+Ks with both arms: [3, 4, 5, 6, 7, 8, 9, 10]
+
+[check] interior steps identical across K (same arm, same step, both traces interior)
+   comparisons with any difference: 0
+
+[check] maximum wait lag over all cells: 7 (launch window = 7)
+[check] prefetcher cache over all cells: wraps=0 drains=0 evictions=0 too-large resets=0
+
+| K | resets mcast | resets ring | ring-mcast | final-step tight mcast | ring | ring-mcast |
+|--:|--:|--:|--:|--:|--:|--:|
+| 3 | 1 | 1 | +0 | 4 | 8 | +4 |
+| 4 | 4 | 1 | -3 | 6 | 5 | -1 |
+| 5 | 4 | 2 | -2 | 4 | 5 | +1 |
+| 6 | 7 | 2 | -5 | 6 | 8 | +2 |
+| 7 | 7 | 2 | -5 | 4 | 5 | +1 |
+| 8 | 10 | 3 | -7 | 6 | 5 | -1 |
+| 9 | 10 | 3 | -7 | 4 | 8 | +4 |
+| 10 | 13 | 3 | -10 | 6 | 5 | -1 |
+
+reset step positions (step index within the trace), by arm:
+  arm0 K=3: steps [(2, 1)]
+  arm0 K=4: steps [(2, 3), (3, 1)]
+  arm0 K=5: steps [(2, 3), (4, 1)]
+  arm0 K=6: steps [(2, 3), (4, 3), (5, 1)]
+  arm0 K=7: steps [(2, 3), (4, 3), (6, 1)]
+  arm0 K=8: steps [(2, 3), (4, 3), (6, 3), (7, 1)]
+  arm0 K=9: steps [(2, 3), (4, 3), (6, 3), (8, 1)]
+  arm0 K=10: steps [(2, 3), (4, 3), (6, 3), (8, 3), (9, 1)]
+  arm1 K=3: steps [(1, 1)]
+  arm1 K=4: steps [(1, 1)]
+  arm1 K=5: steps [(1, 1), (4, 1)]
+  arm1 K=6: steps [(1, 1), (4, 1)]
+  arm1 K=7: steps [(1, 1), (4, 1)]
+  arm1 K=8: steps [(1, 1), (4, 1), (7, 1)]
+  arm1 K=9: steps [(1, 1), (4, 1), (7, 1)]
+  arm1 K=10: steps [(1, 1), (4, 1), (7, 1)]
+
+--------------------------------------------------------------------------
+Reproduce:
+  capture   research_codes/mm_profiling/cwmap_cell.sh <K> <arm 0|1> <outdir>
+            (needs the tt-metal-cmdprobe build at gemma4-dispatch-accessors;
+             sets GEMMA4_TRACEDUMP_DIR and GEMMA4_ALLOCMAP_OUT)
+  analyse   python3 cwmap_tables.py <outdir>
+            python3 configwait_map.py <outdir>   # full per-program map
+  archived  cwmap_decisions.csv.gz -- one row per program of each MEASURED
+            (pinned) trace, K=3..10 x both arms, 18,096 rows. The initial
+            DRAM capture (trace 0) is dropped; it is identical across arms.

@@ -276,3 +276,202 @@ Consequences for anyone using these captures:
    Raising the count, or shortening that history for an untimed diagnostic, are
    the two ways to fit complete traced replays — the second changes the capture
    history the campaign otherwise holds fixed.
+
+## Route 1: dispatch-only profiling is NOT available — source verdict
+
+**Checked 2026-09-10 in the built worktree's source.** Worker instrumentation
+**cannot** be disabled while retaining dispatch timestamps.
+
+The gate is `tt_metal/tools/profiler/kernel_profiler.hpp:44-45`:
+
+```
+#if defined(PROFILE_KERNEL) && \
+    (!defined(DISPATCH_KERNEL) || (defined(DISPATCH_KERNEL) && (PROFILE_KERNEL & PROFILER_OPT_DO_DISPATCH_CORES)))
+```
+
+For a **worker** kernel `DISPATCH_KERNEL` is undefined, so the condition collapses
+to `defined(PROFILE_KERNEL)` — instrumentation is compiled in whenever profiling is
+enabled at all. And `jit_build/build.cpp:176-189` composes the value as
+`profiler_options = 1` with the option bits OR-ed on top, so bit 0 is unconditional
+and `PROFILER_OPT_DO_DISPATCH_CORES` (bit 1) only **adds** dispatch cores. Requesting
+`--profile-dispatch-cores` therefore yields `PROFILE_KERNEL=3`, which is worker
+profiling **plus** dispatch, never dispatch alone. This confirms that asking for
+dispatch profiling does not disable worker profiling.
+
+**The one lever that does reduce Tensix marker volume** is
+`PROFILER_OPT_DO_TRACE_ONLY` (bit 2), reachable via the environment variable
+`TT_METAL_PROFILER_TRACE_TRACKING`, which is present in the built library. It sets
+`TRACE_ON_TENSIX` (`:69-73`), and in that mode `profileScopeGuaranteed` emits markers
+only when the `TRACE_REPLAY_STATUS` control word permits (`:751-780`), rather than on
+every invocation — which is precisely the overflow source. It also pins
+`myRiscID = 0` (`:107-111`) instead of the per-hardware-thread index, changing the
+per-RISC data layout.
+
+**Two risks to verify before relying on it, neither yet tested.**
+
+1. **It may gate the measurement itself.** Dispatch runs on Tensix worker cores on
+   this part, so a Tensix-scoped trace gate could suppress the very
+   `SEND_GO_SIGNAL` markers the analysis needs. Compiled zones and **actually
+   emitted records** must both be checked, not just the define.
+2. **`myRiscID = 0` collapses per-RISC slots.** Whether records remain separable per
+   RISC, or overwrite one another, is unverified.
+
+It changes a JIT define, so the first run at each new setting recompiles all kernels.
+
+**Consequence for the plan:** dispatch-only is not expressible with the existing
+option bits, so route 1 as originally framed is closed. The nearest available
+substitute is trace-only marker gating, which must itself be qualified — compiled
+zones, emitted records, and a profiler-off control at the chosen replay count —
+before any further matrix is collected.
+
+## Trace-only qualification: FAILS gate 2. Route 1 is closed.
+
+**2026-09-10.** The substitute for dispatch-only profiling was
+`PROFILER_OPT_DO_TRACE_ONLY`. It fails on emitted records, and the failure is a
+hard abort rather than a degradation.
+
+**Activation failure — wrong variable first, and it failed silently.** The evidence
+that settles this is the **configuration/code-path check** (which field the variable
+writes, and the absent `-DPROFILE_KERNEL` change). Absent recompilation and equal CSV
+size are consistent with inactivity but do not prove it on their own. `TT_METAL_PROFILER_TRACE_TRACKING`
+sets `profiler_trace_tracking`; the field feeding `PROFILER_OPT_DO_TRACE_ONLY` is
+`get_profiler_trace_only()` -> `profiler_trace_profiler`, set by
+**`TT_METAL_TRACE_PROFILER`**. Two similar names, and the wrong one is inert.
+Evidence it was inert: **zero kernel recompiles** and no `-DPROFILE_KERNEL` in the
+log, while the two device CSVs came out the **same size** with different content.
+Comparing only emitted records would have read that as "trace-only suppressed
+nothing" instead of "trace-only never ran". Preserved under `tt/wrong_var/`.
+
+Both flags are conditional on `profiler_enabled` already being true, so parse order
+could silently drop either request. `TT_METAL_DEVICE_PROFILER` is enum 125 and
+`TT_METAL_TRACE_PROFILER` is 132, so the ordering is safe here — but it is the same
+class of silent no-op.
+
+**With the correct variable: compiled zones PASS, emitted records FAIL.**
+
+| Check | Result |
+|---|---|
+| Compiled zones | **PASS** — 255 kernel recompiles, `-DPROFILE_KERNEL=7` = base \| DISPATCH_CORES \| TRACE_ONLY |
+| Test execution | ran; harness recorded 2 replays, `trace_us=3322.3`, `valid_clock=true` |
+| Emitted records | **FAIL — profiler aborts** |
+| Setup-marker suppression | not reached |
+| Dispatch GO markers retained | not reached |
+| Core/RISC attribution | **FAIL, and it is the cause** |
+| Independent replay boundaries | not reached |
+
+```
+TT_FATAL profiler.cpp:2149: start_marker_it->marker_name == marker.marker_name
+  Start and end marker names do not match.
+  CQ-DISPATCH-SUBORDINATE ZONE_END, RISC: TENSIX_RISC_AGG, id 43138
+  cq_dispatch_subordinate.cpp:609
+```
+
+**The abort proves marker pairing failed; it does not by itself prove the cause.**
+`TENSIX_RISC_AGG` is the aggregated identity that `myRiscID = 0` produces under
+trace-only, and the failing record reports exactly that identity, so aggregation is a
+**strong suspected mechanism** — but **missing records or zone-boundary handling could
+equally leave an end marker unpaired**, and the raw stream was not analysed to
+separate them. Treat the mechanism as suspected. The predicted risk — that a
+Tensix-scoped gate would damage the dispatch markers the analysis needs — did occur,
+in attribution rather than suppression form, and the decision to stop using this path
+does not depend on which mechanism is responsible.
+
+**Teardown stalled** exactly as the earlier recorded incident: pytest aborted, tracy
+hung for ~1h24m. Only `masterjunmo` processes were SIGTERMed; **no device reset**,
+and nothing belonging to the co-user was signalled. Capture preserved under
+`tt/gate2_failed/` with `FAILURE.json`.
+
+**Occupancy gate worked and found something endpoints would have missed.** 199
+samples across the cell: **no foreign device holders at any point**, but foreign CPU
+spiked to **1426%** (load 6.15 against a 0.20 baseline) in three samples over ~30
+seconds. Device exclusivity held; host CPU exclusivity did not. Note the sampler
+polls at 10 s, so it bounds contamination loosely and would miss a shorter spike.
+
+**Verdict: route 1 is closed.** Dispatch-only is not expressible with the option
+bits, and the only marker-volume lever corrupts dispatch attribution. Per the agreed
+sequence, the next work is **host-side command capture** — actual bytes, wait
+targets, configuration addresses, program identities — with interventions evaluated
+on the existing unprofiled 400-replay harness. Do not shorten capture history or fit
+an overhead correction as a substitute; each needs its own validation first.
+
+## Host-side command capture: gates passed, hypothesis tested, hypothesis rejected
+
+**2026-09-10.** The route the profiler-path failure sent us to. Full result in
+MEASUREMENT_RECORD.md 6P.34.
+
+### Probe extension
+
+Two locations, as scoped:
+
+- `FDMeshCommandQueue::record_end` — per program: identity, byte range within the
+  trace stream (taken as the growth of the sysmem bypass buffer across each
+  `write_program_command_sequence`), `sync_count`, the stall flags, `send_binary`,
+  and the prefetcher-cache residency fields. Plus a `trace_begin` record with
+  trace sequence, mesh device and CQ id, a terminator range, and a range total.
+- `MeshTrace::populate_mesh_buffer` — the exact **unpadded** command stream before
+  page padding, keyed to the same trace sequence.
+
+Each `record_end` writes its own file, so the initial DRAM capture and the measured
+pinned capture are separable by construction.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| Separate DRAM and pinned trace identity | **PASS** — 2 traces, 2 streams per capture, tagged with device and CQ |
+| Complete byte accounting | **PASS** — preamble + programs + terminator equals the range total exactly, all traces; `.bin` size = manifest unpadded bytes = words x 4 |
+| Reproducibility, controlled construction order | **PASS** — with `PYTHONHASHSEED=0`, two fresh processes give **byte-identical streams and identical manifests** |
+| Probe neutrality (declared in advance: median paired shift <= 3.0 us, range <= 10.0) | **PASS** — median **−0.02 us/trace**, range **0.48 us**, K=3, 400 replays, 4 paired rounds |
+| Profiler-off control reproduces the qualified baseline | **PASS** — median 3164.15 against 6P.28's 3164.042, within **0.11 us** |
+
+The address variation recorded earlier was a **Python hash-seed effect**: with the
+seed pinned it does not occur. Raw addresses are preserved in the dump; any
+normalized view is additional, never a replacement.
+
+### What the capture showed, and what the intervention did to it
+
+Residency decisions differ **only in the final step** — the first K−1 steps are
+byte-identical at every K (verified K=3→4, 4→5, 5→6, both arms) — and the arms
+diverge in opposite directions at K=4. Rank order across K=3/4/5 matched the timing
+penalty exactly.
+
+**Tested and rejected.** Forcing the whole final step to send its binaries
+(`GEMMA4_FORCE_SEND_TAIL`) removed the divergence by construction and **did not
+shrink the dip; it grew 13.33 -> 16.47 us**. Against predeclared thresholds this is
+NULL. Baseline cells reproduced the qualified values, so the reversal gate passed
+and the null is trustworthy.
+
+**New observation, needing its own confirmation:** the intervention makes the ring
+send +12/+10/+5 more binaries than multicast at K=3/4/5. Timing responds at
+**0.39 and 0.31 us per differential send at K=3 and K=5**, and at **0.01 at K=4**,
+whose three rounds straddle zero. **K=4 absorbs added binary work its neighbours pay
+for.** That is a negative result about responsiveness from a single lever and three
+rounds — not a mechanism, and possibly a property of the lever rather than of K=4.
+
+### Scoped repeat — MEASUREMENT_RECORD.md 6P.35
+
+`GEMMA4_FORCE_SEND_TRACE=1` restricts the override to the measured pinned trace.
+Verified before timing: the initial DRAM trace is **byte-identical** (MD5) in both
+arms with 0 programs changed, and output validation passes (3 blocking replays
+bit-identical against eager). 6P.34's scope defect is eliminated.
+
+Full audit of the change: **only `send_binary`, `bytes`, `pc_is_cached` and
+`pc_offset` differ**, in 60 (multicast) / 70 (ring) final-step programs.
+`sync_count`, both stall flags, program and runtime ids, worker counts and launch
+write pointers are identical in every program of every trace. First differing raw
+byte falls inside the final step in both arms.
+
+72 cells, 6 counterbalanced rounds, none flagged. **The dip survives and deepens:
+13.88 -> 17.19 us, a within-round change of +3.27 [+2.62, +3.84] excluding zero.**
+Baseline reproduces 6P.26's 13.74, so the reversal gate passes.
+
+**Hypothesis closed:** the final-step skipped-send pattern does not explain the dip
+through this intervention. **Not closed:** binary residency generally, the
+captured-program branch, or anything about K=4 responsiveness -- the K=4
+differential of +0.55 is near-common-mode, both arms paying ~34.7-35.1 us.
+
+### Standing cautions carried forward
+
+Equal byte counts never closed this question, and a differing command never
+established causality — the intervention is what settled it, and it settled it
+against the hypothesis. Item 19 remains deferred.
