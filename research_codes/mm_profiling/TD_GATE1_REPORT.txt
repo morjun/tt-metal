@@ -1,0 +1,58 @@
+A. initial DRAM trace (trace 0) unchanged by the intervention, and test outcome
+cell        stream0 base==iv  stream1 base==iv  base pass  iv pass  override fired
+K3a0                   True             False        yes      yes              46
+K3a1                   True             False        yes      yes              48
+K4a0                   True             False        yes      yes              46
+K4a1                   True             False        yes      yes              45
+K5a0                   True             False        yes      yes              46
+K5a1                   True             False        yes      yes              45
+K6a0                   True             False        yes      yes              46
+K6a1                   True             False        yes      yes              48
+K7a0                   True             False        yes      yes              46
+K7a1                   True             False        yes      yes              45
+K8a0                   True             False        yes      yes              46
+K8a1                   True             False        yes      yes              45
+  GATE A: DRAM trace untouched, both arms correct
+
+B. what changed in the measured trace
+cell     progs changed  bin_off  nb_off  sendb  wait  stalls   src  evict |  sendb base/iv  resets base/iv  tight base/iv
+K3a0             138      132      79     12     2      61    39     69 |        320/320             1/0          22/23
+K3a1             172      169      82     26     6      52    33     87 |        329/336             1/1          20/20
+K4a0             170      166     142     18     6     103    65    108 |        437/438             4/3          32/31
+K4a1             177      176      22     30     8      20    22     51 |        448/443             1/1          26/28
+K5a0              97       92      84      4     0      82    47     79 |        540/538             4/4          40/40
+K5a1             176      151     130     14     4      70    46     94 |        570/567             2/2          35/36
+K6a0             170      166     142     18     6     103    65    108 |        652/653             7/6          49/48
+K6a1             172      169      82     26     6      52    33     87 |        670/677             2/2          45/45
+K7a0              97       92      84      4     0      82    47     79 |        755/753             7/7          57/57
+K7a1             177      176      22     30     8      20    22     51 |        789/784             2/2          51/53
+K8a0             170      166     142     18     6     103    65    108 |        867/868            10/9          66/65
+K8a1             176      151     130     14     4      70    46     94 |        911/908             3/3          60/61
+
+C. does it remove or shift the targeted reset schedule?
+ K |  resets mcast b/iv  resets ring b/iv |  final tight m b/iv  final tight r b/iv | diff base diff iv
+ 3 |        1/0               1/1         |         4/5                 8/8         |        +4      +3
+ 4 |        4/3               1/1         |         6/5                 5/7         |        -1      +2
+ 5 |        4/4               2/2         |         4/4                 5/6         |        +1      +2
+ 6 |        7/6               2/2         |         6/5                 8/8         |        +2      +3
+ 7 |        7/7               2/2         |         4/4                 5/7         |        +1      +3
+ 8 |       10/9               3/3         |         6/5                 5/6         |        -1      +1
+
+  A useful test requires the iv columns to differ from base. If they do not,
+  the override does not touch the mechanism and gate 2 must not run.
+
+D. containment: interior decisions unchanged, and the stream's first divergent byte
+cell    interior diffs first diff prog final step starts  stream1 first diff byte
+K3a0                0             340               340                  1850537
+K3a1                0             356               356                  1866985
+K4a0                0             510               510                  2777513
+K4a1                0             534               534                  2800745
+K5a0                0             680               680                  3701865
+K5a1                0             712               712                  3734377
+K6a0                0             850               850                  4628393
+K6a1                0             890               890                  4667433
+K7a0                0            1020              1020                  5552745
+K7a1                0            1068              1068                  5601193
+K8a0                0            1190              1190                  6479273
+K8a1                0            1246              1246                  6534825
+  GATE D: the intervention touches only the final step
