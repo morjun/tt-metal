@@ -1,0 +1,33 @@
+conditions captured: ['bottomup', 'early', 'late', 'ringbase']
+
+A. output correctness and injection log
+  ringbase  passed=True  injection log lines=0 (expected 0)
+  bottomup  passed=True  injection log lines=0 (expected 0)
+  early     passed=True  injection log lines=2 (expected 2)
+  late      passed=True  injection log lines=2 (expected 2)
+
+B. initial DRAM trace unchanged vs the bottom-up reference
+  ringbase  stream0 identical to bottomup: True
+  bottomup  stream0 identical to bottomup: True
+  early     stream0 identical to bottomup: True
+  late      stream0 identical to bottomup: True
+
+C. against bottom-up: only the intended nodes change, and only their stall flag
+  early     nodes changed: [413, 449] (expected [413, 449]); changes that are not purely an added wait: []
+      node 413: target 44990  (bottom-up had stall=0, target 0)
+      node 449: target 48950  (bottom-up had stall=0, target 0)
+  late      nodes changed: [445, 481] (expected [445, 481]); changes that are not purely an added wait: []
+      node 445: target 44990  (bottom-up had stall=0, target 0)
+      node 481: target 48950  (bottom-up had stall=0, target 0)
+
+D. existing required synchronization is untouched
+  early     other nodes whose wait changed: []
+  late      other nodes whose wait changed: []
+
+E. exactly the intended extra command bytes
+  ringbase  program command bytes 2799168 (original allocator, not comparable)
+  bottomup  program command bytes 2800640, bottom-up 2800640, delta 0 (expected 0)
+  early     program command bytes 2800768, bottom-up 2800640, delta 128 (expected 128)
+  late      program command bytes 2800768, bottom-up 2800640, delta 128 (expected 128)
+
+GATE: PASS -- timing may proceed
