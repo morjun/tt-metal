@@ -51,7 +51,13 @@ def foreign_cpu(d):
 
 
 def read_cell(d):
-    """Median trace_us over the cell's timing records, plus its clock."""
+    """The cell's trace_us, plus its clock.
+
+    The harness emits ONE timing record per cell whose trace_us is
+    elapsed_ns / replays / 1000, i.e. the mean over all 400 replays. The median
+    below is therefore over a single value; it is kept only so a harness that
+    ever emits several records still works. A cell is one aggregate, not 400
+    samples, so no within-cell dispersion is available and none is reported."""
     f = os.path.join(d, "cell.jsonl")
     if not os.path.exists(f):
         return None
