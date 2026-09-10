@@ -1,0 +1,25 @@
+rounds: [1, 2, 3, 4, 5, 6]  cells: 18  AICLK: ['1350']  internal clock changes: 0
+
+Absolute K=3 trace time, us
+cond     |        r1        r2        r3        r4        r5        r6 |    median                 range
+mcast    |   3164.58   3164.41   3164.58   3164.60   3164.00   3164.54 |   3164.56 [  3164.00,  3164.60]
+ring     |   3193.77   3194.34   3194.33   3193.94   3193.51   3193.94 |   3193.94 [  3193.51,  3194.34]
+ringbd   |   3185.97   3186.63   3186.45   3186.10   3186.06   3186.30 |   3186.20 [  3185.97,  3186.63]
+
+Paired responses, us (positive = first condition slower)
+contrast               |        r1        r2        r3        r4        r5        r6 |    median               range
+ring - mcast (ANCHOR)  |    +29.19    +29.93    +29.75    +29.34    +29.51    +29.40 |    +29.45 [  +29.19,  +29.93]  6/6 pos
+ringbd - mcast         |    +21.39    +22.22    +21.87    +21.50    +22.07    +21.76 |    +21.82 [  +21.39,  +22.22]  6/6 pos
+ringbd - ring          |     -7.80     -7.71     -7.88     -7.84     -7.44     -7.63 |     -7.75 [   -7.88,   -7.44]  0/6 pos
+
+Foreign host CPU during each cell (median %)
+  mcast       333    309    315    276    286    312
+  ring        360    286    333    307    278    319
+  ringbd      349    313    310    301    289    309
+
+ANCHOR ring - mcast = +29.45 us (standing 400-replay value +29.84 / +29.88); reproduces
+PRIMARY DELIVERABLE: of the 29.45 us ring penalty, the targeted variant recovers +7.75 us = 26.3%.
+Residual penalty after the variant: +21.82 us.
+The audit showed this variant RELOCATES the tight waits (413/449 -> 407/443) rather than
+removing them: tight-wait count 20, tight-lag sum 51 and total wait count 452 are all
+unchanged. Read the recovery figure against that, not as a deferral result.
