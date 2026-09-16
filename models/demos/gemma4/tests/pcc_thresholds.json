@@ -8,6 +8,8 @@
       "test_attention_paged_decode_via_harness[blackhole-full-1x1]": 0.986,
       "test_full_model[wormhole_b0-1x1]": 0.90,
       "test_full_model[blackhole-1x1]": 0.84,
+      "_comment_full_model_decode": "Measured 2026-09-16 at 1x1 on the zero-padding default prompt: 0.9799, argmax matching HF. Threshold set below measured; the 0.99 default was simply uncalibrated for this test. Earlier readings on the old 6-token prompt (0.9750-0.9900 over 4 prompts) carried a padded-prefill confound -- the test prefilled HF unpadded but TT padded -- which E2B absorbed (top-1 leads by ~10 logits) but 12B did not. See USABILITY.md section 5.4.",
+      "test_full_model_decode[blackhole-1x1]": 0.97,
       "test_full_model_parity_warmup_then_inference[wormhole_b0-pli-all-kv-shared-steps4-1x1]": 0.98,
       "test_full_model_parity_warmup_then_inference[blackhole-pli-all-kv-shared-steps4-1x1]": 0.98
     },
@@ -43,6 +45,8 @@
       "test_attention_decode_bounded_vs_unbounded_parity[blackhole-cache1500-1x1]": 0.97,
       "test_attention_prefill[blackhole-seq4096-global-1x1]": 0.98,
       "_comment_full_model": "Real-weight (gemma4_unified) full-model PCC ~0.94 at 1x1 (single chip measures lower than 1x4's ~0.96); known 12B unified-arch backbone-accumulation gap. Threshold set below measured.",
+      "_comment_full_model_decode": "Measured 2026-09-16 at 1x1 bf16 on the zero-padding prompt: 0.9764, argmax MATCHING HF. Threshold set below measured. Deliberately withheld until the padding confound was fixed -- on the old 6-token prompt this read 0.9746 with a WRONG argmax (' beach' vs HF 'thought'), and a threshold then would have hidden it. See USABILITY.md section 5.4.",
+      "test_full_model_decode[blackhole-1x1]": 0.97,
       "test_full_model[blackhole-1x1]": 0.92
     },
     "1x4": {

@@ -142,7 +142,21 @@ def _patch_model_args(
             )
             # Defensive: some versions still hand back a dict-like with input_ids.
             return out["input_ids"] if isinstance(out, dict) else out
-        return tokenizer.encode(prompt, add_special_tokens=True)
+        # No chat template (google/gemma-4-12B-it ships none): encode plainly, but
+        # BOS must still be prepended by hand. add_special_tokens=True does NOT do
+        # it for the Gemma-4 tokenizers -- measured, they return identical ids with
+        # it True or False -- and the chat-template branch above gets BOS for free
+        # because the template emits "<bos><|turn>user\n...".
+        #
+        # Gemma without BOS produces garbage, not merely worse output. Measured on
+        # 12B at 1x1, "The capital of France is" greedily decodes to "111111..."
+        # under BOTH HuggingFace-on-CPU and tt-metal (acceptance 0.04/3); with BOS
+        # it decodes to "...The capital of France is **Paris**." (acceptance 1.80/3).
+        ids = tokenizer.encode(prompt, add_special_tokens=True)
+        bos_id = getattr(tokenizer, "bos_token_id", None)
+        if bos_id is not None and (not ids or ids[0] != bos_id):
+            ids = [bos_id] + ids
+        return ids
 
     model_args.encode_prompt = _encode_prompt
 

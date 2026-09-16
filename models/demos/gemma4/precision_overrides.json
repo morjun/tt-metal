@@ -11,7 +11,5 @@
   "gemma-4-31B-it": {
     "default": {"shared_mlp": "bfp8", "attention": "bfp8"}
   },
-  "gemma-4-12B-it": {
-    "default": {"shared_mlp": "bfp8", "attention": "bfp8"}
-  }
+  "_note_gemma-4-12B-it": "REMOVED 2026-09-16. The distributor ships pure bf16 (config dtype=bfloat16; all 677 safetensors tensors BF16), so bfp8 here was a tt-metal-side precision change, not the model default. Measured cost at 1x1 on the full-model-vs-HF PCC with a well-formed (BOS-prefixed) prompt: bf16 0.9942 vs bfp8 0.9546 (last-token 0.9931 vs 0.9384). bf16 fits at 1x1 on a 31.88 GiB p150a and runs spec decode end-to-end. This entry looks inherited from the 31B row, whose comment in precision.py:12 says such entries exist for DRAM pressure -- a constraint not re-checked for 12B. If a smaller-DRAM system needs bfp8, add a MESH-SCOPED entry rather than a blanket default."
 }

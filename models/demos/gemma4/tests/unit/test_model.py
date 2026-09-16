@@ -310,6 +310,33 @@ def test_single_layer_model(mesh_device, layer_group, reset_seeds, request):
     assert passing, f"Single-layer model (group={layer_group}, layers={num_layers}, tp={tp}) PCC too low: {pcc_msg}"
 
 
+def _encode_with_bos(tokenizer, prompt):
+    """Encode ``prompt`` with BOS guaranteed.
+
+    Gemma-4 variants disagree about who supplies BOS. E2B ships a
+    ``chat_template`` that emits ``"<bos><|turn>user\n..."``; google/gemma-4-12B-it
+    ships **no** chat_template, and ``add_special_tokens=True`` does NOT add BOS for
+    either tokenizer (measured: both return identical ids with it True or False).
+    So a plain ``tokenizer.encode`` here yields a BOS-less prompt for 12B.
+
+    That is not a cosmetic difference. Gemma without BOS produces garbage rather
+    than degraded output: 12B greedily decodes "The capital of France is" to
+    "111111..." under BOTH HuggingFace-on-CPU and tt-metal. Measured effect on this
+    very test at 1x1, bf16:
+
+        12B   no-BOS 0.9119 (FAIL)   +BOS 0.9942 (PASS)
+        E2B   no-BOS 0.9366 (pass)   +BOS 0.9894
+
+    E2B tolerates the omission and 12B does not, so testing without BOS silently
+    compared logits from a model in a degenerate state, and read as a 12B defect.
+    """
+    ids = tokenizer.encode(prompt, return_tensors="pt")
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is not None and (ids.shape[1] == 0 or int(ids[0, 0]) != bos_id):
+        ids = torch.cat([torch.tensor([[bos_id]], dtype=ids.dtype), ids], dim=1)
+    return ids
+
+
 # ── Full Model PCC Test ─────────────────────────────────────────────────
 
 
@@ -351,8 +378,10 @@ def test_full_model(mesh_device, reset_seeds, request):
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")  # [1, seq_len]
+    # GEMMA4_PCC_PROMPT allows checking this PCC on the project's canonical
+    # measurement prompt (MEASUREMENT_RECORD.md 2.1) without editing the test.
+    prompt = os.environ.get("GEMMA4_PCC_PROMPT", "The capital of France is")
+    input_ids = _encode_with_bos(tokenizer, prompt)  # [1, seq_len], BOS-prefixed
     seq_len = input_ids.shape[1]
     padded_len = ((seq_len + 31) // 32) * 32
     if padded_len > seq_len:
@@ -509,9 +538,41 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    # This prompt is chosen to tokenize to EXACTLY 32 tokens including BOS, on both
+    # the E2B and 12B tokenizers, so the TT prefill needs NO padding.
+    #
+    # Why that matters: HF is prefilled with the REAL ids (unpadded, below), while the
+    # TT side is prefilled with `input_ids_padded`. Any pad positions therefore give
+    # the two sides different KV state, and the decode step compared here is then not
+    # apples-to-apples. It is not cosmetic -- MEASURED at 1x1, bf16, on the old
+    # 6-token prompt (26 pad positions):
+    #
+    #     12B  pad 32 -> PCC 0.9746, argmax ' beach'  (HF says 'thought')  WRONG
+    #     12B  pad 128 -> PCC 0.9276, argmax '<|channel>'                  WRONG
+    #     12B  NO padding -> PCC 0.9764, argmax ' is' == HF                RIGHT
+    #     E2B  pad 32 -> 0.9750 correct;  no padding -> 0.9799 correct
+    #
+    # i.e. the result moved with the padding LENGTH, which it must not. Both models are
+    # affected; E2B's top-1 leads by ~10 logits and absorbs it, while 12B's top-3 sit
+    # within 2 logits (15.81/14.44/13.94) and reorder. The end-to-end harness never hits
+    # this because it prefills via generator.prefill_forward_text(..., prompt_lens=...),
+    # which is told the real prompt length; ttnn_prefill_forward has no such parameter.
+    #
+    # GEMMA4_PCC_PROMPT overrides it (e.g. for MEASUREMENT_RECORD.md 2.1's prompt), but
+    # a prompt that is not a multiple of 32 tokens reintroduces the confound above.
+    prompt = os.environ.get(
+        "GEMMA4_PCC_PROMPT",
+        "The capital of France is Paris and the capital of Germany is Berlin and the capital "
+        "of Spain is Madrid and the capital of Italy is Rome and the capital of",
+    )
+    input_ids = _encode_with_bos(tokenizer, prompt)
     seq_len = input_ids.shape[1]
+    if seq_len % 32 != 0:
+        logger.warning(
+            f"PCC prompt is {seq_len} tokens, not a multiple of 32: the TT prefill will be padded "
+            f"to {((seq_len + 31) // 32) * 32} while HF is prefilled unpadded, so this decode "
+            f"comparison is not apples-to-apples. See the comment above."
+        )
     with torch.no_grad():
         hf_out = hf_model(input_ids, use_cache=True)
         next_tok = int(hf_out.logits[0, -1].argmax().item())  # teacher-forced decode input
@@ -545,12 +606,26 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     embeds = ttnn.to_layout(
         ttnn.reshape(tt_model.embed_tokens(tokens_tt), (1, 1, padded_len, model_args.hidden_size)), ttnn.TILE_LAYOUT
     )
+    # PLI models (E2B/E4B: hidden_size_per_layer_input > 0) need BOTH input_ids_torch
+    # and embeds_torch -- _compute_per_layer_inputs raises if either is missing, since
+    # silently dropping PLI produces garbage decode with no other signal. Passing
+    # embeds_torch=None therefore made this test unrunnable on E2B from the day it
+    # landed (#46508, 2026-06-11, after the guard in #43199, 2026-05-01); it was
+    # authored against the non-PLI variants (its default model is 26B-A4B at 1x4).
+    # Same construction as test_full_model, but sourced from the model's own CPU
+    # embedding weight so no state_dict is needed here.
+    embeds_torch = (
+        F.embedding(input_ids_padded.long(), tt_model._embed_weight_cpu).float() * tt_model.embed_scale
+        if tt_model._embed_weight_cpu is not None
+        else None
+    )
+
     tt_model.ttnn_prefill_forward(
         embeds,
         page_table=None,
         kv_cache=tt_kv_cache,
         input_ids_torch=input_ids_padded,
-        embeds_torch=None,
+        embeds_torch=embeds_torch,
     ).deallocate(True)
 
     # One decode step at position seq_len with the teacher-forced token.
