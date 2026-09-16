@@ -120,9 +120,14 @@ class SpeculativeDecoder:
         #
         # The one path that genuinely cannot is the fully on-device FUSED iteration:
         # its draft tokens are argmaxed and re-embedded on device and never reach the
-        # host, so there is no id to build PLI from. ``target_needs_host_pli`` gates
+        # host, so there is no id to build PLI from. ``target_has_pli`` gates
         # that path (and routes the demo to the traced host loop instead).
-        self.target_needs_host_pli = bool(
+        # NAME: this is "does the target HAVE per-layer inputs", nothing about where they
+        # are computed. It was called target_needs_host_pli until 2026-09-16, which was a
+        # fossil from before compute_pli_device existed -- back then having PLI did imply
+        # needing it built on host. The giveaway was that it is passed straight through as
+        # its own opposite, `pli_on_device=self.target_has_pli`, below.
+        self.target_has_pli = bool(
             getattr(target_model, "hidden_size_per_layer_input", 0)
             and getattr(target_model, "per_layer_input_weights", None)
         )
@@ -1232,7 +1237,7 @@ class SpeculativeDecoder:
         # through ttnn_packed_verify_forward (which takes pli_on_device); _fused_body uses
         # ttnn_verify_forward, the batch-dim verify, which we avoid anyway because it
         # re-loads KV per candidate.
-        if self.target_needs_host_pli and not self._fused_pli_device:
+        if self.target_has_pli and not self._fused_pli_device:
             raise NotImplementedError(
                 "The fused on-device iteration needs on-device PLI for a per-layer-input target "
                 "(E2B/E4B): its draft tokens are argmaxed and re-embedded on device and never reach "
@@ -1578,7 +1583,7 @@ class SpeculativeDecoder:
             # DRAFTER round-trips its per-step argmax through the host, so this path
             # could also use host PLI, but keeping one PLI source avoids a second
             # divergence while debugging the fused body.)
-            pli_on_device=self.target_needs_host_pli,
+            pli_on_device=self.target_has_pli,
         )
         lh = self._logits_to_host(logits).reshape(B * P, -1)
         logits.deallocate(True)
@@ -1699,7 +1704,7 @@ class SpeculativeDecoder:
             # The fused trace's candidate ids are produced by the drafter's on-device
             # argmax and never reach the host, so PLI must be built on device from
             # `verify_x`. For non-PLI targets this is a no-op.
-            pli_on_device=self.target_needs_host_pli,
+            pli_on_device=self.target_has_pli,
         )
         vidx = self._argmax_last(vlogits, rows=B * P)  # [1,1,B*P] uint32 RM
         vlogits.deallocate(True)
@@ -2137,12 +2142,12 @@ class SpeculativeDecoder:
             # the acceptance gap above -- outweighs it. NOT understood; do not re-enable on
             # the KV argument alone.
             _route = os.environ.get("GEMMA4_SPEC_ROUTE", "auto")
-            if greedy and not self.target_needs_host_pli and _route == "fused-batched":
+            if greedy and not self.target_has_pli and _route == "fused-batched":
                 outs, accepts = self.generate_batched(
                     [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
                 )
                 return outs[0], accepts[0]
-            if greedy and self.target_needs_host_pli and self._fused_pli_device:
+            if greedy and self.target_has_pli and self._fused_pli_device:
                 # PLI target with on-device PLI: take the BATCHED fused trace at B=1.
                 # It is the only fused body that routes through
                 # ttnn_packed_verify_forward (the packed verify we require -- the
@@ -2173,7 +2178,7 @@ class SpeculativeDecoder:
                     [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
                 )
                 return outs[0], accepts[0]
-            if greedy and not self.target_needs_host_pli:
+            if greedy and not self.target_has_pli:
                 return self.generate_fused(anchor_token, anchor_pos, max_new_tokens)
             if greedy:
                 # PLI target (E2B/E4B): the fused iteration is out (its drafts never
@@ -2245,7 +2250,7 @@ class SpeculativeDecoder:
         # lazy init already fires out-of-trace today. This is explicit anyway: the guarantee
         # is currently an accident of the compile-run pattern, and the failure it prevents is
         # silent.
-        if traced and self._pli_dev_host and self.target_needs_host_pli:
+        if traced and self._pli_dev_host and self.target_has_pli:
             self.target.init_pli_device_weights()
         self._pv_a_prev = -1  # re-seed packed-verify staging for the new anchor/request
         # The host loop had NO steady-state timer, so the demo fell back to wall time for

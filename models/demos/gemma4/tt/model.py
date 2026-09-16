@@ -690,7 +690,7 @@ class Gemma4Model:
     # so no draft token ever reaches the host. That is the only configuration measured
     # to beat plain decode, and it is also immune to the two-traces-one-queue hang
     # (there is only one trace). It was gated off for E2B/E4B by
-    # ``target_needs_host_pli`` for exactly one reason: PLI is a function of the
+    # ``target_has_pli`` for exactly one reason: PLI is a function of the
     # candidate token IDS, and host PLI cannot see ids that never leave the device.
     #
     # The blocker was assumed to be the 4.38 GiB embed_tokens_per_layer table

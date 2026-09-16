@@ -788,18 +788,23 @@ def _run_spec_decode(
     # verify fused — avoids the distinct-CCL-trace interleave deadlock). Sampling
     # (temp>0) falls back to the host-readback generate for batch=1.
     use_fused = batch_size == 1 and ((not temperature) or temperature <= 0)
-    # E2B/E4B targets carry per-layer inputs computed on CPU from the token ids, so
-    # they cannot use the fully on-device FUSED iteration — its drafts never reach
-    # the host, so there is nothing to build PLI from. The traced HOST loop is fine
-    # (PLI enters the trace as data via a persistent buffer; see
-    # SpeculativeDecoder._verify). GEMMA4_SPEC_FUSED can force the choice for A/B.
+    # E2B/E4B targets carry per-layer inputs. They are NOT sent to the traced host loop
+    # any more: Gemma4Model.compute_pli_device builds PLI on device from the same token
+    # ids, so generate() routes them to the fused BATCHED trace (the only fused body that
+    # threads pli_on_device). Setting use_fused=False here hands that routing decision to
+    # generate() -- it does not mean "no fusion", and both entry points are single fused
+    # traces. (Until 2026-09-16 this comment claimed such targets "cannot use the fully
+    # on-device FUSED iteration", which device PLI made untrue.)
+    # GEMMA4_SPEC_FUSED can force the choice for A/B.
     _fused_env = os.environ.get("GEMMA4_SPEC_FUSED")
     if _fused_env is not None:
         use_fused = _fused_env == "1"
-    elif use_fused and getattr(spec, "target_needs_host_pli", False):
+    elif use_fused and getattr(spec, "target_has_pli", False):
         logger.info(
-            "Target uses per-layer inputs (E2B/E4B): falling back to the traced host "
-            "spec-decode loop (the fused on-device iteration would need PLI on device)."
+            "Target has per-layer inputs (E2B/E4B): deferring the route choice to "
+            "generate(), which sends it to the fused BATCHED trace (device PLI). This is "
+            "NOT a fallback to the host loop -- the authoritative route is the route= line "
+            "logged after the call."
         )
         use_fused = False
     elif use_fused and os.environ.get("GEMMA4_SPEC_ROUTE", "auto") in ("auto", "fused-batched"):

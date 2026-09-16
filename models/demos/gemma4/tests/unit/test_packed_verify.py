@@ -613,7 +613,7 @@ def test_packed_verify_traced_pli_matches_eager(mesh_device, reset_seeds):
         draft_len=3,
     )
     P = spec.draft_len + 1
-    assert spec.target_needs_host_pli, "PLI target must report target_needs_host_pli"
+    assert spec.target_has_pli, "PLI target must report target_has_pli"
 
     def _prefill():
         # warmup_prefill=False: see test_packed_verify_matches_sequential.
