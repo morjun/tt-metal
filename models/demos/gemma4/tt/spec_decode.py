@@ -2099,6 +2099,49 @@ class SpeculativeDecoder:
         """
         greedy = not temperature or temperature <= 0
         if self._use_trace:
+            # GEMMA4_SPEC_ROUTE routes a NON-PLI target (12B/31B) between the two fused
+            # bodies. DEFAULT ("auto") keeps UPSTREAM's batch-dim verify; "fused-batched"
+            # opts in to the packed one. It is OPT-IN because the packed verify MEASURED
+            # WORSE for 12B, which was not the expected result:
+            #
+            #   12B, 1x1, bf16, K=3, canonical prompt, 500 tokens, demo instrument
+            #   (text_demo_v2.py::test_demo_spec_decode), 2 runs each:
+            #     batch-dim (auto)      105.84 / 105.80 ms/iter, accept 1.66/3, 25.13 tok/s/u
+            #     packed (fused-batched) 110.86 / 111.07 ms/iter, accept 1.49/3, 22.33 tok/s/u
+            #   -> batch-dim is 12.6% better END-TO-END, on BOTH ms/iter and acceptance.
+            #
+            # It loses on BOTH factors, independently:
+            #   (a) ms/iter ~5% higher, i.e. the KV-read saving does not net out as a win;
+            #   (b) acceptance ~10% lower (1.49 vs 1.66 @500 tok; 1.41 vs 1.60 @200 tok),
+            #       so packed's slightly different logits match fewer drafts -> more
+            #       iterations per token.
+            # NOT a correctness problem: both routes are exact against plain greedy except
+            # at NEAR-TIES, which is expected of any batched verify. Measured first
+            # divergence vs plain greedy over 200 tokens: batch-dim idx 76 (top-2 gap
+            # 0.3750), packed idx 150 (gap 0.1250), both far under the 2.0 near-tie
+            # threshold, and test_spec_decode_matches_greedy PASSES on both. Packed in fact
+            # diverges LATER. The generated text does differ between routes from ~90 tokens
+            # in, which is that same near-tie effect, not corruption.
+            #
+            #   auto | (anything else) -> generate_fused -> _fused_body -> ttnn_verify_forward
+            #                             candidates in the BATCH dim; the page table is the
+            #                             user's row replicated K times, so KV is re-read once
+            #                             PER CANDIDATE. This is upstream's behaviour.
+            #   fused-batched          -> generate_batched -> _fused_body_batched ->
+            #                             ttnn_packed_verify_forward; candidates folded into
+            #                             the QUERY-HEAD dim, ONE shared KV read.
+            #
+            # A per-candidate KV re-read predicts the packed body should win (~2.35 ms of KV
+            # bytes at ctx 1024, bounded because sliding_window=1024 caps 40 of 48 layers).
+            # It does not, so something else -- packed-mask build, SDPA shape efficiency, or
+            # the acceptance gap above -- outweighs it. NOT understood; do not re-enable on
+            # the KV argument alone.
+            _route = os.environ.get("GEMMA4_SPEC_ROUTE", "auto")
+            if greedy and not self.target_needs_host_pli and _route == "fused-batched":
+                outs, accepts = self.generate_batched(
+                    [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
+                )
+                return outs[0], accepts[0]
             if greedy and self.target_needs_host_pli and self._fused_pli_device:
                 # PLI target with on-device PLI: take the BATCHED fused trace at B=1.
                 # It is the only fused body that routes through

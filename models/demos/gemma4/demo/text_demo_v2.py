@@ -802,6 +802,14 @@ def _run_spec_decode(
             "spec-decode loop (the fused on-device iteration would need PLI on device)."
         )
         use_fused = False
+    elif use_fused and os.environ.get("GEMMA4_SPEC_ROUTE", "auto") in ("auto", "fused-batched"):
+        # Delegate to generate(), which since 2026-09-16 defaults a NON-PLI target to the
+        # PACKED verify (_fused_body_batched) instead of the batch-dim one. Calling
+        # generate_fused() here would short-circuit that routing and silently pin 12B/31B
+        # to the batch-dim verify -- which is exactly what happened to an earlier A/B on
+        # this demo: all arms logged route=fused-traced because the knob never ran.
+        # GEMMA4_SPEC_ROUTE=fused (or GEMMA4_SPEC_FUSED=1) still takes the direct call.
+        use_fused = False
     # Both paths are HOST-DISPATCH bound when untraced (the fused one runs ~10
     # tok/s/u — SLOWER than plain decode); tracing removes that overhead. Default
     # tracing to the demo's `enable_trace` so spec-decode is fast out of the box;
