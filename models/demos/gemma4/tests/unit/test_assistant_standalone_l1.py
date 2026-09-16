@@ -2867,8 +2867,32 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     manifest["rope_cache_order"] = list(rig["assistant"].rope_caches_2d)
     # Reproduce the pre-L1 capture performed by the existing ledger.
     _time_fused_k_steps(mesh_device, rig, k, reps=20)
-    moved = _relocate(_weight_slots(rig["assistant"]), mesh_device, to_l1=True, only=("down_proj",))
-    assert moved == 4, f"expected four down_proj weights, moved {moved}"
+    # GEMMA4_L1_RELOC_LAYERS selects WHICH down_proj layers are relocated, e.g. "0" or "0-1";
+    # unset keeps the historical behaviour (all four). This exists because the 12B drafter
+    # cannot hold four: its down_proj is K=8192, so the LOCKSTEP charge is
+    # K*32*per_core_N*elem = 512 KiB/bank/layer against ~645 KiB of L1 left under the CB
+    # high-water, i.e. exactly ONE layer fits. n>=3 is refused by the allocator outright and
+    # n=2 CB-clashes. E2B (K=2048 -> 128 KiB/layer) is unaffected and still relocates four.
+    # "none" relocates nothing, which is how a DRAM arm is obtained from this harness --
+    # it otherwise always pins before timing, so it has no DRAM baseline of its own.
+    _reloc_spec = (os.environ.get("GEMMA4_L1_RELOC_LAYERS") or "").strip()
+    if _reloc_spec.lower() == "none":
+        _only, _expected = (), 0
+    elif _reloc_spec:
+        _sel = set()
+        for _part in _reloc_spec.split(","):
+            if "-" in _part:
+                _a, _b = _part.split("-", 1)
+                _sel.update(range(int(_a), int(_b) + 1))
+            else:
+                _sel.add(int(_part))
+        # _weight_slots labels are "L<i>.<attr>" (:937), so this matches layer AND weight.
+        _only = tuple(f"L{i}.down_proj" for i in sorted(_sel))
+        _expected = len(_sel)
+    else:
+        _only, _expected = ("down_proj",), 4
+    moved = _relocate(_weight_slots(rig["assistant"]), mesh_device, to_l1=True, only=_only)
+    assert moved == _expected, f"expected {_expected} down_proj weights, moved {moved} (only={_only})"
     body = _make_fused_k_body(rig, k)
     observed_plans = []
     original_plan = rig["assistant"].mm._gather_plan
@@ -2923,7 +2947,7 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
     ttnn.synchronize_device(mesh_device)
     try:
-        expected_ring = 4 * k if manifest["arm"] == "ring" else 0
+        expected_ring = _expected * k if manifest["arm"] == "ring" else 0
         assert sum(p["ring"] for p in observed_plans) == expected_ring, "unexpected ring engagement"
         append_record(
             output,
