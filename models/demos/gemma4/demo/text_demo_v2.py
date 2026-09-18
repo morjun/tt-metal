@@ -788,32 +788,32 @@ def _run_spec_decode(
     # verify fused — avoids the distinct-CCL-trace interleave deadlock). Sampling
     # (temp>0) falls back to the host-readback generate for batch=1.
     use_fused = batch_size == 1 and ((not temperature) or temperature <= 0)
-    # E2B/E4B targets carry per-layer inputs. They are NOT sent to the traced host loop
-    # any more: Gemma4Model.compute_pli_device builds PLI on device from the same token
-    # ids, so generate() routes them to the fused BATCHED trace (the only fused body that
-    # threads pli_on_device). Setting use_fused=False here hands that routing decision to
-    # generate() -- it does not mean "no fusion", and both entry points are single fused
-    # traces. (Until 2026-09-16 this comment claimed such targets "cannot use the fully
-    # on-device FUSED iteration", which device PLI made untrue.)
-    # GEMMA4_SPEC_FUSED can force the choice for A/B.
+    # ROUTING IS generate()'s JOB, NOT THIS DEMO'S. `use_fused=False` here means "call
+    # generate() and let it choose"; it does NOT mean "no fusion" -- generate() reaches
+    # every route, including both fused bodies. Calling generate_fused() directly instead
+    # SHORT-CIRCUITS that choice and silently pins the run to the batch-dim verify, which
+    # has happened before: an earlier A/B on this demo had every arm log
+    # route=fused-traced because the knob never reached the code that reads it.
+    #
+    # So the only reason to skip the delegation is an explicit GEMMA4_SPEC_FUSED, which
+    # exists to force the direct call for an A/B.
+    #
+    # FIXED 2026-09-18: this used to delegate only when GEMMA4_SPEC_ROUTE was `auto` or
+    # `fused-batched`. When a9c7d020626 extended that knob to `host-loop`, `fused-packed`
+    # and `fused-batch-dim`, those three fell through the gate on a NON-PLI target and were
+    # silently ignored -- reintroducing the exact bug the paragraph above describes. A PLI
+    # target was unaffected (it matched an earlier branch), which is why an E2B run did not
+    # catch it. Enumerating route values here at all was the mistake; it does not any more.
     _fused_env = os.environ.get("GEMMA4_SPEC_FUSED")
     if _fused_env is not None:
         use_fused = _fused_env == "1"
-    elif use_fused and getattr(spec, "target_has_pli", False):
+    elif use_fused:
         logger.info(
-            "Target has per-layer inputs (E2B/E4B): deferring the route choice to "
-            "generate(), which sends it to the fused BATCHED trace (device PLI). This is "
-            "NOT a fallback to the host loop -- the authoritative route is the route= line "
-            "logged after the call."
+            "Deferring the route choice to generate() (GEMMA4_SPEC_ROUTE"
+            f"={os.environ.get('GEMMA4_SPEC_ROUTE', 'auto')}). This is NOT a fallback to "
+            "the host loop -- generate() reaches every route, and the authoritative one is "
+            "the route= line logged after the call."
         )
-        use_fused = False
-    elif use_fused and os.environ.get("GEMMA4_SPEC_ROUTE", "auto") in ("auto", "fused-batched"):
-        # Delegate to generate(), which since 2026-09-16 defaults a NON-PLI target to the
-        # PACKED verify (_fused_body_batched) instead of the batch-dim one. Calling
-        # generate_fused() here would short-circuit that routing and silently pin 12B/31B
-        # to the batch-dim verify -- which is exactly what happened to an earlier A/B on
-        # this demo: all arms logged route=fused-traced because the knob never ran.
-        # GEMMA4_SPEC_ROUTE=fused (or GEMMA4_SPEC_FUSED=1) still takes the direct call.
         use_fused = False
     # Both paths are HOST-DISPATCH bound when untraced (the fused one runs ~10
     # tok/s/u — SLOWER than plain decode); tracing removes that overhead. Default
@@ -823,10 +823,10 @@ def _run_spec_decode(
     _trace_env = os.environ.get("GEMMA4_SPEC_TRACE")
     spec._use_trace = enable_trace if _trace_env is None else (_trace_env == "1")
     # `path=` below is the demo's PRE-dispatch intent and is NOT the route that runs:
-    # generate() reroutes a per-layer-input target to the fused batched trace whenever
-    # GEMMA4_SPEC_FUSED_PLI_DEV is on (spec_decode.py, see generate()), so host and fused
-    # runs used to log the identical line. The authoritative `route=` is read back from
-    # spec._last_route AFTER the call returns; quote that one, never this one.
+    # generate() picks the route from GEMMA4_SPEC_ROUTE and the target's kind (and, before
+    # a9c7d020626, from GEMMA4_SPEC_FUSED_PLI_DEV), so host and fused runs used to log the
+    # identical line. The authoritative `route=` is read back from spec._last_route AFTER
+    # the call returns; quote that one, never this one.
     logger.info(
         f"Spec-decode generate (draft_len={draft_len}, temp={temperature}, "
         f"path[intent]={'fused' if use_fused else 'host'}, trace={spec._use_trace}, "
