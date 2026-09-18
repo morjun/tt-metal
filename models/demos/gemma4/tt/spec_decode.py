@@ -179,6 +179,11 @@ class SpeculativeDecoder:
         # fused path runs device PLI would compare two different implementations in
         # every spec-vs-plain number.
         self._pli_dev_host = os.environ.get("GEMMA4_SPEC_PLI_DEV", "1") == "1"
+        # All three PLI knobs must select the SAME implementation, or a spec-vs-plain
+        # number also measures the ~1 bf16 ULP device-vs-host PLI gap. Checked at
+        # CONSTRUCTION, before any device work, because the failure mode is a plausible
+        # wrong number rather than an error. See _assert_consistent_pli.
+        self._assert_consistent_pli()
         # Which iteration structure the last generate*/ call actually ran. The demo used
         # to print its own pre-dispatch guess ("path=host"), which is blind to generate()
         # rerouting a PLI target to the fused batched trace -- so runs on two different
@@ -2085,6 +2090,91 @@ class SpeculativeDecoder:
             "    GEMMA4_SPEC_TRACE_VERIFY=0    traced drafter + eager verify\n"
             "\n"
             f"  To reproduce the hang deliberately, set {self._ALLOW_TWO_TRACES_ENV}=1."
+        )
+
+    # ── PLI: ONE implementation across every route ───────────────────────────
+    #: Escape hatch for deliberately reproducing a pre-`6806855687d` number, taken
+    #: before the three PLI knobs were made to move together.
+    _ALLOW_MIXED_PLI_ENV = "GEMMA4_PLI_ALLOW_MIXED"
+
+    def _assert_consistent_pli(self):
+        """Refuse a knob state in which two routes would run DIFFERENT PLI implementations.
+
+        Device and host PLI differ by ~1 bf16 ULP (PCC 0.9999947, max|diff| 0.0625 = one
+        ULP). That is small, and it is exactly why this check exists: a mixed state does
+        not fail, it produces numbers. Any spec-vs-plain comparison taken under one
+        silently measures the PLI implementation gap on top of whatever it meant to
+        measure, and nothing in the output says so. ``6806855687d`` flipped all three knobs
+        on together for this reason; the reason was recorded in prose, and prose is not
+        enforcement -- see ``_assert_single_trace``, which exists because that same lesson
+        had to be learned twice.
+
+        The three knobs are three per-route CALL SITES, not three settings for one thing:
+
+            GEMMA4_DECODE_PLI_DEV      plain decode             ``model.py``
+            GEMMA4_SPEC_PLI_DEV        host-loop packed verify  ``_verify_packed``
+            GEMMA4_SPEC_FUSED_PLI_DEV  the fused single trace   ``_fused_body_batched``
+
+        **``GEMMA4_SPEC_FUSED_PLI_DEV=0`` alone is NOT a mixed state and must not trip
+        this.** The fused trace cannot do host PLI at all -- its candidate ids never reach
+        the host -- so turning it off does not put that route on host PLI, it selects the
+        HOST LOOP instead, whose PLI is then governed by ``GEMMA4_SPEC_PLI_DEV``. That one
+        knob doing two jobs (mechanism and route) is a naming defect tracked separately;
+        here it simply means the fused flag is a route selector with nothing to compare.
+
+        Targets without per-layer inputs (12B/31B) build no PLI, so all three are inert.
+        """
+        if not self.target_has_pli:
+            return
+
+        decode = os.environ.get("GEMMA4_DECODE_PLI_DEV", "1") == "1"
+        spec_host = self._pli_dev_host  # GEMMA4_SPEC_PLI_DEV
+        fused_route = self._fused_pli_device  # GEMMA4_SPEC_FUSED_PLI_DEV
+        where = lambda flag: "DEVICE" if flag else "HOST"  # noqa: E731
+
+        problems = []
+        if fused_route and not decode:
+            problems.append(
+                "  * the FUSED route is available and ALWAYS computes PLI on DEVICE (it has "
+                "no host\n    option), but plain decode is on HOST PLI "
+                "(GEMMA4_DECODE_PLI_DEV=0), so any\n    fused-vs-plain number also measures "
+                "the PLI gap."
+            )
+        if spec_host != decode:
+            problems.append(
+                f"  * the HOST-LOOP spec verify is on {where(spec_host)} PLI "
+                f"(GEMMA4_SPEC_PLI_DEV={int(spec_host)}),\n    but plain decode is on "
+                f"{where(decode)} PLI (GEMMA4_DECODE_PLI_DEV={int(decode)})."
+            )
+        if not problems:
+            return
+
+        if os.environ.get(self._ALLOW_MIXED_PLI_ENV) == "1":
+            from loguru import logger as _lg
+
+            _lg.error(
+                f"{self._ALLOW_MIXED_PLI_ENV}=1: running a MIXED PLI configuration on "
+                "purpose. Any spec-vs-plain number from this run also measures the "
+                "device-vs-host PLI gap and is NOT comparable to the record."
+            )
+            return
+
+        raise RuntimeError(
+            "REFUSED: mixed PLI implementations across routes -- a CONFOUNDED measurement.\n"
+            "\n" + "\n".join(problems) + "\n"
+            "\n"
+            "  Device and host PLI differ by ~1 bf16 ULP, so this does not fail: it runs\n"
+            "  and produces numbers that silently include that gap.\n"
+            "\n"
+            "  Put every route on the SAME PLI implementation:\n"
+            "    (unset)                                          all DEVICE\n"
+            "    GEMMA4_SPEC_PLI_DEV=0 GEMMA4_DECODE_PLI_DEV=0    all HOST\n"
+            "\n"
+            "  To A/B the ROUTE at a fixed PLI implementation, set\n"
+            "  GEMMA4_SPEC_FUSED_PLI_DEV=0 alone: it selects the host loop and leaves\n"
+            "  every route's PLI implementation untouched.\n"
+            "\n"
+            f"  To run a mixed configuration deliberately, set {self._ALLOW_MIXED_PLI_ENV}=1."
         )
 
     def generate(
