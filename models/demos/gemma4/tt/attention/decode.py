@@ -620,13 +620,30 @@ def _packed_verify_sdpa(
     # assertion, but that only bites when PNHt is odd. At H_local=8, P=4:
     # PNHt = H*P/32 = 1, so min(PNHt*Sk_chunk_t, dst_size) = min(2, 8) = 2, already
     # a power of two — the workaround is not needed for this shape.
-    # Apply the fp32 workaround ONLY for the shape that actually needs it.
     #
     # It exists to satisfy ttnn's assertion that
     #     MUL_BCAST_GRANULARITY = min(PNHt * Sk_chunk_t, dst_size)
     # is a power of 2. With bf16 dst_size=8 and Sk_chunk_t = k_chunk(64)/32 = 2 that
     # fails at exactly ONE value, PNHt == 3 (min(6,8)=6); every other PNHt gives
     # 2, 4 or the capped 8. fp32_dest_acc_en halves dst_size to 4, making it 2 or 4.
+    #
+    # 2026-09-18: THE ASSERTION IS GONE, AND IT GUARDED NOTHING. MUL_BCAST_GRANULARITY
+    # and its LOG2_ twin are emitted into the kernel build and never read by any kernel
+    # — grep finds them only in the six program factories that SET them and in the
+    # generated defines header; sdpa_flash_decode.cpp's include (sdpa/.../
+    # compute_common.hpp) drives its loops off REDUCE_/SUB_EXP_/DHT_/STATS_GRANULARITY
+    # only. sdpa_decode_program_factory.cpp:773-804 now degrades every granularity to
+    # the largest power of 2 that DIVIDES it (v & -v) instead of aborting, which is
+    # the identity for every value that passed before.
+    #
+    # And the workaround was never viable at the shape it was kept for: at PNHt == 3
+    # fp32's dst_size=4 also gives qk_out_subblock_h = min(3, 4/2) = 2, which does not
+    # divide PNHt = 3, so the QK matmul reserves 6 output tiles and pushes 4 — the
+    # compute kernel DEADLOCKS. Measured on an isolated SDPA-decode probe at 1x1
+    # (MEASUREMENT_RECORD.md §8.7): PNHt=3 + fp32 hangs the board; PNHt=3 + bf16 is
+    # correct on all three tile rows (PCC 0.9998); PNHt=1 + fp32, where the blocking
+    # is fine, drops PCC 0.999778 -> 0.052540 with everything else held fixed. So
+    # fp32 is harmful at BOTH shapes and nothing forces it any more: opt-in only.
     #
     # It used to be applied to EVERY single-device call, and that is a correctness
     # bug, not just wasted precision. Measured at 1x1, H_local=8, P=4 (PNHt=1, so the
@@ -656,16 +673,14 @@ def _packed_verify_sdpa(
             f"draft_len = {_mult}*n - 1 (e.g. {_mult - 1}, {2 * _mult - 1}, {3 * _mult - 1})."
         )
     _pnht = (H_local * P) // 32
-    _needs_fp32 = _pnht == 3  # the only PNHt where the power-of-2 assertion fails
     _fp32_env = os.environ.get("GEMMA4_PV_SDPA_FP32")
-    _use_fp32 = _needs_fp32 if _fp32_env is None else (_fp32_env == "1")
+    _use_fp32 = _fp32_env == "1"  # opt-in ONLY — see the 2026-09-18 note above
     if not _use_fp32:
         compute_kernel_config = None
     else:
-        # NOTE both knobs below are INERT unless this branch runs, i.e. unless PNHt == 3
-        # (draft_len 11 at tp=1) or GEMMA4_PV_SDPA_FP32=1 is set explicitly. At the shipping
-        # draft_len=3 the op default is used and neither knob has any effect -- setting them
-        # alone changes nothing and reports nothing. Pair them with GEMMA4_PV_SDPA_FP32=1.
+        # NOTE both knobs below are INERT unless this branch runs, i.e. unless
+        # GEMMA4_PV_SDPA_FP32=1 is set explicitly -- setting them alone changes nothing
+        # and reports nothing. Pair them with GEMMA4_PV_SDPA_FP32=1.
         _fid = getattr(ttnn.MathFidelity, os.environ.get("GEMMA4_PV_SDPA_FIDELITY", "HiFi2"))
         compute_kernel_config = ttnn.init_device_compute_kernel_config(
             _dev.arch(),

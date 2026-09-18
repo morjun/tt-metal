@@ -771,10 +771,35 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     compute_defines["LOG2_DHT_GRANULARITY"] = std::to_string(log2_dht_granularity);
 
     if (Sk_chunk_t > 0) {
+        // A granularity is a compile-time LOOP STEP. The compute kernels use it as
+        //     dst_tiles = min(cols, G);  granularity = cols / G;
+        // and shift by LOG2_<name> instead of dividing, so G must be a power of 2
+        // AND must divide the tile count it steps over.
+        //
+        // min(PNHt * Sk_chunk_t, dst_size) is neither when PNHt is odd and > 1:
+        // PNHt = 3 with Sk_chunk_t = 2 gives 6. That is the ONLY thing that made
+        // bf16 accumulation unreachable for the packed speculative verify at
+        // draft_len = 11 (PNH = H_local * P = 8 * 12 = 96 => PNHt = 3), and the
+        // fp32_dest_acc_en workaround used to dodge it (dst_size 8 -> 4) is worse
+        // than the assertion: at PNHt = 3 it also makes qk_out_subblock_h = 2,
+        // which does not divide PNHt = 3, so the QK matmul computes 2 of the 3
+        // padded-head tile rows (see qk_in0_num_subblocks above).
+        //
+        // Degrade to the largest power of 2 that DIVIDES the value instead of
+        // aborting -- same spirit as dht_granularity above, which degrades to 1.
+        // For every value that is already a power of 2 this is the identity, so
+        // it is inert for every shape that works today.
+        //
+        // NOTE std::bit_floor is NOT the right degrade: bit_floor(6) = 4 is a
+        // power of 2 but does not divide 6, so `cols / G` would silently drop two
+        // of the six tiles. The lowest set bit (6 -> 2) is both a power of 2 and a
+        // divisor.
+        auto largest_pow2_divisor = [](uint32_t v) { return v & (~v + 1u); };
         auto add_granularity = [&](const char* name, uint32_t value) {
-            uint32_t log2_val = static_cast<uint32_t>(std::log2(value));
-            TT_FATAL(value == (1u << log2_val), "{} ({}) must be power of 2", name, value);
-            compute_defines[name] = std::to_string(value);
+            TT_FATAL(value > 0, "{} must be non-zero", name);
+            const uint32_t granularity = largest_pow2_divisor(value);
+            const uint32_t log2_val = static_cast<uint32_t>(std::log2(granularity));
+            compute_defines[name] = std::to_string(granularity);
             compute_defines[std::string("LOG2_") + name] = std::to_string(log2_val);
         };
         add_granularity("SUB_EXP_GRANULARITY", std::min(Sk_chunk_t, dst_size));
