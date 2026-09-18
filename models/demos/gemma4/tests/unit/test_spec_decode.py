@@ -42,6 +42,26 @@ _assistant_probe = pytest.mark.skipif(
 )
 
 
+def _draft_len(mesh_device):
+    """``GEMMA4_SPEC_DRAFT_LEN``, defaulting to the smallest LEGAL value for this mesh.
+
+    The packed verify folds the P = K+1 candidates into the query-head dim, which must be
+    tile-aligned: ``(H_local * P) % 32 == 0`` (``attention/decode.py``). E2B has 8 query
+    heads, so ``H_local = 8 // tp`` and the smallest legal P is ``4 * tp``, i.e.
+    ``draft_len = 4*tp - 1`` — 3 at tp=1, 7 at tp=2, 15 at tp=4. That is also the shipping
+    configuration, so tests measure what actually runs.
+
+    This exists because the default was previously duplicated at 15 call sites, and at 13 of
+    them it was a hardcoded ``4`` — P=5, legal at NO mesh shape. Only 2 sites had been fixed
+    in place with the expression below, so the defect kept being reintroduced by copy-paste;
+    centralising it is the point. The violation surfaces as "Statically allocated circular
+    buffers ... grow to 2005952 B which is beyond max L1 size of 1572864 B"
+    (``program.cpp:1717``) in the tests that reach the packed verify, which names neither
+    draft_len nor the constraint it broke.
+    """
+    return int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4 * tuple(mesh_device.shape)[1] - 1))
+
+
 @lru_cache(maxsize=1)
 def _target_text_config():
     model_path = os.getenv("HF_MODEL")
@@ -929,7 +949,7 @@ def test_export_tt_spec_features(mesh_device, reset_seeds):
         # Hardcoding 4 gave P=5, which is legal at NO mesh shape and blew up at 1x1
         # with "circular buffers grow to 2005952 B > max L1 1572864 B"
         # (program.cpp:1717) rather than anything diagnosable.
-        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4 * tuple(mesh_device.shape)[1] - 1)),
+        draft_len=_draft_len(mesh_device),
     )
 
     generator.prefill_forward_text(in_pt, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos)
@@ -1074,7 +1094,7 @@ def test_assistant_recurrent_vs_hf_realistic(mesh_device, reset_seeds):
 
     page_table = create_tt_page_table(1, paged_attention_config)
     prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Write a short paragraph about the history of the Eiffel Tower.")
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
         [prompt], tokenizer, generator.model_args, True, 32, max_prefill_len=max_seq_len
     )
@@ -1477,7 +1497,7 @@ def test_drafter_per_position_tt_vs_hf(mesh_device, reset_seeds):
 
     page_table = create_tt_page_table(1, paged_attention_config)
     prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Write a short paragraph about the history of the Eiffel Tower.")
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
         [prompt], tokenizer, generator.model_args, True, n_steps, max_prefill_len=max_seq_len
     )
@@ -1619,7 +1639,7 @@ def test_tt_drafter_greedychain_acceptance(mesh_device, reset_seeds):
 
     page_table = create_tt_page_table(1, paged_attention_config)
     prompt = os.environ.get("GEMMA4_SPEC_PROMPT", "Write a short paragraph about the history of the Eiffel Tower.")
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     in_pt, encoded, decoding_pos, prefill_lens = preprocess_inputs_prefill(
         [prompt], tokenizer, generator.model_args, True, n_steps, max_prefill_len=max_seq_len
     )
@@ -1747,7 +1767,7 @@ def test_spec_decode_matches_greedy(mesh_device, reset_seeds):
         # i.e. P divisible by 32 // H_local. E2B has 8 query heads so H_local = 8 // tp
         # and the smallest legal P is 4*tp => K = 4*tp - 1 (3 at tp=1, 7 at tp=2,
         # 15 at tp=4). The hardcoded 4 gave P=5, legal at NO mesh shape.
-        draft_len=int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4 * tuple(mesh_device.shape)[1] - 1)),
+        draft_len=_draft_len(mesh_device),
     )
 
     # Reference: prefill, then plain greedy decode.
@@ -1947,7 +1967,7 @@ def test_spec_decode_perf_breakdown(mesh_device, reset_seeds):
     in_pt = torch.stack(in_pt).view(1, -1)
     anchor_token = int(encoded[0][prefill_lens[0] - 1])
     anchor_pos = prefill_lens[0] - 1
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     spec = SpeculativeDecoder(
         target_model=target,
         assistant_model=assistant,
@@ -2271,7 +2291,7 @@ def test_verify_trace_batched_capture(mesh_device, reset_seeds):
         pytest.skip("set HF_MODEL (target) to run")
     max_seq_len = 1024
     block_size = 64
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2401,7 +2421,7 @@ def test_ondevice_argmax_probe(mesh_device, reset_seeds):
         pytest.skip("set HF_MODEL (target) to run")
     max_seq_len = 1024
     block_size = 64
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2527,7 +2547,7 @@ def test_fused_iter_eager(mesh_device, reset_seeds):
         pytest.skip("set HF_MODEL (target) to run")
     max_seq_len = 1024
     block_size = 64
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2621,7 +2641,7 @@ def test_fused_loop_eager(mesh_device, reset_seeds):
     max_seq_len = 1024
     block_size = 64
     n_new = int(os.environ.get("GEMMA4_SPEC_TEST_TOKENS", 48))
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2726,7 +2746,7 @@ def test_fused_loop_traced(mesh_device, reset_seeds):
     max_seq_len = 1024
     block_size = 64
     n_new = int(os.environ.get("GEMMA4_SPEC_TEST_TOKENS", 32))
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2825,7 +2845,7 @@ def test_fused_trace_minimal(mesh_device, reset_seeds):
     max_seq_len = 1024
     block_size = 64
     n_new = int(os.environ.get("GEMMA4_SPEC_TEST_TOKENS", 24))
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -2908,7 +2928,7 @@ def test_verify_seqkv_cost(mesh_device, reset_seeds):
         pytest.skip("set HF_MODEL (target) to run")
     max_seq_len = 1024
     block_size = 64
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -3020,7 +3040,7 @@ def test_draft_step_breakdown(mesh_device, reset_seeds):
         pytest.skip("set HF_MODEL (target) to run")
     max_seq_len = 1024
     block_size = 64
-    K = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    K = _draft_len(mesh_device)
     paged_attention_config = PagedAttentionConfig(
         block_size=block_size, max_num_blocks=math.ceil(max_seq_len / block_size)
     )
@@ -3270,7 +3290,7 @@ def test_spec_decode_batched(mesh_device, reset_seeds):
     B = int(os.environ.get("GEMMA4_SPEC_BATCH", 4))
     max_seq_len = int(os.environ.get("GEMMA4_SPEC_MAX_SEQ", 1024))
     n_new = int(os.environ.get("GEMMA4_SPEC_TEST_TOKENS", 16))
-    draft_len = int(os.environ.get("GEMMA4_SPEC_DRAFT_LEN", 4))
+    draft_len = _draft_len(mesh_device)
     block_size = 64
     blocks_per_user = math.ceil(max_seq_len / block_size)
     paged_attention_config = PagedAttentionConfig(block_size=block_size, max_num_blocks=B * blocks_per_user)

@@ -662,6 +662,10 @@ def _packed_verify_sdpa(
     if not _use_fp32:
         compute_kernel_config = None
     else:
+        # NOTE both knobs below are INERT unless this branch runs, i.e. unless PNHt == 3
+        # (draft_len 11 at tp=1) or GEMMA4_PV_SDPA_FP32=1 is set explicitly. At the shipping
+        # draft_len=3 the op default is used and neither knob has any effect -- setting them
+        # alone changes nothing and reports nothing. Pair them with GEMMA4_PV_SDPA_FP32=1.
         _fid = getattr(ttnn.MathFidelity, os.environ.get("GEMMA4_PV_SDPA_FIDELITY", "HiFi2"))
         compute_kernel_config = ttnn.init_device_compute_kernel_config(
             _dev.arch(),

@@ -2618,6 +2618,11 @@ def test_fused_k_step_dram_vs_l1(mesh_device, reset_seeds):
     prefix and cannot be inferred from the total.
     """
     k = int(os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3"))
+    # 8, NOT weight_placement.DEFAULT_BUDGET_MB (32). This is deliberate and must not be
+    # "fixed" to track the production default: every ledger number on record was taken at
+    # an 8 MB budget, and the budget selects WHICH tensors get admitted (whole-tensor
+    # greedy first-fit), so raising it silently changes the pinned set and invalidates the
+    # comparison rather than improving it.
     budget = float(os.getenv("GEMMA4_L1_WEIGHT_BUDGET_MB", "8"))
 
     # EVERY arm gets the tuner. ``_build_standalone`` force-enables it for
