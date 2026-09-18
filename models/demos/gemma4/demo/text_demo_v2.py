@@ -810,9 +810,9 @@ def _run_spec_decode(
     elif use_fused:
         logger.info(
             "Deferring the route choice to generate() (GEMMA4_SPEC_ROUTE"
-            f"={os.environ.get('GEMMA4_SPEC_ROUTE', 'auto')}). This is NOT a fallback to "
-            "the host loop -- generate() reaches every route, and the authoritative one is "
-            "the route= line logged after the call."
+            f"={os.environ.get('GEMMA4_SPEC_ROUTE', 'auto')}). Deferring is not itself a "
+            "route: generate() reaches every one of them, including both fused bodies. "
+            "The authoritative route is the route= line logged after the call."
         )
         use_fused = False
     # Both paths are HOST-DISPATCH bound when untraced (the fused one runs ~10
