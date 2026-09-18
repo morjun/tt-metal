@@ -18,34 +18,39 @@
 #include "experimental/ckernel_sfpu_abs.h"
 #include "llk_sfpu/ckernel_sfpu_clamp.h"
 #include "llk_sfpu/ckernel_sfpu_comp.h"
+#include "llk_sfpu/ckernel_sfpu_cumsum.h"
 #include "llk_sfpu/ckernel_sfpu_exp.h"
 #include "llk_sfpu/ckernel_sfpu_gelu.h"
 #include "llk_sfpu/ckernel_sfpu_negative.h"
 #include "llk_sfpu/ckernel_sfpu_recip.h"
+#include "llk_sfpu/ckernel_sfpu_relu.h"
+#include "llk_sfpu/ckernel_sfpu_rounding_ops.h"
 #include "llk_sfpu/ckernel_sfpu_rsqrt.h"
 #include "llk_sfpu/ckernel_sfpu_softplus.h"
 #include "llk_sfpu/ckernel_sfpu_square.h"
 #include "llk_sfpu/ckernel_sfpu_tanh.h"
 #include "llk_sfpu/ckernel_sfpu_trigonometry.h"
 #include "llk_sfpu/ckernel_sfpu_typecast.h"
-#include "sfpu/ckernel_sfpu_relu.h"
 #include "sfpu/ckernel_sfpu_sigmoid.h"
 #include "sfpu/ckernel_sfpu_silu.h"
 #include "sfpu/ckernel_sfpu_sqrt.h"
+#include "sfpu/ckernel_sfpu_typecast_fp32_to_uint16.h"
 
 // Binary SFPU op headers (consumed by the binary dispatchers below). The op is
 // selected via the LLK ckernel::BinaryOp enum (reused like Blackhole; the
-// comparison and max/min enumerators were added to it in llk_defs.h).
+// comparison, max/min, and atan2 enumerators were added to it in ckernel_defs.h).
 //
 // To add a new Quasar binary SFPU op:
 // 1. Include its ckernel header below.
-// 2. Add the enumerator to ckernel::BinaryOp (llk_defs.h) if it is not there.
+// 2. Add the enumerator to ckernel::BinaryOp (tt_llk_quasar/common/inc/ckernel_defs.h) if it is not there.
 // 3. Add the `if constexpr` branch in call_binary_sfpu_operation_quasar()
 //    (and init_binary_sfpu_operation_quasar() if it needs an init step).
+#include "llk_sfpu/ckernel_sfpu_add.h"            // calculate_add_int (int add)
+#include "llk_sfpu/ckernel_sfpu_atan2.h"          // calculate_sfpu_atan2 / calculate_sfpu_atan2_init (float atan2)
 #include "llk_sfpu/ckernel_sfpu_binary.h"         // calculate_sfpu_binary / sfpu_binary_init (float mul/div)
 #include "llk_sfpu/ckernel_sfpu_binary_max_min.h" // calculate_binary_max_min / _init_binary_max_min_
+#include "llk_sfpu/ckernel_sfpu_quant.h"          // quant_family / quant_family_init (quant/requant/dequant)
 #include "llk_sfpu/llk_math_eltwise_binary_sfpu_macros.h"
-#include "sfpu/ckernel_sfpu_add.h"         // _add_int_ (int add)
 #include "sfpu/ckernel_sfpu_binary_comp.h" // calculate_binary_comp_int32 (int gt/lt/le/ge)
 #include "sfpu/ckernel_sfpu_mul_int32.h"   // _mul_int32_ (int mul)
 
@@ -54,6 +59,9 @@ namespace test_utils
 using namespace ckernel;
 using namespace ckernel::math;
 using namespace ckernel::sfpu;
+
+template <auto>
+inline constexpr bool unhandled_op = false;
 
 /**
  * @brief Whether OPERATION is one of the six comparison-to-zero modes.
@@ -94,7 +102,7 @@ void init_unary_sfpu_operation_quasar()
 {
     if constexpr (OPERATION == SfpuType::gelu)
     {
-        gelu_init();
+        gelu_init<APPROX, is_fp32_dest_acc_en>();
     }
     else if constexpr (OPERATION == SfpuType::square)
     {
@@ -119,6 +127,10 @@ void init_unary_sfpu_operation_quasar()
     else if constexpr (is_trig_op(OPERATION))
     {
         init_trigonometry<OPERATION, is_fp32_dest_acc_en>();
+    }
+    else if constexpr (OPERATION == SfpuType::cumsum)
+    {
+        cumsum_init<APPROX>();
     }
 }
 
@@ -188,14 +200,26 @@ void call_zero_comp_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_fo
  * @tparam is_fp32_dest_acc_en Whether Dest is in FP32 mode.
  * @tparam APPROX Whether operations with approximate and accurate paths use the approximate path.
  * @tparam ITERATIONS Number of SFPU loop iterations.
+ * @tparam TYPECAST_IN_FORMAT Source format for the typecast op (default Float32).
+ * @tparam TYPECAST_OUT_FORMAT Destination format for the typecast op (default Float16_b).
  * @param dst_index Destination tile index operated on (already offset by DST_INDEX).
  * @param sfpu_format SFPU math format; only the comp family reads it (see
  *        @ref call_zero_comp_operation_quasar), float-only ops ignore it.
+ * @param first Whether this tile starts a fresh top-to-bottom accumulation chain; only cumsum
+ *        reads it. Defaults to true so each tile is independent.
  * @note Must be preceded by @ref init_unary_sfpu_operation_quasar for the same op.
  */
-template <SfpuType OPERATION, DstSync DST_SYNC, bool is_fp32_dest_acc_en, bool APPROX = false, int ITERATIONS = SFPU_ITERATIONS>
-void call_unary_sfpu_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_format = DataFormat::Float32)
+template <
+    SfpuType OPERATION,
+    DstSync DST_SYNC,
+    bool is_fp32_dest_acc_en,
+    bool APPROX                    = false,
+    int ITERATIONS                 = SFPU_ITERATIONS,
+    DataFormat TYPECAST_IN_FORMAT  = DataFormat::Float32,
+    DataFormat TYPECAST_OUT_FORMAT = DataFormat::Float16_b>
+void call_unary_sfpu_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_format = DataFormat::Float32, [[maybe_unused]] const bool first = true)
 {
+    constexpr std::uint32_t kReluThresholdBits = 0x40A00000u; // 5.0f
     if constexpr (OPERATION == SfpuType::abs)
     {
         SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_abs_, (ITERATIONS), dst_index, VectorMode::RC);
@@ -213,11 +237,37 @@ void call_unary_sfpu_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_f
     }
     else if constexpr (OPERATION == SfpuType::gelu)
     {
-        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_gelu, (true /* APPROX */, ITERATIONS), dst_index, VectorMode::RC);
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_gelu, (APPROX, is_fp32_dest_acc_en, ITERATIONS), dst_index, VectorMode::RC);
     }
     else if constexpr (OPERATION == SfpuType::relu)
     {
         SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_relu_, (ITERATIONS), dst_index, VectorMode::RC);
+    }
+    else if constexpr (OPERATION == SfpuType::lrelu)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_lrelu_, (ITERATIONS), dst_index, VectorMode::RC, 0x3dcccccdu /* slope: 0.1f */);
+    }
+    else if constexpr (OPERATION == SfpuType::relu_min)
+    {
+        SFPU_UNARY_CALL(
+            DST_SYNC,
+            is_fp32_dest_acc_en,
+            _relu_min_,
+            (sfpi::vFloat, APPROX, ITERATIONS, std::uint32_t),
+            dst_index,
+            VectorMode::RC,
+            kReluThresholdBits /* threshold: 5.0f */);
+    }
+    else if constexpr (OPERATION == SfpuType::relu_max)
+    {
+        SFPU_UNARY_CALL(
+            DST_SYNC,
+            is_fp32_dest_acc_en,
+            _relu_max_,
+            (sfpi::vFloat, APPROX, ITERATIONS, std::uint32_t),
+            dst_index,
+            VectorMode::RC,
+            kReluThresholdBits /* threshold: 5.0f */);
     }
     else if constexpr (OPERATION == SfpuType::reciprocal)
     {
@@ -250,9 +300,9 @@ void call_unary_sfpu_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_f
     else if constexpr (is_trig_op(OPERATION))
     {
         // One op-templated kernel serves sine/cosine/acosh/asinh/atanh; OPERATION picks the branch
-        // at compile time. APPROXIMATION_MODE=false selects the full-polynomial (accurate) path;
-        // VectorMode::RC (the params default) runs the functor once per face.
-        _llk_math_eltwise_unary_sfpu_params_(calculate_trigonometry<OPERATION, false /* APPROX */, is_fp32_dest_acc_en, ITERATIONS>, dst_index);
+        // at compile time. APPROXIMATION_MODE=false selects the full-polynomial (accurate) path.
+        SFPU_UNARY_CALL(
+            DST_SYNC, is_fp32_dest_acc_en, calculate_trigonometry, (OPERATION, false /* APPROX */, is_fp32_dest_acc_en, ITERATIONS), dst_index, VectorMode::RC);
     }
     else if constexpr (OPERATION == SfpuType::negative)
     {
@@ -293,15 +343,48 @@ void call_unary_sfpu_operation_quasar(std::uint32_t dst_index, DataFormat sfpu_f
     }
     else if constexpr (OPERATION == SfpuType::typecast)
     {
-        // Typecast is parameterized by the (input,output) DataFormat pair, which the test
-        // bakes in as the compile-time constants TYPECAST_IN_FORMAT / TYPECAST_OUT_FORMAT (set
-        // by the TYPECAST_FORMATS variant). The functor picks the conversion sequence from the
-        // pair at compile time.
-        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_typecast, (TYPECAST_IN_FORMAT, TYPECAST_OUT_FORMAT, ITERATIONS), dst_index, VectorMode::RC);
+        if constexpr (TYPECAST_IN_FORMAT == DataFormat::Float32 && TYPECAST_OUT_FORMAT == DataFormat::UInt16)
+        {
+            // Dedicated TTI kernel: names the FP32 load and UInt16 store formats explicitly
+            // rather than letting HW imply them, so it needs implied math format disabled.
+            // Walks Dest through ADDR_MOD_7 + _incr_counters_ instead of ADDR_MOD_6.
+            SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_typecast_fp32_to_uint16_, (ITERATIONS), dst_index, VectorMode::RC);
+        }
+        else
+        {
+            SFPU_UNARY_CALL(
+                DST_SYNC, is_fp32_dest_acc_en, calculate_typecast, (TYPECAST_IN_FORMAT, TYPECAST_OUT_FORMAT, ITERATIONS), dst_index, VectorMode::RC);
+        }
+    }
+    else if constexpr (OPERATION == SfpuType::cumsum)
+    {
+        // Whole-tile op: the accumulation chain spans all 32 tile rows and crosses the face-pair
+        // boundary, so it runs once per tile (RC_custom), not once per face.
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_cumsum, (APPROX, ITERATIONS), dst_index, VectorMode::RC_custom, first);
+    }
+    else if constexpr (OPERATION == SfpuType::floor)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_floor_, (APPROX, ITERATIONS), dst_index, VectorMode::RC);
+    }
+    else if constexpr (OPERATION == SfpuType::ceil)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_ceil_, (APPROX, ITERATIONS), dst_index, VectorMode::RC);
+    }
+    else if constexpr (OPERATION == SfpuType::trunc)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_trunc_, (APPROX, ITERATIONS), dst_index, VectorMode::RC);
+    }
+    else if constexpr (OPERATION == SfpuType::frac)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_frac_, (APPROX, ITERATIONS), dst_index, VectorMode::RC);
+    }
+    else if constexpr (OPERATION == SfpuType::round)
+    {
+        SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, _calculate_round_, (APPROX, ITERATIONS), dst_index, VectorMode::RC, 0 /* decimals */);
     }
     else
     {
-        LLK_ASSERT(false, "Unsupported Quasar unary SFPU operation");
+        static_assert(unhandled_op<OPERATION>, "call_unary_sfpu_operation_quasar: unhandled Quasar unary SFPU operation");
     }
 }
 
@@ -310,26 +393,75 @@ constexpr bool quasar_binary_op_is_max_min(ckernel::BinaryOp op)
     return op == ckernel::BinaryOp::MAX || op == ckernel::BinaryOp::MIN;
 }
 
+constexpr bool quasar_binary_op_is_quant(ckernel::BinaryOp op)
+{
+    return op == ckernel::BinaryOp::QUANT || op == ckernel::BinaryOp::REQUANT || op == ckernel::BinaryOp::DEQUANT;
+}
+
+// Map the shared BinaryOp enum onto the quant kernel's op-templated QuantVariant.
+template <ckernel::BinaryOp OP>
+constexpr ckernel::sfpu::QuantVariant quant_variant_of()
+{
+    if constexpr (OP == ckernel::BinaryOp::QUANT)
+    {
+        return ckernel::sfpu::QuantVariant::Quant;
+    }
+    else if constexpr (OP == ckernel::BinaryOp::REQUANT)
+    {
+        return ckernel::sfpu::QuantVariant::Requant;
+    }
+    else if constexpr (OP == ckernel::BinaryOp::DEQUANT)
+    {
+        return ckernel::sfpu::QuantVariant::Dequant;
+    }
+    else
+    {
+        static_assert(unhandled_op<OP>, "quant_variant_of: unhandled quant BinaryOp");
+    }
+}
+
 /**
  * @brief Run the per-operation init step for a Quasar binary SFPU op.
  *
  * @tparam OP The binary op (compile-time `ckernel::BinaryOp` constant).
+ * @tparam is_fp32_dest_acc_en Whether Dest is in FP32 mode. Must match the calculate step;
+ *         atan2 uses it to select the reciprocal variant its polynomial expects.
+ * @tparam SIGN_MAGNITUDE_FORMAT Quant family only: if true, treat int32 Dest as SMAG32
+ *         and skip the sign-magnitude<->2's-complement casts. Must match the calculate step.
+ * @tparam APPROXIMATION_MODE Whether to use the operation's approximate path. Must match the
+ *         calculate step; atan2 uses it to select the LUT-only reciprocal path.
+ * @param zero_point fp32 bit-pattern of the zero-point loaded once by the quant
+ *        family init (DEQUANT expects the bits of -zero_point); ignored by the
+ *        other ops, which have no runtime init argument.
  * @note Pair with @ref call_binary_sfpu_operation_quasar for the calculate step.
  */
-template <ckernel::BinaryOp OP>
-void init_binary_sfpu_operation_quasar()
+template <ckernel::BinaryOp OP, bool is_fp32_dest_acc_en = false, bool SIGN_MAGNITUDE_FORMAT = false, bool APPROXIMATION_MODE = false>
+void init_binary_sfpu_operation_quasar([[maybe_unused]] std::uint32_t zero_point = 0)
 {
     if constexpr (OP == BinaryOp::MUL)
     {
-        sfpu_binary_init<false /*APPROX*/, BinaryOp::MUL>(); // no-op for MUL; harmless on the int path
+        sfpu_binary_init<APPROXIMATION_MODE, BinaryOp::MUL>(); // no-op for MUL; harmless on the int path
     }
     else if constexpr (OP == BinaryOp::DIV)
     {
-        sfpu_binary_init<false /*APPROX*/, BinaryOp::DIV>();
+        // Forwards APPROXIMATION_MODE to _init_reciprocal_ (LUT-only vs Newton).
+        sfpu_binary_init<APPROXIMATION_MODE, BinaryOp::DIV>();
     }
     else if constexpr (quasar_binary_op_is_max_min(OP))
     {
         _init_binary_max_min_();
+    }
+    else if constexpr (quasar_binary_op_is_quant(OP))
+    {
+        // One op-templated quant kernel; DEQUANT's caller passes bits of -zero_point.
+        quant_family_init<quant_variant_of<OP>(), SIGN_MAGNITUDE_FORMAT>(zero_point);
+    }
+    else if constexpr (OP == BinaryOp::ATAN2)
+    {
+        // Programs the Newton-Raphson reciprocal constant. is_fp32_dest_acc_en must be the
+        // same value the calculate step uses — it picks both the minimax degree and the
+        // reciprocal variant.
+        calculate_sfpu_atan2_init<APPROXIMATION_MODE, is_fp32_dest_acc_en>();
     }
     // ADD / SUB / GT / LT / LE / GE are stateless — no init.
 }
@@ -340,12 +472,26 @@ void init_binary_sfpu_operation_quasar()
  * @tparam OP The binary op (compile-time `ckernel::BinaryOp` constant).
  * @tparam DST_SYNC Destination synchronization mode used for bounds checking.
  * @tparam is_fp32_dest_acc_en Whether Dest is in FP32 mode.
+ * @tparam dst_rounding_mode Controls bf16 narrowing for ADD/SUB results. Default truncates;
+ *         NearestEven applies software RNE before the store. Ignored for MUL (no narrowing)
+ *         and DIV (always rounds RNE regardless). No-op when is_fp32_dest_acc_en is true.
  * @tparam ITERATIONS Number of SFPU loop iterations.
+ * @tparam SIGN_MAGNITUDE_FORMAT Quant family only: if true, treat int32 Dest as SMAG32
+ *         and skip the sign-magnitude<->2's-complement casts. Must match the init step.
+ * @tparam APPROXIMATION_MODE Whether to use the operation's approximate path. Must match the
+ *         init step; atan2 uses it to select the LUT-only reciprocal path.
  * @param src0_tile,src1_tile,dst_tile Operand / result tile indices.
  * @param math_format Dest math format (Int32 vs float path for MUL and max/min).
  * @note Must be preceded by @ref init_binary_sfpu_operation_quasar for the same op.
  */
-template <ckernel::BinaryOp OP, DstSync DST_SYNC, bool is_fp32_dest_acc_en, int ITERATIONS = SFPU_ITERATIONS>
+template <
+    ckernel::BinaryOp OP,
+    DstSync DST_SYNC,
+    bool is_fp32_dest_acc_en,
+    ckernel::DstRoundingMode dst_rounding_mode = ckernel::DstRoundingMode::Default,
+    int ITERATIONS                             = SFPU_ITERATIONS,
+    bool SIGN_MAGNITUDE_FORMAT                 = false,
+    bool APPROXIMATION_MODE                    = false>
 void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t src1_tile, std::uint32_t dst_tile, [[maybe_unused]] DataFormat math_format)
 {
     if constexpr (OP == BinaryOp::ADD)
@@ -353,7 +499,14 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
         if (math_format == DataFormat::Int32)
         {
             SFPU_BINARY_CALL(
-                DST_SYNC, is_fp32_dest_acc_en, _add_int_, (false, ITERATIONS, DataFormat::Int32, 0, false), src0_tile, src1_tile, dst_tile, VectorMode::RC);
+                DST_SYNC,
+                is_fp32_dest_acc_en,
+                calculate_add_int,
+                (false, ITERATIONS, DataFormat::Int32, 0, false),
+                src0_tile,
+                src1_tile,
+                dst_tile,
+                VectorMode::RC);
         }
         else
         {
@@ -361,7 +514,7 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
                 DST_SYNC,
                 is_fp32_dest_acc_en,
                 calculate_sfpu_binary,
-                (false /*APPROX*/, BinaryOp::ADD, is_fp32_dest_acc_en, ITERATIONS),
+                (APPROXIMATION_MODE, BinaryOp::ADD, is_fp32_dest_acc_en, dst_rounding_mode, ITERATIONS),
                 src0_tile,
                 src1_tile,
                 dst_tile,
@@ -375,7 +528,7 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
             DST_SYNC,
             is_fp32_dest_acc_en,
             calculate_sfpu_binary,
-            (false /*APPROX*/, BinaryOp::SUB, is_fp32_dest_acc_en, ITERATIONS),
+            (APPROXIMATION_MODE, BinaryOp::SUB, is_fp32_dest_acc_en, dst_rounding_mode, ITERATIONS),
             src0_tile,
             src1_tile,
             dst_tile,
@@ -413,7 +566,7 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
                 DST_SYNC,
                 is_fp32_dest_acc_en,
                 calculate_sfpu_binary,
-                (false /*APPROX*/, BinaryOp::MUL, is_fp32_dest_acc_en, ITERATIONS),
+                (APPROXIMATION_MODE, BinaryOp::MUL, is_fp32_dest_acc_en, dst_rounding_mode, ITERATIONS),
                 src0_tile,
                 src1_tile,
                 dst_tile,
@@ -426,7 +579,32 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
             DST_SYNC,
             is_fp32_dest_acc_en,
             calculate_sfpu_binary,
-            (false /*APPROX*/, BinaryOp::DIV, is_fp32_dest_acc_en, ITERATIONS),
+            (APPROXIMATION_MODE, BinaryOp::DIV, is_fp32_dest_acc_en, dst_rounding_mode, ITERATIONS),
+            src0_tile,
+            src1_tile,
+            dst_tile,
+            VectorMode::RC);
+    }
+    else if constexpr (OP == BinaryOp::ATAN2)
+    {
+        // atan2(y, x): src0 = y, src1 = x. is_fp32_dest_acc_en must match the init's.
+        SFPU_BINARY_CALL(
+            DST_SYNC,
+            is_fp32_dest_acc_en,
+            calculate_sfpu_atan2,
+            (APPROXIMATION_MODE, ITERATIONS, is_fp32_dest_acc_en),
+            src0_tile,
+            src1_tile,
+            dst_tile,
+            VectorMode::RC);
+    }
+    else if constexpr (quasar_binary_op_is_quant(OP))
+    {
+        SFPU_BINARY_CALL(
+            DST_SYNC,
+            is_fp32_dest_acc_en,
+            quant_family,
+            (quant_variant_of<OP>(), ITERATIONS, SIGN_MAGNITUDE_FORMAT),
             src0_tile,
             src1_tile,
             dst_tile,
@@ -463,11 +641,7 @@ void call_binary_sfpu_operation_quasar(std::uint32_t src0_tile, std::uint32_t sr
     }
     else
     {
-        // Catches BinaryOp values this dispatcher does not implement;
-        // a compile-time static_assert can't be used here because OP is a
-        // non-type param, so sizeof(OP)==0 is non-dependent and fires for every
-        // instantiation (matches the runtime guard in the unary dispatcher).
-        LLK_ASSERT(false, "Unsupported Quasar binary SFPU operation");
+        static_assert(unhandled_op<OP>, "call_binary_sfpu_operation_quasar: unhandled Quasar binary SFPU operation");
     }
 }
 

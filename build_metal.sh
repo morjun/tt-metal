@@ -51,7 +51,9 @@ show_help() {
     echo "  --cpm-source-cache               Set path to CPM Source Cache."
     echo "  --cpm-use-local-packages         Attempt to use locally installed dependencies."
     echo "  --ttnn-shared-sub-libs           Use shared libraries for ttnn."
+    echo "  --use-system-sfpi                Use the SFPI toolchain already installed on the system/image instead of downloading it."
     echo "  --toolchain-path                 Set path to CMake toolchain file."
+    echo "  --host-march                     Set x86 host -march value. Default is x86-64-v3."
     echo "  --configure-only                 Only configure the project, do not build."
     echo "  --without-distributed            Disable distributed compute support (OpenMPI dependency). Enabled by default."
     echo "  --without-python-bindings        Disable Python bindings (ttnncpp will be available as standalone library, otherwise ttnn will include the cpp backend and the python bindings), Enabled by default"
@@ -92,7 +94,9 @@ cxx_compiler_path=""
 cpm_source_cache=""
 c_compiler_path=""
 ttnn_shared_sub_libs="OFF"
+use_system_sfpi="OFF"
 toolchain_path="cmake/x86_64-linux-clang-20-libstdcpp-toolchain.cmake"
+host_march="x86-64-v3"
 
 # Requested handling for 20.04 -> 22.04 migration
 if [[ "$FLAVOR" == "ubuntu" && "$VERSION" == "20.04" ]]; then
@@ -141,7 +145,9 @@ cpm-source-cache:
 cpm-use-local-packages
 c-compiler-path:
 ttnn-shared-sub-libs
+use-system-sfpi
 toolchain-path:
+host-march:
 configure-only
 without-distributed
 without-python-bindings
@@ -205,6 +211,8 @@ while true; do
             build_all="ON";;
         --ttnn-shared-sub-libs)
             ttnn_shared_sub_libs="ON";;
+        --use-system-sfpi)
+            use_system_sfpi="ON";;
         --configure-only)
             configure_only="ON";;
         --without-python-bindings)
@@ -225,6 +233,8 @@ while true; do
             c_compiler_path="$2";shift;;
         --toolchain-path)
             toolchain_path="$2";shift;;
+        --host-march)
+            host_march="$2";shift;;
         --release)
             build_type="Release";;
         --development)
@@ -321,12 +331,14 @@ echo "INFO: Tracy debug-verbosity categories: $perf_debug_categories_effective"
 # NOTE: upstream also echoes $enable_lto / $warnings_as_errors here; this fork does
 # not define those options (see the -j/--jobs OOM-guard variant of this script), so
 # those two echoes are intentionally omitted rather than printing empty values.
+echo "INFO: Host march: $host_march"
 
 # Prepare cmake arguments
 cmake_args+=("-B" "$build_dir")
 cmake_args+=("-G" "Ninja")
 cmake_args+=("-DCMAKE_BUILD_TYPE=$build_type")
 cmake_args+=("-DCMAKE_INSTALL_PREFIX=$cmake_install_prefix")
+cmake_args+=("-DTT_X86_MARCH=$host_march")
 
 if [ "$cxx_compiler_path" != "" ]; then
     echo "INFO: C++ compiler: $cxx_compiler_path"
@@ -366,6 +378,10 @@ fi
 
 if [ "$ttnn_shared_sub_libs" = "ON" ]; then
     cmake_args+=("-DENABLE_TTNN_SHARED_SUBLIBS=ON")
+fi
+
+if [ "$use_system_sfpi" = "ON" ]; then
+    cmake_args+=("-DTT_USE_SYSTEM_SFPI=ON")
 fi
 
 if [ "$build_tests" = "ON" ]; then

@@ -14,6 +14,8 @@
 
 #include "ttnn/tensor/storage.hpp"
 
+#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
+
 namespace ttnn {
 
 using tt::tt_metal::Buffer;
@@ -97,8 +99,8 @@ struct DeviceStorage::MeshTensorHolder {
         if (auto* allocated = std::get_if<Allocated>(&state_)) {
             // Capture spec/topology, then replace the Allocated state. The MeshTensor is destroyed by this
             // assignment, and its destructor releases the underlying device memory.
-            state_ =
-                DeallocatedTombStone{allocated->mesh_tensor_.tensor_spec(), allocated->mesh_tensor_.tensor_topology()};
+            state_ = DeallocatedTombStone{
+                allocated->mesh_tensor_.tensor_spec(), tt::tt_metal::get_tensor_topology(allocated->mesh_tensor_)};
         }
     }
 };
@@ -163,6 +165,16 @@ const tt::tt_metal::distributed::MeshBuffer& DeviceStorage::get_mesh_buffer() co
         mesh_tensor_holder_->state_);
 }
 
+const tt::tt_metal::distributed::MeshBuffer& DeviceStorage::get_root_mesh_buffer() const {
+    return std::visit(
+        ttsl::overloaded{
+            [](const MeshTensorHolder::Allocated& allocated) -> const tt::tt_metal::distributed::MeshBuffer& {
+                return allocated.mesh_tensor_.mesh_buffer();
+            },
+            [](const auto&) -> const tt::tt_metal::distributed::MeshBuffer& { TT_THROW("Tensor is not allocated"); }},
+        get_root_mesh_tensor()->state_);
+}
+
 bool DeviceStorage::is_sole_owner_of_device_memory() const {
     if (!is_allocated()) {
         return false;
@@ -211,6 +223,8 @@ void DeviceStorage::deallocate() {
 
 bool DeviceStorage::is_allocated() const { return mesh_tensor_holder_->is_allocated(); }
 
+bool DeviceStorage::is_root_allocated() const { return get_root_mesh_tensor()->is_allocated(); }
+
 bool DeviceStorage::is_uniform_storage() const { return coords_.size() == get_mesh_tensor().device().num_devices(); }
 
 std::span<const tt::tt_metal::distributed::MeshCoordinate> DeviceStorage::get_coords() const {
@@ -258,7 +272,7 @@ DeviceStorage DeviceStorage::combine_device_storages(
         tt::tt_metal::distributed::MeshShape(vec_coords.size()), shard_dim);
 
     DeviceStorage res(model_storage, std::move(vec_coords));
-    res.get_mesh_tensor().update_tensor_topology(topology);
+    update_tensor_topology(res.get_mesh_tensor(), topology);
     return res;
 }
 
@@ -279,7 +293,7 @@ const TensorTopology& DeviceStorage::get_tensor_topology() const {
     return std::visit(
         ttsl::overloaded{
             [](const MeshTensorHolder::Allocated& allocated) -> const TensorTopology& {
-                return allocated.mesh_tensor_.tensor_topology();
+                return tt::tt_metal::get_tensor_topology(allocated.mesh_tensor_);
             },
             [](const MeshTensorHolder::DeallocatedTombStone& tombstone) -> const TensorTopology& {
                 return tombstone.tensor_topology_;

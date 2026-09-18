@@ -165,11 +165,7 @@ _QUASAR_COLS_TO_REMOVE = {
     "DEVICE TRISC1 KERNEL DURATION [ns]",
     "DEVICE TRISC2 KERNEL DURATION [ns]",
     "DEVICE ERISC KERNEL DURATION [ns]",
-    # cross-clock-domain aggregate durations (span DM + Neo-TRISC) -> no single-clock ns
-    "DEVICE KERNEL DURATION [ns]",
-    "DEVICE KERNEL DURATION DM START [ns]",
-    "DEVICE KERNEL FIRST TO LAST START [ns]",
-    # DM-start op-to-op (mixes DM+Neo-TRISC cycles)
+    # Replaced on Quasar by the per-type OP TO OP DM/TRISC LATENCY columns
     "OP TO OP LATENCY BR/NRISC START [ns]",
 }
 # Stale [ns] row keys to strip so the strict DictWriter accepts the reshaped rows.
@@ -178,8 +174,7 @@ _QUASAR_STALE_ROW_KEYS = list(_QUASAR_COLS_TO_REMOVE) + list(_QUASAR_COL_REPLACE
 
 def shape_device_headers_for_quasar(headers):
     """Rewrite the fixed device-timing headers for a Quasar report: replace certain single-processor-type
-    columns in place with two per-type [ns] columns (DM / Neo-TRISC), and drop the cross-clock-domain
-    aggregate durations. All other columns are unchanged."""
+    columns in place with two per-type [ns] columns (DM / Neo-TRISC). All other columns are unchanged."""
     shaped = []
     for header in headers:
         if header in _QUASAR_COL_REPLACEMENTS:
@@ -1010,11 +1005,6 @@ def _enrich_ops_from_device_logs(
                 )
                 assign_metric("Math Scoreboard Stall Rate", per_op_stats.get("Math Scoreboard Stall Rate", {}))
 
-                # Fidelity metrics
-                assign_metric("Fidelity Stall Rate", per_op_stats.get("Fidelity Stall Rate", {}))
-                assign_metric("HiFi Fraction", per_op_stats.get("HiFi Fraction", {}))
-                assign_metric("Avg HF Cycles Per Instrn", per_op_stats.get("Avg HF Cycles Per Instrn", {}), suffix="")
-
                 # Instruction issue rates
                 assign_metric("T0 Instrn Issue Rate", per_op_stats.get("T0 Instrn Issue Rate", {}), suffix="")
                 assign_metric("T1 Instrn Issue Rate", per_op_stats.get("T1 Instrn Issue Rate", {}), suffix="")
@@ -1309,9 +1299,7 @@ def get_device_data_generate_report(
                     metrics = device_efficiency_metrics[device]
 
                     for base_name, m in metrics.items():
-                        is_raw = (
-                            "IPC" in base_name or "Issue Rate" in base_name or base_name == "Avg HF Cycles Per Instrn"
-                        )
+                        is_raw = "IPC" in base_name or "Issue Rate" in base_name
                         suffix = "" if is_raw else " (%)"
                         # Legacy "Avg on full grid" column names.
                         if base_name == "SFPU Util":

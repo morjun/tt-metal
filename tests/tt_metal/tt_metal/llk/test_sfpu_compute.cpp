@@ -11,6 +11,7 @@
 #include <random>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tt_metal.hpp>
+#include "impl/program/program_impl.hpp"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -46,6 +47,7 @@
 #include <umd/device/types/arch.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program.hpp>
 #include <tt-metalium/int8.hpp>
+#include "tt_metal/impl/dispatch/slow_dispatch.hpp"
 
 namespace tt::tt_metal {
 
@@ -60,9 +62,12 @@ namespace unit_tests::sfpu_util {
 const map<std::string, std::map<std::string, std::string>> sfpu_op_to_op_name = {
     // FIXME: #1157
     {"relu", {{"SFPU_OP_CHAIN_0", "relu_tile_init(); relu_tile(0);"}}},
+    {"relu_min", {{"SFPU_OP_CHAIN_0", "relu_min_tile_init(); relu_min_tile(0, 0x40A33333u);"}}},  // 5.1f
+    {"relu_max", {{"SFPU_OP_CHAIN_0", "relu_max_tile_init(); relu_max_tile(0, 0x40A33333u);"}}},  // 5.1f
     {"exponential", {{"SFPU_OP_CHAIN_0", "exp_tile_init(); exp_tile(0);"}}},
     {"reciprocal", {{"SFPU_OP_CHAIN_0", "recip_tile_init(); recip_tile(0);"}}},
     {"gelu", {{"SFPU_OP_CHAIN_0", "gelu_tile_init(); gelu_tile(0);"}}},
+    {"gelu_accurate", {{"SFPU_OP_CHAIN_0", "gelu_tile_init<false>(); gelu_tile<false>(0);"}}},
     {"sqrt", {{"SFPU_OP_CHAIN_0", "sqrt_tile_init(); sqrt_tile(0);"}}},
     {"sigmoid", {{"SFPU_OP_CHAIN_0", "sigmoid_tile_init(); sigmoid_tile(0);"}}},
     {"silu", {{"SFPU_OP_CHAIN_0", "silu_tile_init(); silu_tile(0);"}}},
@@ -74,7 +79,9 @@ const map<std::string, std::map<std::string, std::string>> sfpu_op_to_op_name = 
     {"square", {{"SFPU_OP_CHAIN_0", "square_tile_init(); square_tile(0);"}}},
     {"negative", {{"SFPU_OP_CHAIN_0", "negative_tile_init(); negative_tile(0);"}}},
     {"softplus",
-     {{"SFPU_OP_CHAIN_0", "softplus_tile_init(); softplus_tile(0, /* beta */ 0x3F800000u, /* recip */0x3F800000u, /* threshold */ 0x41A00000u);"}}},
+     {{"SFPU_OP_CHAIN_0",
+       "softplus_tile_init(); softplus_tile(0, /* beta */ 0x3F800000u, /* recip */0x3F800000u, /* threshold */ "
+       "0x41A00000u);"}}},
     {"clamp", {{"SFPU_OP_CHAIN_0", "clamp_tile_init(); clamp_tile(0, 0xBF800000u, 0x3F800000u);"}}},  // [-1.0f, 1.0f]
     // Comparison-to-zero family (unary): result = 1.0f if predicate(x, 0) else 0.0f.
     {"eqz", {{"SFPU_OP_CHAIN_0", "eqz_tile_init(); eqz_tile(0);"}}},
@@ -83,6 +90,11 @@ const map<std::string, std::map<std::string, std::string>> sfpu_op_to_op_name = 
     {"gtz", {{"SFPU_OP_CHAIN_0", "gtz_tile_init(); gtz_tile(0);"}}},
     {"gez", {{"SFPU_OP_CHAIN_0", "gez_tile_init(); gez_tile(0);"}}},
     {"lez", {{"SFPU_OP_CHAIN_0", "lez_tile_init(); lez_tile(0);"}}},
+    {"ceil", {{"SFPU_OP_CHAIN_0", "rounding_op_tile_init(); ceil_tile(0);"}}},
+    {"floor", {{"SFPU_OP_CHAIN_0", "rounding_op_tile_init(); floor_tile(0);"}}},
+    {"trunc", {{"SFPU_OP_CHAIN_0", "rounding_op_tile_init(); trunc_tile(0);"}}},
+    {"frac", {{"SFPU_OP_CHAIN_0", "rounding_op_tile_init(); frac_tile(0);"}}},
+    {"round", {{"SFPU_OP_CHAIN_0", "rounding_op_tile_init(); round_tile(0, 0 /* decimals */);"}}},
 };
 
 // Binary SFPU ops driven by `run_sfpu_binary_two_input_buffer`.
@@ -104,6 +116,7 @@ const map<std::string, std::map<std::string, std::string>> sfpu_op_to_op_name = 
 const map<std::string, std::map<std::string, std::string>> sfpu_binary_op_to_op_name = {
     {"div_binary", {{"SFPU_OP_INIT_0", "div_binary_tile_init();"}, {"SFPU_OP_CHAIN_0", "div_binary_tile(0, 1, 0);"}}},
     {"mul_float", {{"SFPU_OP_INIT_0", "mul_binary_tile_init();"}, {"SFPU_OP_CHAIN_0", "mul_binary_tile(0, 1, 0);"}}},
+    {"atan2", {{"SFPU_OP_INIT_0", "atan2_binary_tile_init();"}, {"SFPU_OP_CHAIN_0", "atan2_binary_tile(0, 1, 0);"}}},
     // add_int: Int8 L1 inputs are promoted to sign-magnitude Int32 in DEST via copy_tile + fp32_dest_acc;
     // add_int_tile<Int32> (sign-mag on Quasar via ARCH_QUASAR) then adds in sign-mag space. Result in DST[0].
     {"add_int",
@@ -135,6 +148,12 @@ float sfpu_function(const std::string& op_name, float input) {
     if (op_name == "relu") {
         return fmaxf(input, 0.0f);
     }
+    if (op_name == "relu_min") {
+        return fmaxf(input, 5.1f);
+    }
+    if (op_name == "relu_max") {
+        return fmaxf(0.0f, fminf(input, 5.1f));
+    }
     if (op_name == "exponential") {
         return std::exp(input);
     }
@@ -145,6 +164,12 @@ float sfpu_function(const std::string& op_name, float input) {
         static constexpr float alpha = M_2_SQRTPI * M_SQRT1_2;
         auto x3 = input * input * input;
         return input * 0.5 * (1.0 + tanhf(alpha * (input + 0.044715 * x3)));
+    }
+    if (op_name == "gelu_accurate") {
+        // In double: erf(x/sqrt(2)) tends to -1 in the negative tail, so 1 + erf cancels. Computed
+        // in float the golden is already 1.8% off at x = -4.84, past this op's 1% rtol.
+        const double x = input;
+        return static_cast<float>(0.5 * x * (1.0 + erf(x * M_SQRT1_2)));
     }
     if (op_name == "sqrt") {
         return sqrtf(input);
@@ -200,6 +225,22 @@ float sfpu_function(const std::string& op_name, float input) {
     if (op_name == "lez") {
         return bfloat16(static_cast<float>(input) <= 0.0f ? 1.0f : 0.0f);
     }
+    if (op_name == "ceil") {
+        return std::ceil(input);
+    }
+    if (op_name == "floor") {
+        return std::floor(input);
+    }
+    if (op_name == "trunc") {
+        return std::trunc(input);
+    }
+    if (op_name == "frac") {
+        return input - std::trunc(input);
+    }
+    if (op_name == "round") {
+        // Round-half-to-even (matches _round_even_). std::round is away-from-zero.
+        return std::nearbyint(input);
+    }
     TT_THROW("Unsupported op_name in test");
 }
 
@@ -214,6 +255,10 @@ bfloat16 sfpu_binary_function(const std::string& op_name, const bfloat16& lhs, c
     }
     if (op_name == "mul_float") {
         return bfloat16(static_cast<float>(lhs) * static_cast<float>(rhs));
+    }
+    if (op_name == "atan2") {
+        // Compute API convention: the first operand is y and the second is x.
+        return bfloat16(std::atan2(static_cast<float>(lhs), static_cast<float>(rhs)));
     }
     if (op_name == "binary_max") {
         return bfloat16(std::max(static_cast<float>(lhs), static_cast<float>(rhs)));
@@ -289,6 +334,9 @@ vector<uint32_t> generate_packed_sfpu_input(const unsigned int numel, const std:
         auto possible_values = vector<bfloat16>({-1.0f, -0.5f, 0.5f, 1.0f});
         return generate_packed_random_vector_from_vector<uint32_t, bfloat16>(possible_values, numel, seed);
     }
+    if (op_name == "gelu_accurate") {
+        return generate_packed_uniform_random_vector<uint32_t, bfloat16>(-5.0f, 5.0f, numel, seed);
+    }
     if ((op_name == "eqz") || (op_name == "nez") || (op_name == "ltz") || (op_name == "gtz") || (op_name == "gez") ||
         (op_name == "lez")) {
         // Include exact zeros so the eqz/nez/lez/gez at-zero branches are exercised.
@@ -300,6 +348,16 @@ vector<uint32_t> generate_packed_sfpu_input(const unsigned int numel, const std:
     }
     if (op_name == "clamp") {
         return generate_packed_uniform_random_vector<uint32_t, bfloat16>(-2.0f, 2.0f, numel, seed);
+    }
+    if ((op_name == "relu_min") || (op_name == "relu_max")) {
+        return generate_packed_uniform_random_vector<uint32_t, bfloat16>(-2.0f, 10.0f, numel, seed);
+    }
+    if ((op_name == "ceil") || (op_name == "floor") || (op_name == "trunc") || (op_name == "frac") ||
+        (op_name == "round")) {
+        // Half-integers distinguish floor/ceil from trunc and exercise round-half-to-even.
+        auto possible_values =
+            vector<bfloat16>({-2.5f, -1.5f, -0.5f, 0.0f, 0.5f, 1.5f, 2.5f, -2.0f, 2.0f, -0.25f, 3.75f});
+        return generate_packed_random_vector_from_vector<uint32_t, bfloat16>(possible_values, numel, seed);
     }
     return generate_packed_uniform_random_vector<uint32_t, bfloat16>(-1.0f, 1.0f, numel, seed);
 }
@@ -331,6 +389,11 @@ std::pair<vector<uint32_t>, vector<uint32_t>> generate_packed_sfpu_binary_inputs
         auto lhs = generate_div_operand(numel, seed);
         auto rhs = generate_div_operand(numel, seed + 1);
         return {lhs, rhs};
+    }
+    if (op_name == "atan2") {
+        return {
+            generate_packed_uniform_random_vector<uint32_t, bfloat16>(-5.0f, 5.0f, numel, seed),
+            generate_packed_uniform_random_vector<uint32_t, bfloat16>(-5.0f, 5.0f, numel, seed + 1)};
     }
     if (op_name == "binary_max" || op_name == "binary_min") {
         auto lhs = generate_packed_uniform_random_vector<uint32_t, bfloat16>(-4.0f, 4.0f, numel, seed);
@@ -368,6 +431,9 @@ std::pair<float, float> sfpu_tolerance(const std::string& op_name, bool fp32_des
     if ((op_name == "gelu") || (op_name == "relu")) {
         return {0.15f, 0.001f};
     }
+    if (op_name == "gelu_accurate") {
+        return {0.01f, 0.001f};
+    }
     if (op_name == "exponential") {
         // 16-bit Dest runs the approximate (HW LUT) exp; 32-bit Dest runs the fp32-accurate
         // path, so hold it to a much tighter tolerance.
@@ -386,6 +452,10 @@ bool is_close_packed_sfpu_output(
     const std::vector<uint32_t>& vec_a, const std::vector<uint32_t>& vec_b, const std::string& op_name) {
     if (is_int8_binary_sfpu_op(op_name) || op_name == "binary_max" || op_name == "binary_min") {
         return vec_a == vec_b;
+    }
+    if (op_name == "ceil" || op_name == "floor" || op_name == "trunc" || op_name == "frac" || op_name == "round") {
+        return is_close_packed_vectors<bfloat16, uint32_t>(
+            vec_a, vec_b, [](const bfloat16& a, const bfloat16& b) { return a == b; });
     }
     if (op_name == "where") {
         // Matches the LLK pytest's torch.isclose(rtol=0.05, atol=0.05) for
@@ -624,9 +694,9 @@ struct SfpuConfig {
     CoreRangeSet cores;
     std::string sfpu_op;
     bool approx_mode = true;
-    bool dst_full_sync_en = true;      // SyncFull by default (matches today's implicit behavior)
-    bool unpack_to_dest_fp32 = false;  // Quasar Float32 path; default false keeps the bf16 path byte-identical
-    bool unpack_to_dest_en = false;  // explicit unpack-to-dest without forcing fp32 (e.g. 16-bit unpack-to-dest)
+    bool dst_full_sync_en = true;  // SyncFull by default (matches today's implicit behavior)
+    bool unpack_to_dest =
+        false;  // route input DFB to Dest (unpack_modes=UnpackToDest); pair with en_32bit_dest for 32-bit Dest
     bool en_32bit_dest = false;
 };
 
@@ -660,26 +730,22 @@ experimental::KernelSpec::CompilerOptions::Defines to_kernel_defines(const std::
 /// keeps the Gen1+Gen2 data-movement config and the MeshWorkload dispatch path. Callers supply the
 /// compute `defines` (op selection / chain) and the packed SRC bytes, and verify the returned DST bytes.
 std::vector<uint32_t> run_sfpu_pipeline(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    distributed::MeshDevice& mesh_device,
     const SfpuConfig& test_config,
     const std::map<std::string, std::string>& defines,
     const std::vector<uint32_t>& packed_input) {
-    auto& cq = mesh_device->mesh_command_queue();
+    auto& cq = mesh_device.mesh_command_queue();
     const size_t in_bytes = test_config.num_tiles * tt::tile_size(test_config.l1_input_data_format);
     const size_t out_bytes = test_config.num_tiles * tt::tile_size(test_config.l1_output_data_format);
 
-    tt::tt_metal::InterleavedBufferConfig in_dram{
-        .device = mesh_device->get_devices()[0],
-        .size = in_bytes,
-        .page_size = in_bytes,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-    tt::tt_metal::InterleavedBufferConfig out_dram{
-        .device = mesh_device->get_devices()[0],
-        .size = out_bytes,
-        .page_size = out_bytes,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-    auto input_dram_buffer = CreateBuffer(in_dram);
-    auto output_dram_buffer = CreateBuffer(out_dram);
+    auto input_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = in_bytes},
+        {.page_size = in_bytes, .buffer_type = BufferType::DRAM},
+        &mesh_device);
+    auto output_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = out_bytes},
+        {.page_size = out_bytes, .buffer_type = BufferType::DRAM},
+        &mesh_device);
 
     // Every parametrization of these tests uses a single-core CoreRangeSet of {0, 0};
     // MakeProgramFromSpec models the kernel set per single-core WorkUnit.
@@ -704,7 +770,7 @@ std::vector<uint32_t> run_sfpu_pipeline(
         make_dfb_spec(OUT_DFB, test_config, test_config.l1_output_data_format);
 
     experimental::DataMovementHardwareConfig reader_hw_config;
-    if (mesh_device->arch() == tt::ARCH::QUASAR) {
+    if (mesh_device.arch() == tt::ARCH::QUASAR) {
         reader_hw_config = experimental::DataMovementGen2Config{.disable_dfb_implicit_sync_for_all = true};
     } else {
         reader_hw_config = experimental::DataMovementGen1Config{
@@ -726,7 +792,7 @@ std::vector<uint32_t> run_sfpu_pipeline(
     };
 
     experimental::DataMovementHardwareConfig writer_hw_config;
-    if (mesh_device->arch() == tt::ARCH::QUASAR) {
+    if (mesh_device.arch() == tt::ARCH::QUASAR) {
         writer_hw_config = experimental::DataMovementGen2Config{.disable_dfb_implicit_sync_for_all = true};
     } else {
         writer_hw_config = experimental::DataMovementGen1Config{
@@ -749,18 +815,17 @@ std::vector<uint32_t> run_sfpu_pipeline(
 
     experimental::ComputeHardwareConfig compute_hw_config;
     experimental::ComputeUnpackModes unpack_modes{};
-    if (test_config.unpack_to_dest_fp32) {
+    if (test_config.unpack_to_dest) {
         unpack_modes = {{IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
     }
-    const bool fp32_dest_acc_en = test_config.en_32bit_dest || test_config.unpack_to_dest_fp32;
-    if (mesh_device->arch() == tt::ARCH::QUASAR) {
+    const bool fp32_dest_acc_en = test_config.en_32bit_dest;
+    if (mesh_device.arch() == tt::ARCH::QUASAR) {
         compute_hw_config = experimental::ComputeGen2Config{
             .sfpu_precision_mode =
                 test_config.approx_mode ? tt::tt_metal::Precision::Approximate : tt::tt_metal::Precision::Precise,
             .enable_32_bit_dest = fp32_dest_acc_en,
             .double_buffer_dest = !test_config.dst_full_sync_en,
             .unpack_modes = unpack_modes,
-            .unpack_to_dest_en = test_config.unpack_to_dest_fp32 || test_config.unpack_to_dest_en,
         };
     } else {
         compute_hw_config = experimental::ComputeGen1Config{
@@ -808,13 +873,7 @@ std::vector<uint32_t> run_sfpu_pipeline(
         .work_units = {wu},
     };
 
-    Program program = experimental::MakeProgramFromSpec(*mesh_device, spec);
-
-    distributed::MeshWorkload workload;
-    auto zero_coord = distributed::MeshCoordinate(0, 0);
-    auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
-    workload.add_program(device_range, std::move(program));
-    auto& program_run = workload.get_programs().at(device_range);
+    Program program = experimental::MakeProgramFromSpec(mesh_device, spec);
 
     experimental::ProgramRunArgs params;
     params.kernel_run_args = {
@@ -836,14 +895,13 @@ std::vector<uint32_t> run_sfpu_pipeline(
         },
         experimental::ProgramRunArgs::KernelRunArgs{.kernel = COMPUTE},
     };
-    experimental::SetProgramRunArgs(program_run, params);
+    experimental::SetProgramRunArgs(program, params);
 
-    tt_metal::detail::WriteToBuffer(input_dram_buffer, packed_input);
-    distributed::EnqueueMeshWorkload(cq, workload, false);
-    distributed::Finish(cq);
+    distributed::EnqueueWriteMeshBuffer(cq, input_dram_buffer, packed_input, /*blocking=*/true);
+    LaunchProgram(mesh_device, std::move(program));
 
     std::vector<uint32_t> dest_buffer_data;
-    tt_metal::detail::ReadFromBuffer(output_dram_buffer, dest_buffer_data);
+    distributed::EnqueueReadMeshBuffer(cq, dest_buffer_data, output_dram_buffer, /*blocking=*/true);
     return dest_buffer_data;
 }
 
@@ -852,22 +910,21 @@ std::vector<uint32_t> run_sfpu_pipeline(
 /// @param device
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool run_sfpu_all_same_buffer(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device, const SfpuConfig& test_config) {
+bool run_sfpu_all_same_buffer(distributed::MeshDevice& mesh_device, const SfpuConfig& test_config) {
     const size_t byte_size = test_config.num_tiles * test_config.tile_byte_size;
 
     // Input
     const bool is_fp32 = (test_config.l1_input_data_format == tt::DataFormat::Float32);
-    // The Float32 device path only wires up relu in v1; the golden/input/check helpers below are
-    // format-generic, so this is the single place that pins the supported-op set for Float32.
-    TT_FATAL(!is_fp32 || test_config.sfpu_op == "relu", "Float32 SFPU path supports relu only in v1");
+    const bool is_relu_family =
+        test_config.sfpu_op == "relu" || test_config.sfpu_op == "relu_min" || test_config.sfpu_op == "relu_max";
+    TT_FATAL(!is_fp32 || is_relu_family, "Float32 SFPU path supports relu / relu_min / relu_max only in v1");
     const size_t element_size = is_fp32 ? sizeof(float) : sizeof(bfloat16);
     const size_t numel = byte_size / element_size;
     const auto seed = std::chrono::system_clock::now().time_since_epoch().count();
-    // Float32 packs 1:1 into uint32 words (pack_vector accepts sizeof(PackType) >= sizeof(ValueType)),
-    // so the bf16 uniform-random generator works for both; relu uses the [-1, 1] default range.
+    const bool relu_threshold_op = test_config.sfpu_op == "relu_min" || test_config.sfpu_op == "relu_max";
     std::vector<uint32_t> packed_input =
-        is_fp32 ? generate_packed_uniform_random_vector<uint32_t, float>(-1.0f, 1.0f, numel, seed)
+        is_fp32 ? generate_packed_uniform_random_vector<uint32_t, float>(
+                      relu_threshold_op ? -2.0f : -1.0f, relu_threshold_op ? 10.0f : 1.0f, numel, seed)
                 : sfpu_util::generate_packed_sfpu_input(numel, test_config.sfpu_op, seed);
 
     // Golden output
@@ -901,6 +958,7 @@ bool run_sfpu_all_same_buffer(
     sfpu_defines["SFPU_OP_SOFTPLUS_INCLUDE"] = "1";
     sfpu_defines["SFPU_OP_CLAMP_INCLUDE"] = "1";
     sfpu_defines["SFPU_OP_RELU_FAMILY_INCLUDE"] = "1";
+    sfpu_defines["SFPU_OP_ROUND_FAMILY_INCLUDE"] = "1";
     sfpu_defines["SFPU_OP_COMPUTE_KERNEL_API_INCLUDE"] = "1";
     sfpu_defines["SFPU_OP_BINOP_WITH_SCALAR_INCLUDE"] = "1";
     sfpu_defines["SFPU_OP_UNARY_COMP_INCLUDE"] = "1";
@@ -951,20 +1009,19 @@ tt_metal::KernelHandle create_legacy_writer_kernel(tt_metal::Program& program, c
 // Compiles `spec`, sets `params`, uploads each input buffer, launches on the device, and
 // returns the raw output tile data. Shared by the binary and ternary Quasar SFPU runners.
 std::vector<uint32_t> sfpu_quasar_run(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    distributed::MeshDevice& mesh_device,
     const experimental::ProgramSpec& spec,
     const experimental::ProgramRunArgs& params,
-    const std::vector<std::pair<std::shared_ptr<tt::tt_metal::Buffer>, const std::vector<uint32_t>*>>& inputs,
-    const std::shared_ptr<tt::tt_metal::Buffer>& out_buf) {
-    auto* device = mesh_device->get_devices()[0];
-    auto program = experimental::MakeProgramFromSpec(*mesh_device, spec);
+    const std::vector<std::pair<std::shared_ptr<distributed::MeshBuffer>, const std::vector<uint32_t>*>>& inputs,
+    const std::shared_ptr<distributed::MeshBuffer>& out_buf) {
+    auto program = experimental::MakeProgramFromSpec(mesh_device, spec);
     experimental::SetProgramRunArgs(program, params);
     for (const auto& [buf, data] : inputs) {
-        tt_metal::detail::WriteToBuffer(buf, *data);
+        slow_dispatch::WriteToBuffer(*buf, *data);
     }
-    tt_metal::detail::LaunchProgram(device, program, /*wait_until_cores_done=*/true);
+    LaunchProgram(mesh_device, std::move(program));
     std::vector<uint32_t> dest;
-    tt_metal::detail::ReadFromBuffer(out_buf, dest);
+    slow_dispatch::ReadFromBuffer(*out_buf, dest);
     return dest;
 }
 
@@ -980,26 +1037,22 @@ std::vector<uint32_t> sfpu_quasar_run(
 /// @param mesh_device Device under test.
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool run_sfpu_binary_two_input_buffer(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device, const SfpuConfig& test_config) {
-    auto* device = mesh_device->get_devices()[0];
+bool run_sfpu_binary_two_input_buffer(distributed::MeshDevice& mesh_device, const SfpuConfig& test_config) {
     const size_t per_buffer_byte_size_input = test_config.num_tiles * tt::tile_size(test_config.l1_input_data_format);
     const size_t per_buffer_byte_size_output = test_config.num_tiles * tt::tile_size(test_config.l1_output_data_format);
 
-    tt::tt_metal::InterleavedBufferConfig dram_config_input{
-        .device = device,
-        .size = per_buffer_byte_size_input,
-        .page_size = per_buffer_byte_size_input,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-    tt::tt_metal::InterleavedBufferConfig dram_config_output{
-        .device = device,
-        .size = per_buffer_byte_size_output,
-        .page_size = per_buffer_byte_size_output,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-
-    auto input0_dram_buffer = CreateBuffer(dram_config_input);
-    auto input1_dram_buffer = CreateBuffer(dram_config_input);
-    auto output_dram_buffer = CreateBuffer(dram_config_output);
+    auto input0_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size_input},
+        {.page_size = per_buffer_byte_size_input, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
+    auto input1_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size_input},
+        {.page_size = per_buffer_byte_size_input, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
+    auto output_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size_output},
+        {.page_size = per_buffer_byte_size_output, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
 
     const bool is_int8_op = sfpu_util::is_int8_binary_sfpu_op(test_config.sfpu_op);
     const size_t element_size = is_int8_op ? sizeof(int8_t) : sizeof(bfloat16);
@@ -1034,6 +1087,8 @@ bool run_sfpu_binary_two_input_buffer(
         }
     } else if (test_config.sfpu_op == "binary_max" || test_config.sfpu_op == "binary_min") {
         sfpu_defines["SFPU_OP_BINARY_MAX_MIN_INCLUDE"] = "1";
+    } else if (test_config.sfpu_op == "atan2") {
+        sfpu_defines["SFPU_OP_BINARY_ATAN2_INCLUDE"] = "1";
     } else {
         sfpu_defines["SFPU_OP_BINARY_DIV_INCLUDE"] = "1";
     }
@@ -1069,7 +1124,7 @@ bool run_sfpu_binary_two_input_buffer(
     };
 
     experimental::ComputeHardwareConfig compute_hw_config;
-    if (mesh_device->arch() == tt::ARCH::QUASAR) {
+    if (mesh_device.arch() == tt::ARCH::QUASAR) {
         compute_hw_config = experimental::ComputeGen2Config{
             .sfpu_precision_mode =
                 test_config.approx_mode ? tt::tt_metal::Precision::Approximate : tt::tt_metal::Precision::Precise,
@@ -1163,21 +1218,24 @@ bool run_sfpu_binary_two_input_buffer(
 /// @param mesh_device Device under test.
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool run_sfpu_ternary_three_input_buffer(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device, const SfpuConfig& test_config) {
+bool run_sfpu_ternary_three_input_buffer(distributed::MeshDevice& mesh_device, const SfpuConfig& test_config) {
     const size_t per_buffer_byte_size = test_config.num_tiles * test_config.tile_byte_size;
-    auto* device = mesh_device->get_devices()[0];
-
-    tt::tt_metal::InterleavedBufferConfig dram_config{
-        .device = device,
-        .size = per_buffer_byte_size,
-        .page_size = per_buffer_byte_size,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-
-    auto input0_dram_buffer = CreateBuffer(dram_config);
-    auto input1_dram_buffer = CreateBuffer(dram_config);
-    auto input2_dram_buffer = CreateBuffer(dram_config);
-    auto output_dram_buffer = CreateBuffer(dram_config);
+    auto input0_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size},
+        {.page_size = per_buffer_byte_size, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
+    auto input1_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size},
+        {.page_size = per_buffer_byte_size, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
+    auto input2_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size},
+        {.page_size = per_buffer_byte_size, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
+    auto output_dram_buffer = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{.size = per_buffer_byte_size},
+        {.page_size = per_buffer_byte_size, .buffer_type = tt::tt_metal::BufferType::DRAM},
+        &mesh_device);
 
     const size_t numel = per_buffer_byte_size / sizeof(bfloat16);
     const int seed = std::chrono::system_clock::now().time_since_epoch().count();
@@ -1198,7 +1256,7 @@ bool run_sfpu_ternary_three_input_buffer(
     sfpu_defines["SFPU_TERNARY_OP"] = "1";
 
     std::vector<uint32_t> dest_buffer_data;
-    if (device->arch() == ARCH::QUASAR) {
+    if (mesh_device.arch() == ARCH::QUASAR) {
         const experimental::DFBSpecName IN0_DFB{"in0_dfb"};
         const experimental::DFBSpecName IN1_DFB{"in1_dfb"};
         const experimental::DFBSpecName IN2_DFB{"in2_dfb"};
@@ -1246,7 +1304,7 @@ bool run_sfpu_ternary_three_input_buffer(
         };
 
         experimental::ComputeHardwareConfig compute_hw_config;
-        if (mesh_device->arch() == tt::ARCH::QUASAR) {
+        if (mesh_device.arch() == tt::ARCH::QUASAR) {
             compute_hw_config = experimental::ComputeGen2Config{
                 .sfpu_precision_mode =
                     test_config.approx_mode ? tt::tt_metal::Precision::Approximate : tt::tt_metal::Precision::Precise,
@@ -1336,13 +1394,8 @@ bool run_sfpu_ternary_three_input_buffer(
             {{input0_dram_buffer, &packed_in0}, {input1_dram_buffer, &packed_in1}, {input2_dram_buffer, &packed_in2}},
             output_dram_buffer);
     } else {
-        auto& cq = mesh_device->mesh_command_queue();
-        auto zero_coord = distributed::MeshCoordinate(0, 0);
-        auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
-        distributed::MeshWorkload workload;
+        auto& cq = mesh_device.mesh_command_queue();
         tt_metal::Program program = tt_metal::CreateProgram();
-        workload.add_program(device_range, std::move(program));
-        auto& program_ = workload.get_programs().at(device_range);
 
         // reader_binary.cpp with LOAD_BUF2_DATA:
         //   {src0_addr, src0_bank, src1_addr, src1_bank, num_tiles, src2_addr, src2_bank}
@@ -1365,18 +1418,18 @@ bool run_sfpu_ternary_three_input_buffer(
                 return tt_metal::CircularBufferConfig(per_buffer_byte_size, {{idx, test_config.l1_input_data_format}})
                     .set_page_size(idx, test_config.tile_byte_size);
             };
-            tt_metal::CreateCircularBuffer(program_, core_range, make_input_cb(tt::CBIndex::c_0));
-            tt_metal::CreateCircularBuffer(program_, core_range, make_input_cb(tt::CBIndex::c_1));
-            tt_metal::CreateCircularBuffer(program_, core_range, make_input_cb(tt::CBIndex::c_2));
+            tt_metal::CreateCircularBuffer(program, core_range, make_input_cb(tt::CBIndex::c_0));
+            tt_metal::CreateCircularBuffer(program, core_range, make_input_cb(tt::CBIndex::c_1));
+            tt_metal::CreateCircularBuffer(program, core_range, make_input_cb(tt::CBIndex::c_2));
 
             tt_metal::CircularBufferConfig l1_output_cb_config =
                 tt_metal::CircularBufferConfig(
                     per_buffer_byte_size, {{tt::CBIndex::c_16, test_config.l1_output_data_format}})
                     .set_page_size(tt::CBIndex::c_16, test_config.tile_byte_size);
-            tt_metal::CreateCircularBuffer(program_, core_range, l1_output_cb_config);
+            tt_metal::CreateCircularBuffer(program, core_range, l1_output_cb_config);
 
             auto reader_kernel = tt_metal::CreateKernel(
-                program_,
+                program,
                 "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_binary.cpp",
                 test_config.cores,
                 tt_metal::DataMovementConfig{
@@ -1384,10 +1437,10 @@ bool run_sfpu_ternary_three_input_buffer(
                     .noc = tt_metal::NOC::RISCV_1_default,
                     .defines = {{"LOAD_BUF2_DATA", "1"}}});
 
-            auto writer_kernel = create_legacy_writer_kernel(program_, test_config);
+            auto writer_kernel = create_legacy_writer_kernel(program, test_config);
 
             tt_metal::CreateKernel(
-                program_,
+                program,
                 "tests/tt_metal/tt_metal/test_kernels/compute/eltwise_sfpu.cpp",
                 test_config.cores,
                 tt_metal::ComputeConfig{
@@ -1397,17 +1450,16 @@ bool run_sfpu_ternary_three_input_buffer(
                     .defines = sfpu_defines});
 
             for (const CoreCoord& core_coord : core_range) {
-                SetRuntimeArgs(program_, reader_kernel, core_coord, reader_rt_args);
-                SetRuntimeArgs(program_, writer_kernel, core_coord, writer_rt_args);
+                SetRuntimeArgs(program, reader_kernel, core_coord, reader_rt_args);
+                SetRuntimeArgs(program, writer_kernel, core_coord, writer_rt_args);
             }
         }
 
-        tt_metal::detail::WriteToBuffer(input0_dram_buffer, packed_in0);
-        tt_metal::detail::WriteToBuffer(input1_dram_buffer, packed_in1);
-        tt_metal::detail::WriteToBuffer(input2_dram_buffer, packed_in2);
-        distributed::EnqueueMeshWorkload(cq, workload, false);
-        distributed::Finish(cq);
-        tt_metal::detail::ReadFromBuffer(output_dram_buffer, dest_buffer_data);
+        distributed::EnqueueWriteMeshBuffer(cq, input0_dram_buffer, packed_in0, /*blocking=*/true);
+        distributed::EnqueueWriteMeshBuffer(cq, input1_dram_buffer, packed_in1, /*blocking=*/true);
+        distributed::EnqueueWriteMeshBuffer(cq, input2_dram_buffer, packed_in2, /*blocking=*/true);
+        LaunchProgram(mesh_device, std::move(program));
+        distributed::EnqueueReadMeshBuffer(cq, dest_buffer_data, output_dram_buffer, /*blocking=*/true);
     }
 
     return sfpu_util::is_close_packed_sfpu_output(dest_buffer_data, packed_golden, test_config.sfpu_op);
@@ -1420,10 +1472,7 @@ bool run_sfpu_ternary_three_input_buffer(
 /// MX <-> float pairs issue no SFPU op (the unpack/pack gasket performs the conversion); the kernel
 /// chain still runs copy_tile + pack_tile, so the conversion happens symmetrically on both threads.
 bool run_sfpu_typecast(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
-    tt::DataFormat in_fmt,
-    tt::DataFormat out_fmt,
-    size_t num_tiles) {
+    distributed::MeshDevice& mesh_device, tt::DataFormat in_fmt, tt::DataFormat out_fmt, size_t num_tiles) {
     const size_t numel = num_tiles * tt::constants::TILE_HW;
     const int seed = std::chrono::system_clock::now().time_since_epoch().count();
     auto vals = sfpu_util::generate_typecast_input(numel, seed, in_fmt, out_fmt);
@@ -1469,7 +1518,7 @@ bool run_sfpu_typecast(
         .l1_output_data_format = out_fmt,
         .cores = CoreRangeSet({core_range}),
         .approx_mode = false,
-        .unpack_to_dest_fp32 = unpack_to_dest,
+        .unpack_to_dest = unpack_to_dest,
         .en_32bit_dest = fp32_dest_acc,
     };
 
@@ -1481,10 +1530,7 @@ bool run_sfpu_typecast(
 }  // namespace unit_tests::compute::sfpu
 
 void run_quasar_sfpu_unpack_to_dest_fp32(
-    const std::shared_ptr<distributed::MeshDevice>& dev,
-    size_t num_tiles,
-    const std::string& sfpu_op,
-    bool dst_full_sync_en) {
+    distributed::MeshDevice& dev, size_t num_tiles, const std::string& sfpu_op, bool dst_full_sync_en) {
     CoreRange core_range({0, 0}, {0, 0});
     CoreRangeSet core_range_set({core_range});
     unit_tests::compute::sfpu::SfpuConfig cfg{
@@ -1496,7 +1542,8 @@ void run_quasar_sfpu_unpack_to_dest_fp32(
         .sfpu_op = sfpu_op,
         .approx_mode = false,
         .dst_full_sync_en = dst_full_sync_en,
-        .unpack_to_dest_fp32 = true,
+        .unpack_to_dest = true,
+        .en_32bit_dest = true,
     };
     log_info(
         tt::LogTest, "Quasar SFPU FP32: op={} num_tiles={} dst_full_sync_en={}", sfpu_op, num_tiles, dst_full_sync_en);
@@ -1504,10 +1551,7 @@ void run_quasar_sfpu_unpack_to_dest_fp32(
 }
 
 void run_quasar_sfpu_unpack_to_dest_16b(
-    const std::shared_ptr<distributed::MeshDevice>& dev,
-    size_t num_tiles,
-    const std::string& sfpu_op,
-    bool dst_full_sync_en) {
+    distributed::MeshDevice& dev, size_t num_tiles, const std::string& sfpu_op, bool dst_full_sync_en) {
     CoreRange core_range({0, 0}, {0, 0});
     CoreRangeSet core_range_set({core_range});
     unit_tests::compute::sfpu::SfpuConfig cfg{
@@ -1519,10 +1563,14 @@ void run_quasar_sfpu_unpack_to_dest_16b(
         .sfpu_op = sfpu_op,
         .approx_mode = false,
         .dst_full_sync_en = dst_full_sync_en,
-        .unpack_to_dest_en = true,  // 16-bit operand unpack-to-dest via the explicit flag (fp32_dest_acc_en stays false)
+        .unpack_to_dest = true,  // 16-bit operand unpack-to-dest (fp32_dest_acc_en stays false)
     };
     log_info(
-        tt::LogTest, "Quasar SFPU 16b->DEST: op={} num_tiles={} dst_full_sync_en={}", sfpu_op, num_tiles, dst_full_sync_en);
+        tt::LogTest,
+        "Quasar SFPU 16b->DEST: op={} num_tiles={} dst_full_sync_en={}",
+        sfpu_op,
+        num_tiles,
+        dst_full_sync_en);
     EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_all_same_buffer(dev, cfg));
 }
 
@@ -1556,8 +1604,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterizedFixture, TensixSfpuCompute) {
         .sfpu_op = sfpu_op,
         .approx_mode = false};
     log_info(tt::LogTest, "Testing SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(run_sfpu_all_same_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(run_sfpu_all_same_buffer(*device, test_config));
     }
 }
 
@@ -1571,6 +1619,16 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "gtz"),
         std::make_tuple(1, "gez"),
         std::make_tuple(1, "lez"),
+        std::make_tuple(1, "ceil"),
+        std::make_tuple(4, "ceil"),
+        std::make_tuple(1, "floor"),
+        std::make_tuple(4, "floor"),
+        std::make_tuple(1, "trunc"),
+        std::make_tuple(4, "trunc"),
+        std::make_tuple(1, "frac"),
+        std::make_tuple(4, "frac"),
+        std::make_tuple(1, "round"),
+        std::make_tuple(4, "round"),
         std::make_tuple(4, "eqz"),
         std::make_tuple(4, "nez"),
         std::make_tuple(4, "ltz"),
@@ -1586,9 +1644,12 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "clamp"),
         std::make_tuple(4, "clamp"),
         std::make_tuple(1, "relu"),
+        std::make_tuple(1, "relu_min"),
+        std::make_tuple(1, "relu_max"),
         std::make_tuple(1, "exponential"),
         std::make_tuple(1, "reciprocal"),
         std::make_tuple(1, "gelu"),
+        std::make_tuple(1, "gelu_accurate"),
         std::make_tuple(1, "sqrt"),
         std::make_tuple(1, "sigmoid"),
         std::make_tuple(1, "silu"),
@@ -1598,9 +1659,12 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "rsqrt"),
         std::make_tuple(1, "mul_unary"),
         std::make_tuple(4, "relu"),
+        std::make_tuple(4, "relu_min"),
+        std::make_tuple(4, "relu_max"),
         std::make_tuple(4, "exponential"),
         std::make_tuple(4, "reciprocal"),
         std::make_tuple(4, "gelu"),
+        std::make_tuple(4, "gelu_accurate"),
         std::make_tuple(4, "sqrt"),
         std::make_tuple(4, "sigmoid"),
         std::make_tuple(4, "silu"),
@@ -1624,7 +1688,7 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterizedApproxFixture, TensixSfpuCompu
     if (arch_ == tt::ARCH::QUASAR && is_unary_sfpu_op_unsupported_on_quasar(sfpu_op)) {
         GTEST_SKIP() << "SFPU unary op '" << sfpu_op << "' has no Quasar compute-API implementation";
     }
-    if (((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "relu")) ||
+    if (((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "relu" || sfpu_op == "relu_min" || sfpu_op == "relu_max")) ||
         ((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "exponential")) ||
         ((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "log"))) {
         GTEST_SKIP();
@@ -1640,8 +1704,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterizedApproxFixture, TensixSfpuCompu
         .sfpu_op = sfpu_op,
         .approx_mode = true};
     log_info(tt::LogTest, "Testing SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(run_sfpu_all_same_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(run_sfpu_all_same_buffer(*device, test_config));
     }
 }
 INSTANTIATE_TEST_SUITE_P(
@@ -1649,6 +1713,8 @@ INSTANTIATE_TEST_SUITE_P(
     SingleCoreSingleMeshDeviceSfpuParameterizedApproxFixture,
     ::testing::Values(
         std::make_tuple(1, "relu"),
+        std::make_tuple(1, "relu_min"),
+        std::make_tuple(1, "relu_max"),
         std::make_tuple(1, "exponential"),
         std::make_tuple(1, "reciprocal"),
         std::make_tuple(1, "gelu"),
@@ -1661,6 +1727,8 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "rsqrt"),
         std::make_tuple(1, "mul_unary"),
         std::make_tuple(4, "relu"),
+        std::make_tuple(4, "relu_min"),
+        std::make_tuple(4, "relu_max"),
         std::make_tuple(4, "exponential"),
         std::make_tuple(4, "reciprocal"),
         std::make_tuple(4, "gelu"),
@@ -1699,8 +1767,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterized32BitDestFixture, TensixSfpuCo
         .approx_mode = false,
         .en_32bit_dest = true};
     log_info(tt::LogTest, "Testing SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(run_sfpu_all_same_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(run_sfpu_all_same_buffer(*device, test_config));
     }
 }
 
@@ -1708,6 +1776,16 @@ INSTANTIATE_TEST_SUITE_P(
     SingleCoreSfpuCompute,
     SingleCoreSingleMeshDeviceSfpuParameterized32BitDestFixture,
     ::testing::Values(
+        std::make_tuple(1, "ceil"),
+        std::make_tuple(4, "ceil"),
+        std::make_tuple(1, "floor"),
+        std::make_tuple(4, "floor"),
+        std::make_tuple(1, "trunc"),
+        std::make_tuple(4, "trunc"),
+        std::make_tuple(1, "frac"),
+        std::make_tuple(4, "frac"),
+        std::make_tuple(1, "round"),
+        std::make_tuple(4, "round"),
         std::make_tuple(1, "negative"),
         std::make_tuple(4, "negative"),
         std::make_tuple(1, "softplus"),
@@ -1715,9 +1793,12 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "clamp"),
         std::make_tuple(4, "clamp"),
         std::make_tuple(1, "relu"),
+        std::make_tuple(1, "relu_min"),
+        std::make_tuple(1, "relu_max"),
         std::make_tuple(1, "exponential"),
         std::make_tuple(1, "reciprocal"),
         std::make_tuple(1, "gelu"),
+        std::make_tuple(1, "gelu_accurate"),
         std::make_tuple(1, "sqrt"),
         std::make_tuple(1, "sigmoid"),
         std::make_tuple(1, "silu"),
@@ -1726,9 +1807,12 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "sign"),
         std::make_tuple(1, "rsqrt"),
         std::make_tuple(4, "relu"),
+        std::make_tuple(4, "relu_min"),
+        std::make_tuple(4, "relu_max"),
         std::make_tuple(4, "exponential"),
         std::make_tuple(4, "reciprocal"),
         std::make_tuple(4, "gelu"),
+        std::make_tuple(4, "gelu_accurate"),
         std::make_tuple(4, "sqrt"),
         std::make_tuple(4, "sigmoid"),
         std::make_tuple(4, "silu"),
@@ -1751,7 +1835,7 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterized32BitDestApproxFixture, Tensix
     if (arch_ == tt::ARCH::QUASAR && is_unary_sfpu_op_unsupported_on_quasar(sfpu_op)) {
         GTEST_SKIP() << "SFPU unary op '" << sfpu_op << "' has no Quasar compute-API implementation";
     }
-    if (((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "relu")) ||
+    if (((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "relu" || sfpu_op == "relu_min" || sfpu_op == "relu_max")) ||
         ((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "exponential")) ||
         ((arch_ == tt::ARCH::WORMHOLE_B0) && (sfpu_op == "log"))) {
         GTEST_SKIP();
@@ -1768,8 +1852,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuParameterized32BitDestApproxFixture, Tensix
         .approx_mode = true,
         .en_32bit_dest = true};
     log_info(tt::LogTest, "Testing SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(run_sfpu_all_same_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(run_sfpu_all_same_buffer(*device, test_config));
     }
 }
 INSTANTIATE_TEST_SUITE_P(
@@ -1777,6 +1861,8 @@ INSTANTIATE_TEST_SUITE_P(
     SingleCoreSingleMeshDeviceSfpuParameterized32BitDestApproxFixture,
     ::testing::Values(
         std::make_tuple(1, "relu"),
+        std::make_tuple(1, "relu_min"),
+        std::make_tuple(1, "relu_max"),
         std::make_tuple(1, "exponential"),
         std::make_tuple(1, "reciprocal"),
         std::make_tuple(1, "gelu"),
@@ -1788,6 +1874,8 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "sign"),
         std::make_tuple(1, "rsqrt"),
         std::make_tuple(4, "relu"),
+        std::make_tuple(4, "relu_min"),
+        std::make_tuple(4, "relu_max"),
         std::make_tuple(4, "exponential"),
         std::make_tuple(4, "reciprocal"),
         std::make_tuple(4, "gelu"),
@@ -1840,8 +1928,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuBinaryParameterizedFixture, TensixSfpuBinar
         .sfpu_op = sfpu_op,
         .approx_mode = false};
     log_info(tt::LogTest, "Testing binary SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_binary_two_input_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_binary_two_input_buffer(*device, test_config));
     }
 }
 
@@ -1852,6 +1940,7 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         std::make_tuple(1, "div_binary"),
         std::make_tuple(1, "mul_float"),
+        std::make_tuple(1, "atan2"),
         std::make_tuple(1, "add_int"),
         std::make_tuple(1, "mul_int"),
         std::make_tuple(1, "gt_int"),
@@ -1887,8 +1976,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuTernaryParameterizedFixture, TensixSfpuTern
         .sfpu_op = sfpu_op,
         .approx_mode = false};
     log_info(tt::LogTest, "Testing ternary SFPU_OP={} num_tiles={}", sfpu_op, num_tiles);
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_ternary_three_input_buffer(devices_.at(id), test_config));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_ternary_three_input_buffer(*device, test_config));
     }
 }
 
@@ -1902,26 +1991,31 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarSfpuRelu) {
     // 1 and 4-tile, SyncFull and SyncHalf
-    for (const uint32_t num_tiles : {1u, 4u}) {
-        for (const bool dst_full_sync_en : {true, false}) {
-            SCOPED_TRACE(
-                std::string("num_tiles=") + std::to_string(num_tiles) + (dst_full_sync_en ? " SyncFull" : " SyncHalf"));
-            run_quasar_sfpu_unpack_to_dest_fp32(this->devices_.at(0), num_tiles, "relu", dst_full_sync_en);
+    for (const char* sfpu_op : {"relu", "relu_min", "relu_max"}) {
+        for (const uint32_t num_tiles : {1u, 4u}) {
+            for (const bool dst_full_sync_en : {true, false}) {
+                SCOPED_TRACE(
+                    std::string(sfpu_op) + " num_tiles=" + std::to_string(num_tiles) +
+                    (dst_full_sync_en ? " SyncFull" : " SyncHalf"));
+                run_quasar_sfpu_unpack_to_dest_fp32(this->device(), num_tiles, sfpu_op, dst_full_sync_en);
+            }
         }
     }
 }
 
 TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarSfpuUnpackToDest16b) {
-    // 16-bit operand explicitly unpack_to_dest_en, impossible before the
-    // unpack-to-dest decision was decoupled from 32-bit format.
-    for (const bool dst_full_sync_en : {true, false}) {
-        for (uint32_t num_tiles : {1u, 4u}) {
-            log_info(
-                tt::LogTest,
-                "Quasar SFPU 16b->DEST: num_tiles={} {}",
-                num_tiles,
-                dst_full_sync_en ? "SyncFull" : "SyncHalf");
-            run_quasar_sfpu_unpack_to_dest_16b(this->devices_.at(0), num_tiles, "relu", dst_full_sync_en);
+    // 16-bit operand explicitly unpacked to Dest
+    for (const char* sfpu_op : {"relu", "relu_min", "relu_max"}) {
+        for (const bool dst_full_sync_en : {true, false}) {
+            for (uint32_t num_tiles : {1u, 4u}) {
+                log_info(
+                    tt::LogTest,
+                    "Quasar SFPU 16b->DEST: op={} num_tiles={} {}",
+                    sfpu_op,
+                    num_tiles,
+                    dst_full_sync_en ? "SyncFull" : "SyncHalf");
+                run_quasar_sfpu_unpack_to_dest_16b(this->device(), num_tiles, sfpu_op, dst_full_sync_en);
+            }
         }
     }
 }
@@ -1961,8 +2055,8 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuTypecastFixture, TensixSfpuTypecast) {
         "Testing typecast {} -> {}",
         unit_tests::sfpu_util::typecast_device_format_name(in_fmt),
         unit_tests::sfpu_util::typecast_device_format_name(out_fmt));
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_typecast(devices_.at(id), in_fmt, out_fmt, 1));
+    for (auto& device : this->devices_) {
+        EXPECT_TRUE(unit_tests::compute::sfpu::run_sfpu_typecast(*device, in_fmt, out_fmt, 1));
     }
 }
 

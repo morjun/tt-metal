@@ -5,7 +5,6 @@ import torch
 import typing
 import pytest
 import ttnn
-import tempfile
 from loguru import logger
 from tests.ttnn.utils_for_testing import assert_with_pcc
 from models.common.utility_functions import is_single_chip, ti_skip
@@ -42,9 +41,20 @@ def test_multi_device_subset_mesh(silicon_arch_name, silicon_arch_wormhole_b0):
     ttnn.close_mesh_device(multi_device)
 
 
-def test_multi_device_open_close_full_mesh_device_fixture(mesh_device):
-    """Using `mesh_device` pytest fixture defined in conftest.py"""
-    pass
+@pytest.mark.parametrize("mesh_device", [(2, 2)], indirect=True)
+def test_worker_core_from_logical_core(mesh_device, expect_error):
+    worker_core_from_logical_core = ttnn._ttnn.multi_device.experimental.worker_core_from_logical_core
+    logical_core = ttnn.CoreCoord(0, 0)
+    for row in range(2):
+        for column in range(2):
+            mesh_coordinate = ttnn.MeshCoordinate(row, column)
+            unit_mesh = mesh_device.create_submesh(ttnn.MeshShape(1, 1), offset=mesh_coordinate)
+            assert worker_core_from_logical_core(mesh_device, mesh_coordinate, logical_core) == (
+                unit_mesh.worker_core_from_logical_core(logical_core)
+            )
+
+    with expect_error(RuntimeError, "not found in mesh"):
+        worker_core_from_logical_core(mesh_device, ttnn.MeshCoordinate(2, 0), logical_core)
 
 
 def test_multi_device_open_close_full_mesh_device_fixture(mesh_device):
@@ -333,7 +343,7 @@ def test_multi_device_data_parallel_matmul_op(mesh_device):
 @pytest.mark.parametrize("layout", [ttnn.TILE_LAYOUT])
 @pytest.mark.parametrize("memory_config", [ttnn.DRAM_MEMORY_CONFIG])
 @pytest.mark.parametrize("dtype", [ttnn.bfloat8_b, ttnn.bfloat4_b])
-def test_multi_device_as_tensor_api(mesh_device, layout, memory_config, dtype):
+def test_multi_device_as_tensor_api(mesh_device, layout, memory_config, dtype, tmp_path):
     """Multidevice API: Data Parallel on matmul using cached tensor"""
     torch.manual_seed(0)
     torch_input_a_tensor = torch.rand((mesh_device.get_num_devices(), 1, 32, 32), dtype=torch.bfloat16)
@@ -349,36 +359,34 @@ def test_multi_device_as_tensor_api(mesh_device, layout, memory_config, dtype):
         mesh_mapper=ShardTensorToMesh(mesh_device, dim=0),
     )
 
-    with tempfile.NamedTemporaryFile() as temp_file:
-        save_tensor = ttnn.as_tensor(
-            torch_input_b_tensor,
-            dtype=dtype,
-            layout=layout,
-            device=mesh_device,
-            memory_config=memory_config,
-            cache_file_name=f"{temp_file.name}.weight",
-            mesh_mapper=ReplicateTensorToMesh(mesh_device),
-        )
+    cache_file_name = tmp_path / "weight"
+    save_tensor = ttnn.as_tensor(
+        torch_input_b_tensor,
+        dtype=dtype,
+        layout=layout,
+        device=mesh_device,
+        memory_config=memory_config,
+        cache_file_name=cache_file_name,
+        mesh_mapper=ReplicateTensorToMesh(mesh_device),
+    )
 
-        ttnn_input_b_tensor = ttnn.as_tensor(
-            torch_input_b_tensor,
-            dtype=dtype,
-            layout=layout,
-            device=mesh_device,
-            memory_config=memory_config,
-            cache_file_name=f"{temp_file.name}.weight",
-            mesh_mapper=ReplicateTensorToMesh(mesh_device),
-        )
+    ttnn_input_b_tensor = ttnn.as_tensor(
+        torch_input_b_tensor,
+        dtype=dtype,
+        layout=layout,
+        device=mesh_device,
+        memory_config=memory_config,
+        cache_file_name=cache_file_name,
+        mesh_mapper=ReplicateTensorToMesh(mesh_device),
+    )
 
-        ttnn_output_tensor = ttnn_input_a_tensor @ ttnn_input_b_tensor
+    ttnn_output_tensor = ttnn_input_a_tensor @ ttnn_input_b_tensor
 
-        ttnn_torch_output_tensor = ttnn.to_torch(
-            ttnn_output_tensor, mesh_composer=ConcatMeshToTensor(mesh_device, dim=0)
-        )
-        if dtype == ttnn.bfloat4_b:
-            assert_with_pcc(ttnn_torch_output_tensor, torch_output_golden, pcc=0.87)
-        else:
-            assert_with_pcc(ttnn_torch_output_tensor, torch_output_golden, pcc=0.991)
+    ttnn_torch_output_tensor = ttnn.to_torch(ttnn_output_tensor, mesh_composer=ConcatMeshToTensor(mesh_device, dim=0))
+    if dtype == ttnn.bfloat4_b:
+        assert_with_pcc(ttnn_torch_output_tensor, torch_output_golden, pcc=0.87)
+    else:
+        assert_with_pcc(ttnn_torch_output_tensor, torch_output_golden, pcc=0.991)
 
 
 @pytest.mark.parametrize(
@@ -389,32 +397,32 @@ def test_multi_device_as_tensor_api(mesh_device, layout, memory_config, dtype):
 @pytest.mark.parametrize("layout", [ttnn.TILE_LAYOUT])
 @pytest.mark.parametrize("memory_config", [ttnn.DRAM_MEMORY_CONFIG])
 @pytest.mark.parametrize("dtype", [ttnn.bfloat8_b, ttnn.bfloat4_b])
-def test_multi_device_as_tensor_api_sharded_tensor(mesh_device, layout, memory_config, dtype):
+def test_multi_device_as_tensor_api_sharded_tensor(mesh_device, layout, memory_config, dtype, tmp_path):
     """Multidevice API: Data Parallel on matmul using cached tensor"""
     input_tensor = torch.rand((mesh_device.get_num_devices(), 1, 32, 32), dtype=torch.bfloat16)
 
-    with tempfile.NamedTemporaryFile() as temp_file:
-        save_tensor = ttnn.as_tensor(
-            input_tensor,
-            dtype=dtype,
-            layout=layout,
-            device=mesh_device,
-            memory_config=memory_config,
-            cache_file_name=f"{temp_file.name}.weight",
-            mesh_mapper=ShardTensorToMesh(mesh_device, dim=0),
-        )
-        load_tensor = ttnn.as_tensor(
-            input_tensor,
-            dtype=dtype,
-            layout=layout,
-            device=mesh_device,
-            memory_config=memory_config,
-            cache_file_name=f"{temp_file.name}.weight",
-            mesh_mapper=ShardTensorToMesh(mesh_device, dim=0),
-        )
-        torch_loaded_tensor = ttnn.to_torch(load_tensor, mesh_composer=ConcatMeshToTensor(mesh_device, dim=0))
-        expected_pcc = 0.98 if dtype == ttnn.bfloat4_b else 0.99
-        assert_with_pcc(input_tensor, torch_loaded_tensor, pcc=expected_pcc)
+    cache_file_name = tmp_path / "weight"
+    save_tensor = ttnn.as_tensor(
+        input_tensor,
+        dtype=dtype,
+        layout=layout,
+        device=mesh_device,
+        memory_config=memory_config,
+        cache_file_name=cache_file_name,
+        mesh_mapper=ShardTensorToMesh(mesh_device, dim=0),
+    )
+    load_tensor = ttnn.as_tensor(
+        input_tensor,
+        dtype=dtype,
+        layout=layout,
+        device=mesh_device,
+        memory_config=memory_config,
+        cache_file_name=cache_file_name,
+        mesh_mapper=ShardTensorToMesh(mesh_device, dim=0),
+    )
+    torch_loaded_tensor = ttnn.to_torch(load_tensor, mesh_composer=ConcatMeshToTensor(mesh_device, dim=0))
+    expected_pcc = 0.98 if dtype == ttnn.bfloat4_b else 0.99
+    assert_with_pcc(input_tensor, torch_loaded_tensor, pcc=expected_pcc)
 
 
 def test_tensor_file_extension_validation(tmp_path, expect_error):
