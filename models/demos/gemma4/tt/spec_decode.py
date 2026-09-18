@@ -31,6 +31,7 @@ import time
 import torch
 
 import ttnn
+from models.demos.gemma4.tt import pli_env
 from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
 
 _FUSED_DBG = os.environ.get("GEMMA4_SPEC_FUSED_DEBUG") == "1"
@@ -160,7 +161,8 @@ class SpeculativeDecoder:
         # two-traces-one-queue hang. Data ordering across the two queues is preserved by
         # the existing _trace_barrier drain at each switch point.
         self._draft_cq = int(os.environ.get("GEMMA4_SPEC_DRAFT_CQ", "0"))
-        # GEMMA4_SPEC_FUSED_PLI_DEV builds PLI on device inside the fused trace, opting
+        # DEPRECATED, see tt/pli_env.py: GEMMA4_SPEC_FUSED_PLI_DEV built PLI on device
+        # inside the fused trace, opting
         # into the 4.38 GiB embed_tokens_per_layer table in DRAM.
         #
         # DEFAULT ON. This knob does double duty: generate() consults it to route a
@@ -172,13 +174,17 @@ class SpeculativeDecoder:
         # NOTE it is NOT the same knob as GEMMA4_SPEC_FUSED: that one forces the demo's
         # use_fused, which for a PLI target selects generate_fused -> _fused_body -> the
         # BATCH-DIM verify (ttnn_verify_forward), which has no pli_on_device at all.
-        self._fused_pli_device = os.environ.get("GEMMA4_SPEC_FUSED_PLI_DEV", "1") == "1"
+        # GEMMA4_SPEC_ROUTE (GEMMA4_SPEC_FUSED_PLI_DEV=0 is the deprecated spelling of
+        # "host-loop"). `_fused_pli_device` is kept as the derived "is a fused route
+        # permitted" predicate the rest of this file already reads.
+        self._route = pli_env.spec_route()
+        self._fused_pli_device = self._route != "host-loop"
         # GEMMA4_SPEC_PLI_DEV: use on-device PLI in the ordinary host-loop packed verify
         # too. DEFAULT ON, for parity rather than speed -- device and host PLI differ by
         # ~1 bf16 ULP (PCC 0.9999947), so leaving the host loop on host PLI while the
         # fused path runs device PLI would compare two different implementations in
         # every spec-vs-plain number.
-        self._pli_dev_host = os.environ.get("GEMMA4_SPEC_PLI_DEV", "1") == "1"
+        self._pli_dev_host = pli_env.pli_on_device("GEMMA4_SPEC_PLI_DEV")
         # All three PLI knobs must select the SAME implementation, or a spec-vs-plain
         # number also measures the ~1 bf16 ULP device-vs-host PLI gap. Checked at
         # CONSTRUCTION, before any device work, because the failure mode is a plausible
@@ -1246,8 +1252,8 @@ class SpeculativeDecoder:
             raise NotImplementedError(
                 "The fused on-device iteration needs on-device PLI for a per-layer-input target "
                 "(E2B/E4B): its draft tokens are argmaxed and re-embedded on device and never reach "
-                "the host. Set GEMMA4_SPEC_FUSED_PLI_DEV=1 to enable it (costs a 4.38 GiB DRAM table), "
-                "or use generate() (the host loop)."
+                "the host. Leave GEMMA4_SPEC_ROUTE at its default to enable it (costs a 4.38 GiB "
+                "DRAM table), or use generate() with GEMMA4_SPEC_ROUTE=host-loop."
             )
         if self._use_trace:
             self._last_route = "fused-traced"
@@ -2063,7 +2069,7 @@ class SpeculativeDecoder:
         occur by construction; that is its primary design reason, not the throughput win.
 
         Supported configurations are exactly:
-          * GEMMA4_SPEC_FUSED_PLI_DEV=1  -> the fused single trace  (DEFAULT, preferred)
+          * GEMMA4_SPEC_ROUTE=auto       -> the fused single trace  (DEFAULT, preferred)
           * traced verify + EAGER drafter                            (host-loop fallback)
           * fully eager
         """
@@ -2085,7 +2091,7 @@ class SpeculativeDecoder:
             "  Characterised in e7ed645a170 (2026-08-04); every fix ruled out by measurement.\n"
             "\n"
             "  Use instead:\n"
-            "    GEMMA4_SPEC_FUSED_PLI_DEV=1   the fused single trace (default, fastest)\n"
+            "    GEMMA4_SPEC_ROUTE=auto        the fused single trace (default, fastest)\n"
             "    GEMMA4_SPEC_TRACE_DRAFT=0     traced verify + eager drafter\n"
             "    GEMMA4_SPEC_TRACE_VERIFY=0    traced drafter + eager verify\n"
             "\n"
@@ -2109,31 +2115,34 @@ class SpeculativeDecoder:
         enforcement -- see ``_assert_single_trace``, which exists because that same lesson
         had to be learned twice.
 
-        The three knobs are three per-route CALL SITES, not three settings for one thing:
+        **``GEMMA4_PLI`` makes this unreachable**, because one value covers every route.
+        What remains reachable is the deprecated per-route spelling, which ``pli_env``
+        still honours so that recorded configurations reproduce exactly:
 
             GEMMA4_DECODE_PLI_DEV      plain decode             ``model.py``
             GEMMA4_SPEC_PLI_DEV        host-loop packed verify  ``_verify_packed``
-            GEMMA4_SPEC_FUSED_PLI_DEV  the fused single trace   ``_fused_body_batched``
 
-        **``GEMMA4_SPEC_FUSED_PLI_DEV=0`` alone is NOT a mixed state and must not trip
-        this.** The fused trace cannot do host PLI at all -- its candidate ids never reach
-        the host -- so turning it off does not put that route on host PLI, it selects the
-        HOST LOOP instead, whose PLI is then governed by ``GEMMA4_SPEC_PLI_DEV``. That one
-        knob doing two jobs (mechanism and route) is a naming defect tracked separately;
-        here it simply means the fused flag is a route selector with nothing to compare.
+        The fused trace has no PLI knob: it is device-only by construction, and which route
+        runs is ``GEMMA4_SPEC_ROUTE``. So ``GEMMA4_SPEC_ROUTE=host-loop`` is a ROUTE choice
+        and must not trip this check -- it changes no implementation, and the host loop it
+        selects then follows the PLI setting like everything else.
 
-        Targets without per-layer inputs (12B/31B) build no PLI, so all three are inert.
+        Targets without per-layer inputs (12B/31B) build no PLI, so the knobs are inert.
         """
         if not self.target_has_pli:
             return
 
-        decode = os.environ.get("GEMMA4_DECODE_PLI_DEV", "1") == "1"
+        decode = pli_env.pli_on_device("GEMMA4_DECODE_PLI_DEV")
         spec_host = self._pli_dev_host  # GEMMA4_SPEC_PLI_DEV
-        fused_route = self._fused_pli_device  # GEMMA4_SPEC_FUSED_PLI_DEV
+        # The RESOLVED route, not the raw knob: under `auto`, GEMMA4_PLI=host already
+        # resolves to the host loop, so there is no fused route left to disagree with.
+        # Asking for a fused route explicitly alongside host PLI raises inside
+        # resolve_route, whose message names that conflict better than anything here.
+        effective_route = pli_env.resolve_route(self._route, self.target_has_pli, spec_host)
         where = lambda flag: "DEVICE" if flag else "HOST"  # noqa: E731
 
         problems = []
-        if fused_route and not decode:
+        if effective_route in pli_env.DEVICE_PLI_ROUTES and not decode:
             problems.append(
                 "  * the FUSED route is available and ALWAYS computes PLI on DEVICE (it has "
                 "no host\n    option), but plain decode is on HOST PLI "
@@ -2171,7 +2180,7 @@ class SpeculativeDecoder:
             "    GEMMA4_SPEC_PLI_DEV=0 GEMMA4_DECODE_PLI_DEV=0    all HOST\n"
             "\n"
             "  To A/B the ROUTE at a fixed PLI implementation, set\n"
-            "  GEMMA4_SPEC_FUSED_PLI_DEV=0 alone: it selects the host loop and leaves\n"
+            "  GEMMA4_SPEC_ROUTE=host-loop: it selects the host loop and leaves\n"
             "  every route's PLI implementation untouched.\n"
             "\n"
             f"  To run a mixed configuration deliberately, set {self._ALLOW_MIXED_PLI_ENV}=1."
@@ -2231,13 +2240,18 @@ class SpeculativeDecoder:
             # It does not, so something else -- packed-mask build, SDPA shape efficiency, or
             # the acceptance gap above -- outweighs it. NOT understood; do not re-enable on
             # the KV argument alone.
-            _route = os.environ.get("GEMMA4_SPEC_ROUTE", "auto")
-            if greedy and not self.target_has_pli and _route == "fused-batched":
+            # One route decision for both target kinds. `auto` reproduces the shipping
+            # behaviour exactly: a PLI target takes the packed fused trace, anything else
+            # keeps upstream's batch-dim fused body. `resolve_route` also refuses a fused
+            # route that was asked for explicitly alongside GEMMA4_PLI=host, which the
+            # fused trace cannot honour (its candidate ids never reach the host).
+            _route = pli_env.resolve_route(self._route, self.target_has_pli, self._pli_dev_host)
+            if greedy and not self.target_has_pli and _route == "fused-packed":
                 outs, accepts = self.generate_batched(
                     [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
                 )
                 return outs[0], accepts[0]
-            if greedy and self.target_has_pli and self._fused_pli_device:
+            if greedy and self.target_has_pli and _route == "fused-packed":
                 # PLI target with on-device PLI: take the BATCHED fused trace at B=1.
                 # It is the only fused body that routes through
                 # ttnn_packed_verify_forward (the packed verify we require -- the
@@ -2268,7 +2282,7 @@ class SpeculativeDecoder:
                     [anchor_token], [anchor_pos], max_new_tokens, self.target.max_seq_len
                 )
                 return outs[0], accepts[0]
-            if greedy and not self.target_has_pli:
+            if greedy and _route == "fused-batch-dim":
                 return self.generate_fused(anchor_token, anchor_pos, max_new_tokens)
             if greedy:
                 # PLI target (E2B/E4B): the fused iteration is out (its drafts never

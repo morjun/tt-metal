@@ -24,6 +24,7 @@ from tracy import signpost
 
 import ttnn
 from models.common.sampling.generator import SamplingGenerator
+from models.demos.gemma4.tt import pli_env
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
@@ -2155,7 +2156,7 @@ class Gemma4Model:
         # run device PLI, so leaving plain decode on host PLI would make every
         # spec-vs-plain comparison a comparison of two PLI implementations as well.
         # GEMMA4_DECODE_PLI_DEV=0 restores host PLI to reproduce any pre-flip number.
-        if os.environ.get("GEMMA4_DECODE_PLI_DEV", "1") == "1" and self.hidden_size_per_layer_input:
+        if pli_env.pli_on_device("GEMMA4_DECODE_PLI_DEV") and self.hidden_size_per_layer_input:
             _ids = x if x.dtype in (ttnn.uint32, ttnn.int32) else None
             if _ids is not None:
                 if len(_ids.shape) == 4:
