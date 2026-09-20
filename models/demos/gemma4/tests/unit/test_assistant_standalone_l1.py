@@ -777,7 +777,16 @@ def test_fused_draft_k_steps(mesh_device, reset_seeds):
     is verify-side only, so a drafter-only benchmark can use any K.
     """
     ks = [int(s) for s in os.getenv("GEMMA4_DRAFT_K_SWEEP", "1,2,3,4,8").split(",") if s.strip()]
-    rig = _build_standalone(mesh_device, "dram")
+    # GEMMA4_STANDALONE_CTX overrides the rig's KV depth (default DEFAULT_CONTEXT, so
+    # nothing already recorded moves). The breakdown at the end of this test is the only
+    # admissible T_draft instrument -- PROFILING_PLAN.md gate 1 requires _make_fused_k_body
+    # with the token/hidden recurrence AND the argmax, and gate 3 forbids assembling a step
+    # cost from two instruments. So it has to be runnable at the context the demo actually
+    # decodes at, not only at 512. L1_WEIGHT_PINNING.md:274 retracted every number taken on
+    # the predecessor that stopped at the logits.
+    ctx = int(os.getenv("GEMMA4_STANDALONE_CTX", str(DEFAULT_CONTEXT)))
+    rig = _build_standalone(mesh_device, "dram", context_len=ctx, max_seq_len=max(1024, ctx))
+    logger.info(f"[fused-k] context_len={ctx} (GEMMA4_STANDALONE_CTX)")
 
     logger.info(
         f"{'K':>3} {'fused ms/iter':>14} {'ms/step':>9} {'tok/s/u':>9} "
