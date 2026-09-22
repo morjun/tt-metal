@@ -1072,12 +1072,28 @@ def _relocate(slots, mesh_device, to_l1, only=None):
     """
     from models.demos.gemma4.tt.weight_placement import shard_l1_width
 
+    # GEMMA4_L1_PLACEMENT picks WHICH L1 layout `to_l1` means. Default "sharded" is
+    # width-sharded on the matmul's own grid, which compiles the in1 fetch out
+    # entirely (IN1_SHARDED, factory:535 -> reader :386 arm vanishes). "interleaved"
+    # instead round-robins the weight's pages across all 110 banks, so the weight is
+    # in SRAM but every compute core still issues noc.async_read for it
+    # (L1_WEIGHT_PINNING.md §4.4.4, :199). That is the remote-SRAM arm: it separates
+    # "in L1" from "read deleted", which is the whole question.
+    placement = (os.getenv("GEMMA4_L1_PLACEMENT") or "sharded").strip().lower()
+    if placement not in {"sharded", "interleaved"}:
+        raise ValueError(f"GEMMA4_L1_PLACEMENT must be sharded | interleaved, got {placement!r}")
+
     n = 0
     for owner, attr, label in slots:
         if only is not None and not any(o in label for o in only):
             continue
         t = getattr(owner, attr)
-        new = shard_l1_width(t, mesh_device) if to_l1 else ttnn.to_memory_config(t, ttnn.DRAM_MEMORY_CONFIG)
+        if not to_l1:
+            new = ttnn.to_memory_config(t, ttnn.DRAM_MEMORY_CONFIG)
+        elif placement == "interleaved":
+            new = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
+        else:
+            new = shard_l1_width(t, mesh_device)
         if new is None:
             continue
         object.__setattr__(owner, attr, new)
@@ -3053,7 +3069,13 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     assert os.environ.get("GEMMA4_GATHER_IN0") in {"0", "1"}
     manifest = provenance()
     manifest.update(
-        k=k, warmup=warmup, mode=mode, bus_id=bus, arm="ring" if os.environ["GEMMA4_GATHER_IN0"] == "1" else "mcast"
+        k=k,
+        warmup=warmup,
+        mode=mode,
+        bus_id=bus,
+        arm="ring" if os.environ["GEMMA4_GATHER_IN0"] == "1" else "mcast",
+        l1_placement=(os.getenv("GEMMA4_L1_PLACEMENT") or "sharded").strip().lower(),
+        reloc_layers=(os.getenv("GEMMA4_L1_RELOC_LAYERS") or "").strip() or "all",
     )
     append_record(output, {"event": "start", **manifest})
     rig = _build_standalone(mesh_device, "dram", tune_matmuls=True)
