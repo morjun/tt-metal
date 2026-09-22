@@ -345,11 +345,21 @@ class DecodeMatmulTuner:
             return _no("tuner disabled")
         if not _env_on("GEMMA4_GATHER_IN0"):
             return _no("GEMMA4_GATHER_IN0 not set")
-        if not self._l1_width_sharded(w):
-            return _no(
-                f"weight not L1 WIDTH_SHARDED ({w.memory_config().buffer_type.name}/"
-                f"{w.memory_config().memory_layout.name})"
-            )
+        # ttnn permits gather_in0 with in1 width-sharded, DRAM-INTERLEAVED, or fed via a
+        # global CB (matmul_device_operation.cpp:1730-1741). Requiring L1 WIDTH_SHARDED here
+        # is THIS codebase's policy, not a ttnn constraint: it encodes MEASUREMENT_RECORD.md
+        # §9b, where on E2B the ring LOST with a DRAM weight (5.00 us vs 4.32 mcast) and won
+        # only when pinned (2.68). GEMMA4_GATHER_DRAM_WEIGHT=1 lifts the policy so that
+        # contrast can be re-measured on other models -- 12B has already reversed the ring's
+        # sign once (§6.1), so the E2B result is not assumed to carry. L1 INTERLEAVED stays
+        # refused because ttnn itself TT_FATALs on it.
+        _allow_dram = _env_on("GEMMA4_GATHER_DRAM_WEIGHT")
+        _w_mc = w.memory_config()
+        _w_dram_interleaved = (
+            _w_mc.buffer_type == ttnn.BufferType.DRAM and _w_mc.memory_layout == ttnn.TensorMemoryLayout.INTERLEAVED
+        )
+        if not self._l1_width_sharded(w) and not (_allow_dram and _w_dram_interleaved):
+            return _no(f"weight not L1 WIDTH_SHARDED ({_w_mc.buffer_type.name}/" f"{_w_mc.memory_layout.name})")
         k, n = int(x.shape[-1]), int(w.shape[-1])
         pc = derive_decode_1d_gather_config(1, k, n, self._max_x, self._max_y)
         if pc is None:
@@ -358,10 +368,12 @@ class DecodeMatmulTuner:
         if specs is None:
             return _no("gather_shard_specs returned None")
         in0_spec, in1_spec, out_spec = specs
-        # The weight must sit on exactly the grid the ring expects.
-        have, want = list(w.memory_config().shard_spec.shape), list(in1_spec.shard_spec.shape)
-        if have != want:
-            return _no(f"weight shard shape {have} != ring's {want}")
+        # The weight must sit on exactly the grid the ring expects -- but only when it IS
+        # sharded. A DRAM-interleaved weight has no shard_spec; ttnn streams it per block.
+        if w.memory_config().shard_spec is not None:
+            have, want = list(w.memory_config().shard_spec.shape), list(in1_spec.shard_spec.shape)
+            if have != want:
+                return _no(f"weight shard shape {have} != ring's {want}")
         if dbg:
             logger.info(f"[gather] TAKE {k}x{n}")
         return pc, in0_spec, out_spec

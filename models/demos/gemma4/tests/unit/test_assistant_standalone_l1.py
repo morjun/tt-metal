@@ -3162,8 +3162,17 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
     ttnn.synchronize_device(mesh_device)
     try:
-        expected_ring = _expected * k if manifest["arm"] == "ring" else 0
-        assert sum(p["ring"] for p in observed_plans) == expected_ring, "unexpected ring engagement"
+        observed_ring = sum(p["ring"] for p in observed_plans)
+        manifest["observed_ring"] = observed_ring
+        if _env_on("GEMMA4_GATHER_DRAM_WEIGHT"):
+            # With a DRAM weight the ring is no longer tied to the RELOCATED layers -- it fires
+            # on every shape with a valid gather config (down_proj x4 + o_proj full + o_proj
+            # sliding x3 = 8/step here), so the per-layer formula does not apply. Assert only
+            # that it engaged at all, and record the count so the arm stays auditable.
+            assert observed_ring > 0, "GEMMA4_GATHER_DRAM_WEIGHT set but the ring never engaged"
+        else:
+            expected_ring = _expected * k if manifest["arm"] == "ring" else 0
+            assert observed_ring == expected_ring, "unexpected ring engagement"
         append_record(
             output,
             {"event": "capture", **manifest, "matmul_plans": observed_plans, "l1_state": _l1_bank_state(mesh_device)},
