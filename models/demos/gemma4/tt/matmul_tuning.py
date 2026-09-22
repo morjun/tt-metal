@@ -358,7 +358,13 @@ class DecodeMatmulTuner:
         _w_dram_interleaved = (
             _w_mc.buffer_type == ttnn.BufferType.DRAM and _w_mc.memory_layout == ttnn.TensorMemoryLayout.INTERLEAVED
         )
-        if not self._l1_width_sharded(w) and not (_allow_dram and _w_dram_interleaved):
+        # GEMMA4_GATHER_ANY_WEIGHT=1 drops the model-level layout gate entirely and lets
+        # ttnn's own validation adjudicate (matmul_device_operation.cpp:1728-1740). Exists so
+        # "L1 INTERLEAVED + ring is impossible" can be DEMONSTRATED rather than asserted: the
+        # model gate would otherwise refuse first and the TT_FATAL would never fire.
+        if _env_on("GEMMA4_GATHER_ANY_WEIGHT"):
+            pass
+        elif not self._l1_width_sharded(w) and not (_allow_dram and _w_dram_interleaved):
             return _no(f"weight not L1 WIDTH_SHARDED ({_w_mc.buffer_type.name}/" f"{_w_mc.memory_layout.name})")
         k, n = int(x.shape[-1]), int(w.shape[-1])
         pc = derive_decode_1d_gather_config(1, k, n, self._max_x, self._max_y)
