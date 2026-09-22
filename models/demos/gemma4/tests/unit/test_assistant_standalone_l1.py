@@ -2197,6 +2197,92 @@ def test_argmax_shapes(mesh_device, reset_seeds):
         t.deallocate(True)
 
 
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])
+def test_dense_argmax_rows1(mesh_device, reset_seeds):
+    """Does the DENSE 262144-wide argmax need the pad-to-32 that `_argmax_last` applies?
+
+    `masked_embedding._argmax_rows` took the `rows == 1` no-pad fast path in
+    `fd652d14217` (PERFORMANCE_TRAJECTORY §2.10) after `test_argmax_shapes` measured,
+    at N=4096, that argmax on ONE unpadded ROW_MAJOR row is correct and 17.9x cheaper.
+    The dense path never got it: `spec_decode._argmax_last` and `_argmax_token` still
+    pad 1 -> 32 rows, untilize 32 x 262144 x 2B = 16 MiB, and scan 31 rows of padding
+    on every drafter step (gemma4-12b/MEASUREMENT_RECORD.md §4.4, 1.586 ms = 34.2% of
+    the step).
+
+    It was NOT simply ported, because the two paths document OPPOSITE claims and only
+    one of them has been tested at this width. `_argmax_last`'s docstring says the
+    multicore argmax "returns GARBAGE unless the row (batch) dim is EXACTLY one tile".
+    §2.10 measured the opposite at N=4096. The widths differ by 64x and the kernel's
+    core split depends on width, so §2.10's result does not transfer by assumption.
+
+    This is the gate: CORRECTNESS FIRST, at the real width and the real dtype, before
+    any timing claim. Both arms start from a TILE tensor, as the real caller does --
+    untilizing a [1,1,1,N] TILE tensor is what drops the physical 32-row pad.
+
+    The max is placed at a chosen index (first / middle / last / random) because a
+    row-parallel kernel that mis-splits work fails positionally, not uniformly, and a
+    single random draw would likely miss it. The max is made strictly unique by
+    construction: bf16 over 262144 normal draws has many ties, and a tie makes
+    "wrong index" unfalsifiable.
+    """
+    N = int(os.getenv("GEMMA4_ARGMAX_N", "262144"))
+    R32 = 32
+    rows_list = [int(r) for r in (os.getenv("GEMMA4_ARGMAX_ROWS", "1,5")).split(",") if r.strip()]
+
+    def _gold_tensor(rows, pos, dtype):
+        # Values in [-1,-0.5]; the winner is +1.0 -- representable exactly in bf16 and
+        # fp32, and far enough clear that no rounding can produce a tie.
+        t = -torch.rand(1, 1, rows, N) * 0.5 - 0.5
+        for r in range(rows):
+            t[0, 0, r, (pos + r) % N] = 1.0
+        return t.bfloat16().float() if dtype == ttnn.bfloat16 else t
+
+    for dtype, dname in ((ttnn.bfloat16, "bf16"), (ttnn.float32, "fp32")):
+        for rows in rows_list:
+            for pname, pos in (("first", 0), ("middle", N // 2), ("last", N - 1), ("random", 987654 % N)):
+                torch.manual_seed(pos + rows)
+                t = _gold_tensor(rows, pos, dtype)
+                gold = [int(t[0, 0, r].argmax()) for r in range(rows)]
+                src = ttnn.from_torch(t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=dtype)
+
+                def _padded():
+                    p = ttnn.pad(src, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0) if rows < R32 else src
+                    u = ttnn.untilize(p, use_multicore=True)
+                    if p is not src and not _same_buffer(p, src):
+                        p.deallocate(True)
+                    i = ttnn.argmax(u, dim=-1, keepdim=False)
+                    u.deallocate(True)
+                    return i
+
+                def _unpadded():
+                    u = ttnn.untilize(src, use_multicore=True)
+                    i = ttnn.argmax(u, dim=-1, keepdim=False)
+                    u.deallocate(True)
+                    return i
+
+                res = {}
+                for aname, fn in (("padded(current)", _padded), ("unpadded", _unpadded)):
+                    try:
+                        out = fn()
+                        ttnn.synchronize_device(mesh_device)
+                        got = [int(x) for x in ttnn.to_torch(out).reshape(-1)[:rows]]
+                        out.deallocate(True)
+                        us = _op_timed(mesh_device, fn, protect=(src,))
+                        res[aname] = (got == gold, got[:3], us)
+                    except Exception as ex:  # noqa: BLE001
+                        res[aname] = (None, str(ex).split("backtrace")[0].strip()[:70], float("nan"))
+                src.deallocate(True)
+
+                pa, pv, pu = res["padded(current)"]
+                ua, uv, uu = res["unpadded"]
+                speed = (pu / uu) if (uu == uu and uu > 0) else float("nan")
+                logger.info(
+                    f"[dense-argmax] N={N} {dname} rows={rows} max@{pname:<6} "
+                    f"padded ok={str(pa):<5} {pu:9.2f} us | unpadded ok={str(ua):<5} {uu:9.2f} us "
+                    f"| speedup {speed:6.2f}x | gold={gold[:3]} pad={pv} unpad={uv}"
+                )
+
+
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
 def test_matmul_sharded_in0_cost(mesh_device, reset_seeds):
     """Can the decode matmuls consume the norm's sharded output directly?
