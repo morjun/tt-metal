@@ -378,6 +378,12 @@ def _argmax_token(assistant, logits, rows=1):
     if isinstance(logits, CmeLogits):
         return assistant.masked_embedding.argmax_token_id(logits, rows)
     R32 = 32
+    # Mirrors spec_decode._argmax_last's rows==1 fast path (see the rationale there).
+    if rows == 1:
+        u = ttnn.untilize(logits, use_multicore=True)
+        idx = ttnn.argmax(u, dim=-1, keepdim=False)
+        u.deallocate(True)
+        return idx
     src, padded = logits, None
     if rows < R32:
         padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
@@ -2195,6 +2201,93 @@ def test_argmax_shapes(mesh_device, reset_seeds):
             logger.info(f"[argmax-shape] {name:<36} FAILED: {str(ex).split('backtrace')[0].strip()[:95]}")
     for t in protect:
         t.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])
+def test_dense_argmax_real_logits(mesh_device, reset_seeds):
+    """Do padded and unpadded argmax pick the SAME token on REAL drafter logits?
+
+    `test_dense_argmax_rows1` proves the unpadded kernel is correct, but it plants a
+    strictly unique max so that "wrong index" is falsifiable. Real logits are not like
+    that: bf16 over a 262144 vocab has genuine ties near the top, and where the top two
+    are equal, either index is a legitimate argmax. A tie-break difference would not be
+    a correctness bug, but it WOULD change which token the drafter proposes, and so the
+    acceptance rate and the greedy output.
+
+    So this is the token-identity gate before `_argmax_last` is changed: run the real
+    drafter, chaining hidden and token as `_make_fused_k_body` does, and compare the two
+    paths against each other and against a host torch argmax of the same logits. Any
+    mismatch is reported with the top-2 gap so a tie can be told from a defect.
+    """
+    steps = int(os.getenv("GEMMA4_ARGMAX_STEPS", "16"))
+    rig = _build_standalone(mesh_device, "dram")
+    assistant = rig["assistant"]
+    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
+    pu, pi = rig["pos_uint32"], rig["pos_int32"]
+    R32 = 32
+
+    def _padded(lg):  # exactly spec_decode._argmax_last's rows<32 branch
+        pad = ttnn.pad(lg, [(0, 0), (0, 0), (0, R32 - 1), (0, 0)], value=0.0)
+        u = ttnn.untilize(pad, use_multicore=True)
+        if not _same_buffer(pad, lg):
+            pad.deallocate(True)
+        i = ttnn.argmax(u, dim=-1, keepdim=False)
+        u.deallocate(True)
+        sl = ttnn.slice(i, [0, 0, 0], [1, 1, 1])
+        i.deallocate(True)
+        return sl
+
+    def _unpadded(lg):  # the proposed rows==1 fast path
+        u = ttnn.untilize(lg, use_multicore=True)
+        i = ttnn.argmax(u, dim=-1, keepdim=False)
+        u.deallocate(True)
+        return i
+
+    tok, h = rig["token"], rig["hidden"]
+    agree = ties = defects = 0
+    for st in range(steps):
+        logits, h_next = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=True)
+        host = ttnn.to_torch(logits).reshape(-1).float()
+        top2 = torch.topk(host, 2)
+        gold, gap = int(top2.indices[0]), float(top2.values[0] - top2.values[1])
+
+        ip, iu = _padded(logits), _unpadded(logits)
+        ttnn.synchronize_device(mesh_device)
+        vp, vu = int(ttnn.to_torch(ip).reshape(-1)[0]), int(ttnn.to_torch(iu).reshape(-1)[0])
+        ip.deallocate(True)
+        iu.deallocate(True)
+
+        same = vp == vu
+        tied = gap == 0.0
+        agree += int(same)
+        ties += int(tied)
+        if not same:
+            # A disagreement only matters if the values actually differ.
+            defects += int(float(host[vp]) != float(host[vu]))
+            logger.info(
+                f"[real-argmax] step {st:2d} MISMATCH pad={vp} unpad={vu} gold={gold} "
+                f"vals {float(host[vp]):.6f}/{float(host[vu]):.6f} top2gap={gap:.6f}"
+            )
+        else:
+            logger.info(
+                f"[real-argmax] step {st:2d} pad={vp} unpad={vu} gold={gold} "
+                f"agree={same} gold_match={vp == gold} top2gap={gap:.6f}{'  <- TIE' if tied else ''}"
+            )
+        logits.deallocate(True)
+        # Chain exactly as the drafter does, so later steps see real downstream logits.
+        tok = ttnn.from_torch(
+            torch.tensor([[vp]], dtype=torch.int32),
+            device=mesh_device,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+        if h is not rig["hidden"]:
+            h.deallocate(True)
+        h = h_next
+
+    logger.info(f"[real-argmax] ===== {agree}/{steps} steps agree | {ties} exact top-2 ties | {defects} real defects")
+    assert defects == 0, f"{defects} of {steps} steps picked a strictly-lower-valued index"
+    assert agree == steps, f"only {agree}/{steps} agreed (see MISMATCH lines; ties are not defects)"
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])

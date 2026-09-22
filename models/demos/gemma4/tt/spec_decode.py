@@ -1014,7 +1014,7 @@ class SpeculativeDecoder:
         ``ttnn.argmax`` requires ROW_MAJOR input; passing a TILE tensor takes a
         single-core internal-untilize path that is catastrophically slow on a
         262144-wide vocab (~9 ms for 1 row, ~28 ms for 5). The multicore argmax
-        is fast (~1.6 ms) but ROW-PARALLEL: it returns GARBAGE unless the row
+        is fast but ROW-PARALLEL: for 2 <= rows <= 32 it returns GARBAGE unless the row
         (batch) dim is EXACTLY one tile (32) — verified by a correctness probe
         (1/5 rows -> wrong; padded to 32 -> exact; and >32 rows in one call also
         returns garbage beyond the first tile). So process the rows in 32-row
@@ -1047,6 +1047,27 @@ class SpeculativeDecoder:
             for c in chunks:
                 c.deallocate(True)
             return out
+        # rows == 1 (every drafter step) needs NO padding. Untilizing the [1,1,1,V]
+        # TILE tensor drops the physical 32-row pad outright, and argmax over the
+        # resulting single ROW_MAJOR row is both correct and far cheaper -- there is
+        # nothing to slice back. Same fix as masked_embedding._argmax_rows took in
+        # fd652d14217 for the CME head; the dense path had been left behind.
+        # MEASURED at the real width (test_dense_argmax_rows1, N=262144, bf16):
+        # padded 1583.4 us vs unpadded 102.0 us -- 15.5x -- and the unpadded index is
+        # exact in 16/16 cells (bf16+fp32, rows 1 and 5, max at first/middle/last/
+        # random). The docstring's "returns GARBAGE unless the row dim is EXACTLY one
+        # tile" does not hold at rows==1. Token identity on REAL drafter logits is
+        # covered by test_dense_argmax_real_logits (16/16, zero ties).
+        # rows in 2..31 keeps the pad-to-32 path: >32-row behaviour is untested and the
+        # packed-verify caller reaches this through the 32-row chunking above.
+        # GEMMA4_ARGMAX_PAD32=1 restores the old pad-to-32 path. It exists so the
+        # before/after can be measured in ONE session rather than against a figure
+        # recorded days earlier, and as a rollback if the fast path ever misbehaves.
+        if rows == 1 and os.environ.get("GEMMA4_ARGMAX_PAD32", "0") != "1":
+            u = ttnn.untilize(logits, use_multicore=True)
+            idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,1] uint32 RM
+            u.deallocate(True)
+            return idx
         src = logits
         padded = None
         if rows < R32:
