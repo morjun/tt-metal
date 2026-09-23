@@ -2074,7 +2074,15 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     const auto& b = b_tensors[0];
     const auto num_output_cb = out_buffers.size();
     const auto batch = b_tensors.size();
-    const bool in1_is_dram_interleaved = in1_tensor.memory_config().is_dram() && !b.is_sharded();
+    // Interleaved in1, DRAM **or L1**. The kernel's read_block_from_dram() is generic despite
+    // its name -- it issues noc.async_read(s1, ..., {.page_id = ...}) through a TensorAccessor
+    // built by TensorAccessorArgs(in1_tensor), which carries the buffer type and banking. The
+    // name is kept because it is the kernel's compile-arg ABI. Setting it for L1-interleaved
+    // also makes :2153 allocate a real double-buffered CB and :2240 correctly NOT alias the CB
+    // to the tensor -- both of which are what an interleaved weight needs.
+    const bool in1_is_dram_interleaved =
+        !b.is_sharded() &&
+        (in1_tensor.memory_config().is_dram() || in1_tensor.memory_config().buffer_type() == tt_metal::BufferType::L1);
     const bool in1_is_dram_sharded =
         in1_tensor.memory_config().is_dram() && b.is_sharded() && !global_cb.has_value();  // read from DRAM directly
 

@@ -1727,16 +1727,21 @@ void validate_matmul_mcast1d_config(
             input_tensor_a.memory_config().memory_layout());
         TT_FATAL(
             input_tensor_b.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED ||
+                // INTERLEAVED in1 is read per block through a TensorAccessor built from the
+                // tensor itself, so the banking is resolved from its own args and L1 works the
+                // same way DRAM does. The buffer-type test that used to sit here excluded L1
+                // for no reason the read path cares about.
                 (input_tensor_b.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
-                 input_tensor_b.buffer()->buffer_type() == tt_metal::BufferType::DRAM) ||
+                 (input_tensor_b.buffer()->buffer_type() == tt_metal::BufferType::DRAM ||
+                  input_tensor_b.buffer()->buffer_type() == tt_metal::BufferType::L1)) ||
                 // Receiver-contiguous Tensor prefetcher: in1 is an NdShardSpec DRAM
                 // weight (reported as ND_SHARDED) whose data is delivered via the
                 // global CB receivers, not read directly per its DRAM layout. The
                 // weight's own layout is irrelevant to the matmul in this case.
                 (attributes.global_cb.has_value() &&
                  input_tensor_b.buffer()->buffer_type() == tt_metal::BufferType::DRAM),
-            "{}: Input tensor B must be width sharded, DRAM interleaved, or a DRAM weight fed "
-            "via a global circular buffer when using gather_in0.",
+            "{}: Input tensor B must be width sharded, interleaved (DRAM or L1), or a DRAM weight "
+            "fed via a global circular buffer when using gather_in0.",
             config_name);
         if (!attributes.global_cb.has_value() && input_tensor_b.is_sharded()) {
             if (input_tensor_b.buffer()->buffer_type() == tt_metal::BufferType::L1) {

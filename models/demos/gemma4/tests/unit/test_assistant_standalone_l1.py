@@ -3164,7 +3164,7 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     try:
         observed_ring = sum(p["ring"] for p in observed_plans)
         manifest["observed_ring"] = observed_ring
-        if _env_on("GEMMA4_GATHER_DRAM_WEIGHT"):
+        if _env_on("GEMMA4_GATHER_DRAM_WEIGHT") or _env_on("GEMMA4_GATHER_ANY_WEIGHT"):
             # With a DRAM weight the ring is no longer tied to the RELOCATED layers -- it fires
             # on every shape with a valid gather config (down_proj x4 + o_proj full + o_proj
             # sliding x3 = 8/step here), so the per-layer formula does not apply. Assert only
