@@ -55,13 +55,8 @@ from loguru import logger
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
-from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
-from models.demos.gemma4.tt.assistant.model import (
-    Gemma4AssistantModel,
-    Gemma4TTMaskedEmbedder,
-    SplitLogits,
-    _same_buffer,
-)
+from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, Gemma4TTMaskedEmbedder, _same_buffer
+from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel, SplitLogits
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
 from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather, ccl_allreduce
@@ -383,17 +378,22 @@ def _argmax_token(assistant, logits, rows=1):
     if isinstance(logits, CmeLogits):
         return assistant.masked_embedding.argmax_token_id(logits, rows)
     if isinstance(logits, SplitLogits):
-        # Mirrors spec_decode._argmax_last's SplitLogits branch (see the rationale there).
+        # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
+        # drops the physical 32-row pad, so the concat moves `rows` real rows and
+        # the argmax already returns [1,1,rows] -- there is NO slice back. (An
+        # earlier cut kept the padded path's slice; at full extent ttnn returns it
+        # as a VIEW, and freeing idx then freed the result under it.) Concatenating
+        # in vocab-column order makes the index already a vocab id. The alternative,
+        # argmax per part and pick the larger, needs each part's max VALUE, and
+        # ttnn.max is slower than argmax itself (PERFORMANCE_TRAJECTORY §2.10).
+        if rows > 32:
+            raise NotImplementedError("SplitLogits argmax is untested above 32 rows (drafter uses rows=1)")
         rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
         joined = ttnn.concat(rm, dim=-1)
         for t in rm:
             t.deallocate(True)
-        idx = ttnn.argmax(joined, dim=-1, keepdim=False)
+        idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
         joined.deallocate(True)
-        if rows < 32:
-            sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
-            idx.deallocate(True)
-            idx = sliced
         return idx
     R32 = 32
     # Mirrors spec_decode._argmax_last's rows==1 fast path (see the rationale there).
@@ -2235,6 +2235,409 @@ def test_argmax_shapes(mesh_device, reset_seeds):
             logger.info(f"[argmax-shape] {name:<36} FAILED: {str(ex).split('backtrace')[0].strip()[:95]}")
     for t in protect:
         t.deallocate(True)
+
+
+class _Pair:
+    """Freeable handle for two outputs, so _op_timed can time a two-matmul body."""
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def deallocate(self, force=True):
+        self.a.deallocate(force)
+        self.b.deallocate(force)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_lm_head_split(mesh_device, reset_seeds):
+    """Correctness, attribution and the bandwidth gate for GEMMA4_LMHEAD_L1_COLS.
+
+    L1_WEIGHT_PINNING.md §12. Ordered so that each result gates the next:
+
+    1. **Token identity on real drafter logits** -- a chained run with the unsplit head,
+       then the same run with the split head, same start state. Split and unsplit use
+       different program configs, so logits need not be bit-identical; the gate is
+       token identity, with the numerical gap reported.
+    2. **Op-level agreement** on one fixed input: concat(split) vs the unsplit head.
+    3. **Attribution at an identical config**: the slice from DRAM and from L1 with the
+       SAME 110-core program config, so the difference is placement and nothing else.
+    4. **The bandwidth gate**: the whole head at bf16 vs bfp8 -- same MACs, ~0.53x the
+       bytes. If time does not follow bytes, the head is not bandwidth-bound and pinning
+       part of it cannot pay. bfp8 here is an isolated-op PROBE, not a candidate config.
+    """
+    cols = int(os.getenv("GEMMA4_LMHEAD_L1_COLS_TEST", "38720"))
+    steps = int(os.getenv("GEMMA4_ARGMAX_STEPS", "16"))
+    rig = _build_standalone(mesh_device, "dram")
+    a = rig["assistant"]
+    assert a.lm_head_l1 is None, "run with GEMMA4_LMHEAD_L1_COLS unset; this test applies the split itself"
+    shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
+    pu, pi = rig["pos_uint32"], rig["pos_int32"]
+    vocab = int(a.lm_head.shape[-1])
+
+    def chained(tag):
+        tok, h, toks, rows = rig["token"], rig["hidden"], [], []
+        for _ in range(steps):
+            lg, h_next = a.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=True)
+            if isinstance(lg, SplitLogits):
+                host = torch.cat([ttnn.to_torch(p).reshape(-1) for p in lg.parts]).float()
+            else:
+                host = ttnn.to_torch(lg).reshape(-1).float()
+            idx = _argmax_token(a, lg, rows=1)
+            ttnn.synchronize_device(mesh_device)
+            t = int(ttnn.to_torch(idx).reshape(-1)[0])
+            idx.deallocate(True)
+            for p in lg.parts if isinstance(lg, SplitLogits) else (lg,):
+                p.deallocate(True)
+            toks.append(t)
+            rows.append(host[:vocab])
+            tok = ttnn.from_torch(
+                torch.tensor([[t]], dtype=torch.int32),
+                device=mesh_device,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+            if h is not rig["hidden"]:
+                h.deallocate(True)
+            h = h_next
+        logger.info(f"[lm-split] {tag:<8} tokens={toks}")
+        return toks, rows
+
+    base_toks, base_rows = chained("unsplit")
+
+    # ---- op level, one fixed input ------------------------------------------------
+    torch.manual_seed(0)
+    x = ttnn.from_torch(
+        torch.randn(1, 1, 1, int(a.lm_head.shape[-2])).bfloat16(),
+        device=mesh_device,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+    )
+    W = a.lm_head
+    # fp32 host reference for the precision question: is the split LESS accurate, or
+    # only differently rounded? (A drafter that is merely reordered costs nothing; one
+    # that is noisier proposes worse tokens and costs acceptance.)
+    x_host = ttnn.to_torch(x).reshape(-1).float()
+    W_host = ttnn.to_torch(W).reshape(int(W.shape[-2]), int(W.shape[-1])).float()
+    ref32 = (x_host @ W_host)[:vocab]
+    del W_host
+    base_out = ttnn.linear(x, W)
+    base_host = ttnn.to_torch(base_out).reshape(-1)[:vocab].float()
+    base_out.deallocate(True)
+    t_full = _op_timed(mesh_device, lambda: ttnn.linear(x, W), protect=(x, W))
+
+    # bandwidth gate: same MACs, fewer bytes
+    try:
+        W8 = ttnn.typecast(W, ttnn.bfloat8_b)
+        t_full8 = _op_timed(mesh_device, lambda: ttnn.linear(x, W8), protect=(x, W8))
+        W8.deallocate(True)
+    except Exception as ex:  # noqa: BLE001
+        t_full8 = float("nan")
+        logger.info(f"[lm-split] bfp8 probe unavailable: {str(ex)[:120]}")
+
+    # attribution at an identical config: the slice from DRAM vs from L1
+    from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
+
+    g = mesh_device.compute_with_storage_grid_size()
+    k = int(W.shape[-2])
+    pc = derive_decode_1d_config(1, k, cols, max_x=g.x, max_y=g.y)
+    dram_slice = ttnn.slice(W, [0, 0, 0, 0], [1, 1, k, cols])
+    t_slice_dram_auto = _op_timed(mesh_device, lambda: ttnn.linear(x, dram_slice), protect=(x, dram_slice))
+    t_slice_dram_pc = _op_timed(
+        mesh_device, lambda: ttnn.linear(x, dram_slice, program_config=pc), protect=(x, dram_slice)
+    )
+
+    # precision matrix on the SAME slice: which change costs accuracy -- placement,
+    # program config, or compute config?
+    def _err(out):
+        e = (ttnn.to_torch(out).reshape(-1).float()[:cols] - ref32[:cols]).abs()
+        out.deallocate(True)
+        return float(e.mean()), float(e.max())
+
+    hifi4 = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
+    )
+    # What the AUTOMATIC path gets: matmul_device_operation.cpp:2688 raises fidelity to
+    # HiFi2 only when NO program_config is passed; default fp32_acc = (out is fp32) = False,
+    # l1_acc = True. So this is the precision-neutral config for an explicit-config matmul.
+    hifi2 = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=False, packer_l1_acc=True
+    )
+    auto_out = ttnn.linear(x, dram_slice)
+    auto_t = ttnn.to_torch(auto_out).reshape(-1)
+    auto_out.deallocate(True)
+    pc_h2 = ttnn.linear(x, dram_slice, program_config=pc, compute_kernel_config=hifi2)
+    pc_h2_t = ttnn.to_torch(pc_h2).reshape(-1)
+    pc_h2.deallocate(True)
+    logger.info(
+        f"[lm-split] derived pc (in0_block_w={pc.in0_block_w}) + HiFi2 vs automatic, same DRAM slice: bit-exact="
+        f"{bool(torch.equal(auto_t, pc_h2_t))} max|d|={float((auto_t.float()-pc_h2_t.float()).abs().max()):.6f}"
+    )
+    # Which explicit (in0_block_w, packer_l1_acc, fp32_acc) at HiFi2 reproduces the
+    # automatic path bit-for-bit?
+    if os.getenv("GEMMA4_LMSPLIT_MATCH_SWEEP", "0") == "1":
+        for blk in (1, 2, 4, 8, 16, 32):
+            for l1acc in (True, False):
+                for f32 in (False, True):
+                    ckc = ttnn.init_device_compute_kernel_config(
+                        mesh_device.arch(),
+                        math_fidelity=ttnn.MathFidelity.HiFi2,
+                        fp32_dest_acc_en=f32,
+                        packer_l1_acc=l1acc,
+                    )
+                    pcv = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=pc.compute_with_storage_grid_size,
+                        in0_block_w=blk,
+                        out_subblock_h=1,
+                        out_subblock_w=1,
+                        per_core_M=1,
+                        per_core_N=pc.per_core_N,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
+                    try:
+                        ov = ttnn.linear(x, dram_slice, program_config=pcv, compute_kernel_config=ckc)
+                        ovt = ttnn.to_torch(ov).reshape(-1)
+                        ov.deallocate(True)
+                        me = float((ovt.float()[:cols] - ref32[:cols]).abs().mean())
+                        logger.info(
+                            f"[lm-split] match blk={blk:>2} l1acc={int(l1acc)} fp32acc={int(f32)}: "
+                            f"bit-exact-vs-auto={bool(torch.equal(ovt, auto_t))} "
+                            f"max|d-auto|={float((ovt.float()-auto_t.float()).abs().max()):.5f} mean|e|={me:.4e}"
+                        )
+                    except Exception as ex:  # noqa: BLE001
+                        logger.info(
+                            f"[lm-split] match blk={blk} l1acc={int(l1acc)} fp32acc={int(f32)}: FAILED {str(ex)[:60]}"
+                        )
+    prec = {
+        "DRAM slice, explicit 1D pc + HiFi2 (auto-matched)": _err(
+            ttnn.linear(x, dram_slice, program_config=pc, compute_kernel_config=hifi2)
+        ),
+        "DRAM slice, automatic config": _err(ttnn.linear(x, dram_slice)),
+        "DRAM slice, explicit 1D pc": _err(ttnn.linear(x, dram_slice, program_config=pc)),
+        "DRAM slice, explicit 1D pc + HiFi4/fp32acc": _err(
+            ttnn.linear(x, dram_slice, program_config=pc, compute_kernel_config=hifi4)
+        ),
+        "DRAM slice, automatic + HiFi4/fp32acc": _err(ttnn.linear(x, dram_slice, compute_kernel_config=hifi4)),
+    }
+    t_slice_dram_pc_hifi4 = _op_timed(
+        mesh_device,
+        lambda: ttnn.linear(x, dram_slice, program_config=pc, compute_kernel_config=hifi4),
+        protect=(x, dram_slice),
+    )
+    dram_slice.deallocate(True)
+
+    # ---- apply the split exactly as the model does ---------------------------------
+    os.environ["GEMMA4_LMHEAD_L1_COLS"] = str(cols)
+    try:
+        a._split_lm_head_to_l1(mesh_device)
+    finally:
+        os.environ.pop("GEMMA4_LMHEAD_L1_COLS", None)
+    P, T_ = a.lm_head_l1, a.lm_head
+    st = _l1_bank_state(mesh_device)
+    logger.info(_fmt_bank_state("after split", st))
+
+    t_slice_l1_pc = _op_timed(
+        mesh_device,
+        lambda: ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=a.lm_head_l1_ckc),
+        protect=(x, P),
+    )
+    t_tail = _op_timed(mesh_device, lambda: ttnn.linear(x, T_), protect=(x, T_))
+    t_pair = _op_timed(
+        mesh_device,
+        lambda: _Pair(
+            ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=a.lm_head_l1_ckc),
+            ttnn.linear(x, T_),
+        ),
+        protect=(),
+    )
+    hp, tp_ = ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=a.lm_head_l1_ckc), ttnn.linear(
+        x, T_
+    )
+    split_host = torch.cat([ttnn.to_torch(hp).reshape(-1), ttnn.to_torch(tp_).reshape(-1)]).float()[:vocab]
+    split_logits = SplitLogits(parts=(hp, tp_))
+
+    # Stage-by-stage check of the DEVICE combine (untilize -> concat -> argmax) against
+    # host truth on the same outputs, so a failure names the stage that broke.
+    ref_h, ref_t = ttnn.to_torch(hp).reshape(-1).float(), ttnn.to_torch(tp_).reshape(-1).float()
+    h_rm, t_rm = ttnn.untilize(hp, use_multicore=True), ttnn.untilize(tp_, use_multicore=True)
+    d_h = float((ttnn.to_torch(h_rm).reshape(-1).float() - ref_h).abs().max())
+    d_t = float((ttnn.to_torch(t_rm).reshape(-1).float() - ref_t).abs().max())
+    joined = ttnn.concat([h_rm, t_rm], dim=-1)
+    jt = ttnn.to_torch(joined).reshape(-1).float()
+    d_j = (
+        float((jt - torch.cat([ref_h, ref_t])).abs().max())
+        if jt.numel() == ref_h.numel() + ref_t.numel()
+        else float("nan")
+    )
+    di = ttnn.argmax(joined, dim=-1, keepdim=False)
+    dev_idx = int(ttnn.to_torch(di).reshape(-1)[0])
+    host_idx = int(torch.cat([ref_h, ref_t]).argmax())
+    logger.info(
+        f"[lm-split] combine stages: untilize(L1 part {int(hp.shape[-1])}) max|d|={d_h} | "
+        f"untilize(DRAM part {int(tp_.shape[-1])}) max|d|={d_t} | concat numel={jt.numel()} max|d|={d_j} | "
+        f"argmax device={dev_idx} host={host_idx} equal={dev_idx == host_idx}"
+    )
+    comb_idx = _argmax_token(a, split_logits, rows=1)
+    comb = int(ttnn.to_torch(comb_idx).reshape(-1)[0])
+    logger.info(f"[lm-split] _argmax_token(SplitLogits) = {comb} (host truth {host_idx}) equal={comb == host_idx}")
+    for t_ in (h_rm, t_rm, joined, di, comb_idx):
+        t_.deallocate(True)
+    t_argmax_split = _op_timed(mesh_device, lambda: _argmax_token(a, split_logits, rows=1), protect=(hp, tp_))
+    hp.deallocate(True)
+    tp_.deallocate(True)
+
+    # in0_block_w sweep on the pinned slice: fewer K-blocks = fewer bf16 partial spills.
+    if os.getenv("GEMMA4_LMSPLIT_BLK_SWEEP", "0") == "1":
+        kt = k // 32
+        ref_slice = ref32[:cols]
+        for blk in [d for d in (1, 2, 4, 8, 16, 32) if kt % d == 0]:
+            pcb = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=a.lm_head_l1_pc.compute_with_storage_grid_size,
+                in0_block_w=blk,
+                out_subblock_h=1,
+                out_subblock_w=1,
+                per_core_M=1,
+                per_core_N=a.lm_head_l1_pc.per_core_N,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=True,
+            )
+            try:
+                ob = ttnn.linear(x, P, program_config=pcb)
+                eb = (ttnn.to_torch(ob).reshape(-1).float()[:cols] - ref_slice).abs()
+                ob.deallocate(True)
+                tb = _op_timed(mesh_device, lambda: ttnn.linear(x, P, program_config=pcb), protect=(x, P))
+                logger.info(
+                    f"[lm-split] blk-sweep in0_block_w={blk:>2} ({kt // blk} K-blocks): "
+                    f"mean|e|={float(eb.mean()):.4e} max|e|={float(eb.max()):.4f}  {tb:8.2f} us"
+                )
+            except Exception as ex:  # noqa: BLE001
+                logger.info(f"[lm-split] blk-sweep in0_block_w={blk:>2}: FAILED {str(ex).split('backtrace')[0][:90]}")
+        logger.info(
+            f"[lm-split] blk-sweep reference: unsplit head on same cols mean|e|={float((base_host[:cols]-ref_slice).abs().mean()):.4e}"
+        )
+
+    prec["L1 slice, explicit 1D pc"] = _err(
+        ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=a.lm_head_l1_ckc)
+    )
+    prec["L1 slice, explicit 1D pc + HiFi2 (auto-matched)"] = _err(
+        ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=hifi2)
+    )
+    t_slice_l1_pc_hifi2 = _op_timed(
+        mesh_device,
+        lambda: ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=hifi2),
+        protect=(x, P),
+    )
+    logger.info(f"[lm-split] timing  slice L1 pc+HiFi2 {t_slice_l1_pc_hifi2:8.2f} us")
+    prec["L1 slice, explicit 1D pc + HiFi4/fp32acc"] = _err(
+        ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=hifi4)
+    )
+    t_slice_l1_pc_hifi4 = _op_timed(
+        mesh_device,
+        lambda: ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=hifi4),
+        protect=(x, P),
+    )
+    for kname, (me, mx) in prec.items():
+        logger.info(f"[lm-split] precision  {kname:<44} mean|e|={me:.4e} max|e|={mx:.4f}")
+    logger.info(
+        f"[lm-split] precision  (unsplit head, same cols)                 mean|e|={float((base_host[:cols]-ref32[:cols]).abs().mean()):.4e}"
+    )
+    logger.info(
+        f"[lm-split] timing  slice DRAM pc+HiFi4 {t_slice_dram_pc_hifi4:8.2f} us | slice L1 pc+HiFi4 {t_slice_l1_pc_hifi4:8.2f} us"
+    )
+
+    slice_bitexact = bool(torch.equal(split_host[:cols].bfloat16(), base_host[:cols].bfloat16()))
+    logger.info(
+        f"[lm-split] model's pinned-slice config vs unsplit head on the pinned cols: bit-exact={slice_bitexact}"
+    )
+
+    diff = (split_host - base_host).abs()
+    e_base, e_split = (base_host - ref32).abs(), (split_host - ref32).abs()
+    logger.info(
+        f"[lm-split] vs fp32 host ref: UNSPLIT max|e|={float(e_base.max()):.4f} mean|e|={float(e_base.mean()):.4e} | "
+        f"SPLIT max|e|={float(e_split.max()):.4f} mean|e|={float(e_split.mean()):.4e} | "
+        f"split-only cols(L1) mean|e|={float(e_split[:cols].mean()):.4e} vs unsplit same cols {float(e_base[:cols].mean()):.4e} | "
+        f"argmax ref={int(ref32.argmax())} unsplit={int(base_host.argmax())} split={int(split_host.argmax())}"
+    )
+    op_argmax_ok = int(split_host.argmax()) == int(base_host.argmax())
+    logger.info(
+        f"[lm-split] op-level: max|diff|={float(diff.max()):.6f} mean|diff|={float(diff.mean()):.3e} "
+        f"exact_frac={float((diff == 0).float().mean()):.4f} argmax_equal={op_argmax_ok}"
+    )
+
+    # Is the pinned slice still intact after the drafter's own ops run? The op-level
+    # check above ran only linears; the chained run interleaves the whole backbone.
+    def _fp(t):
+        v = ttnn.to_torch(t).float()
+        return float(v.sum()), float(v.abs().sum()), tuple(v.reshape(-1)[:4].tolist())
+
+    fp0 = _fp(P)
+    lg_, hn_ = a.step(rig["token"], rig["hidden"], shared_kv, page_tables, pu, pi, return_logits=False)
+    ttnn.synchronize_device(mesh_device)
+    fp_backbone = _fp(P)
+    hn_.deallocate(True)
+    lg2, hn2 = a.step(rig["token"], rig["hidden"], shared_kv, page_tables, pu, pi, return_logits=True)
+    ttnn.synchronize_device(mesh_device)
+    fp_full = _fp(P)
+    s0 = torch.cat([ttnn.to_torch(p_).reshape(-1) for p_ in lg2.parts]).float()[:vocab]
+    for p_ in lg2.parts:
+        p_.deallocate(True)
+    hn2.deallocate(True)
+    logger.info(f"[lm-split] pinned fingerprint  after split   {fp0}")
+    logger.info(f"[lm-split] pinned fingerprint  after backbone{fp_backbone}  intact={fp_backbone == fp0}")
+    logger.info(f"[lm-split] pinned fingerprint  after full step{fp_full}  intact={fp_full == fp0}")
+    u0 = base_rows[0]
+    d0 = float((s0 - u0).abs().max())
+    tu, ts = torch.topk(u0, 4), torch.topk(s0, 4)
+    logger.info(f"[lm-split] step-0 max|d|={d0:.4f}  max|logit|={float(u0.abs().max()):.3f}")
+    logger.info(
+        f"[lm-split] step-0 unsplit top4 {list(zip(tu.indices.tolist(), [round(v, 4) for v in tu.values.tolist()]))}"
+    )
+    logger.info(
+        f"[lm-split] step-0 split   top4 {list(zip(ts.indices.tolist(), [round(v, 4) for v in ts.values.tolist()]))}"
+    )
+    iu, is_ = int(u0.argmax()), int(s0.argmax())
+    # A flip is a TIE, not a defect, iff the split's winner sits within the observed
+    # perturbation of the unsplit winner in the UNSPLIT logits.
+    tie_gap = float(u0[iu] - u0[is_])
+    tie_explained = (iu == is_) or (tie_gap <= d0)
+    logger.info(
+        f"[lm-split] step-0 argmax unsplit={iu} split={is_}; gap in unsplit logits={tie_gap:.4f} "
+        f"<= max|d| {d0:.4f} -> tie-explained={tie_explained}"
+    )
+
+    split_toks, split_rows = chained("split")
+    agree = sum(int(p == q) for p, q in zip(base_toks, split_toks))
+    step_gap = max(float((r1 - r2).abs().max()) for r1, r2 in zip(base_rows, split_rows))
+
+    logger.info(f"[lm-split] ===== cols={cols} ({cols/vocab*100:.1f}%)")
+    logger.info(f"[lm-split] tokens agree {agree}/{steps}; worst per-step max|logit diff| {step_gap:.6f}")
+    logger.info(
+        f"[lm-split] full head  bf16 {t_full:9.2f} us | bfp8 {t_full8:9.2f} us | ratio {t_full8/t_full:.3f} (bytes ratio ~0.53)"
+    )
+    logger.info(
+        f"[lm-split] slice DRAM auto {t_slice_dram_auto:9.2f} | slice DRAM same-pc {t_slice_dram_pc:9.2f} | slice L1 same-pc {t_slice_l1_pc:9.2f}"
+    )
+    logger.info(f"[lm-split]   placement at identical config (L1 - DRAM): {t_slice_l1_pc - t_slice_dram_pc:+.2f} us")
+    logger.info(
+        f"[lm-split] tail DRAM {t_tail:9.2f} | pair (slice L1 + tail) {t_pair:9.2f} | vs full {t_pair - t_full:+.2f} us"
+    )
+    logger.info(f"[lm-split] argmax over SplitLogits (untilize x2 + concat + argmax) {t_argmax_split:9.2f} us")
+    assert op_argmax_ok, "op-level argmax differs between split and unsplit head"
+    # NOT token identity. The split changes the K-reduction order, so bf16 logits move by a
+    # few ULP; where the top-2 are that close the winner flips, and every later step then
+    # runs on different tokens. A drafter token change is not a correctness problem -- the
+    # verifier is exact by construction (L1_WEIGHT_PINNING.md:725) -- so the gates are: the
+    # combine is exact, the pinned weight is intact, step-0 logits agree to a small
+    # tolerance, and any step-0 flip is explained by that perturbation. Acceptance is
+    # measured end to end, separately.
+    assert fp_full == fp0, "pinned lm_head slice changed during the step"
+    assert (
+        slice_bitexact
+    ), "pinned slice no longer reproduces the unsplit head bit-for-bit -- check ttnn's automatic config"
+    assert d0 < 0.05 * float(u0.abs().max()), f"step-0 logits differ by {d0} -- beyond a reordering tolerance"
+    assert tie_explained, f"step-0 flip not explained by the perturbation (gap {tie_gap} > {d0})"
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])

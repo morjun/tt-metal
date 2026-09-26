@@ -1036,6 +1036,8 @@ class SpeculativeDecoder:
         if isinstance(logits, CmeLogits):
             return self.assistant.masked_embedding.argmax_token_id(logits, rows)
         if isinstance(logits, SplitLogits):
+            if rows > 32:
+                raise NotImplementedError("SplitLogits argmax is untested above 32 rows (drafter uses rows=1)")
             # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
             # drops the physical 32-row pad, so the concat moves one real row rather
             # than 32 (the tax §2.10 removed). Concatenating in vocab-column order
@@ -1046,12 +1048,11 @@ class SpeculativeDecoder:
             joined = ttnn.concat(rm, dim=-1)
             for t in rm:
                 t.deallocate(True)
-            idx = ttnn.argmax(joined, dim=-1, keepdim=False)
+            idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
             joined.deallocate(True)
-            if rows < 32:
-                sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
-                idx.deallocate(True)
-                idx = sliced
+            # NO slice back: after untilize the argmax is over `rows` real rows already.
+            # An earlier cut kept the padded path's slice; at full extent ttnn returns it
+            # as a VIEW, and freeing idx then freed the result under it.
             return idx
         R32 = 32
         if rows > R32:

@@ -233,6 +233,7 @@ class Gemma4AssistantModel:
         self.lm_head = None
         self.lm_head_l1 = None
         self.lm_head_l1_pc = None
+        self.lm_head_l1_ckc = None
         if self.use_cme:
             self.masked_embedding = Gemma4TTMaskedEmbedder(
                 mesh_device=mesh_device,
@@ -251,7 +252,7 @@ class Gemma4AssistantModel:
             self.lm_head = _linear(lm_key, col_mapper)
             if self.lm_head is None:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
-            self.lm_head_l1, self.lm_head_l1_pc = self._split_lm_head_to_l1(mesh_device)
+            self._split_lm_head_to_l1(mesh_device)
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
 
@@ -302,7 +303,7 @@ class Gemma4AssistantModel:
         """
         cols = int(os.getenv("GEMMA4_LMHEAD_L1_COLS", "0"))
         if cols <= 0:
-            return None, None
+            return
         from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
         T = 32
@@ -323,6 +324,31 @@ class Gemma4AssistantModel:
                 f"GEMMA4_LMHEAD_L1_COLS={cols}: Nt={cols // T} is not divisible by the {cores}-core "
                 f"grid; use a multiple of {T * cores} (e.g. {T * cores * 11} or {T * cores * 3})"
             )
+        # PRECISION-NEUTRAL, not just grid-correct. matmul_device_operation.cpp:2688 raises
+        # the default math fidelity to HiFi2 ONLY when no program_config is passed; with one,
+        # it silently drops to LoFi. The unsplit head passes none, so it runs HiFi2 with the
+        # automatic in0_block_w -- and MEASURED on this slice, the explicit config at LoFi /
+        # in0_block_w=8 is 2.9x noisier against an fp32 reference (1.90e-2 vs 6.53e-3).
+        # (in0_block_w=2, HiFi2, packer_l1_acc, no fp32 dest) reproduces the automatic path
+        # BIT-FOR-BIT on the same slice (test_lm_head_split asserts it), so the pinned
+        # columns compute exactly what the unsplit head did and the split changes placement
+        # and nothing else. Note with packer_l1_acc more K-blocks is MORE precise, not less.
+        kt = k // T
+        blk = 2 if kt % 2 == 0 else 1
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=pc.compute_with_storage_grid_size,
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=pc.per_core_N,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+        ckc = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=False, packer_l1_acc=True
+        )
         per_core_n = pc.per_core_N
         charge = k * T * per_core_n * self.lm_head.element_size()
         logger.info(
@@ -343,7 +369,7 @@ class Gemma4AssistantModel:
             head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
         )
         head.deallocate(True)
-        return pinned, pc
+        self.lm_head_l1, self.lm_head_l1_pc, self.lm_head_l1_ckc = pinned, pc, ckc
 
     def step(self, token_tt, target_hidden, shared_kv, page_tables, pos_uint32, pos_int32, return_logits=True):
         """One drafter step.
@@ -405,7 +431,12 @@ class Gemma4AssistantModel:
             elif self.lm_head_l1 is not None:
                 # Split head: the pinned L1 columns and the DRAM remainder, in vocab
                 # order. Kept as parts rather than concatenated here -- see SplitLogits.
-                head = ttnn.linear(normed, self.lm_head_l1, program_config=self.lm_head_l1_pc)
+                head = ttnn.linear(
+                    normed,
+                    self.lm_head_l1,
+                    program_config=self.lm_head_l1_pc,
+                    compute_kernel_config=self.lm_head_l1_ckc,
+                )
                 tail = ttnn.linear(normed, self.lm_head)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     head = ccl_allgather(head, self.mesh_config, self.ccl_manager)
