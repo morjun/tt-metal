@@ -406,6 +406,8 @@ class DecodeMatmulTuner:
         plan = self._gather_plan(x, w) if kwargs.get("program_config") is None else None
         if plan is not None:
             pc, in0_spec, out_spec = plan
+            if kwargs.get("compute_kernel_config") is None:
+                kwargs["compute_kernel_config"] = self.compute_config_for(x, w)
             want_mc = kwargs.pop("memory_config", None) or ttnn.DRAM_MEMORY_CONFIG
             xs = x if x.memory_config() == in0_spec else ttnn.to_memory_config(x, in0_spec)
             out = ttnn.linear(xs, w, program_config=pc, memory_config=out_spec, **kwargs)
@@ -418,7 +420,30 @@ class DecodeMatmulTuner:
             pc = self.config_for(x, w)
             if pc is not None:
                 kwargs["program_config"] = pc
+                if kwargs.get("compute_kernel_config") is None:
+                    kwargs["compute_kernel_config"] = self.compute_config_for(x, w)
         return ttnn.linear(x, w, **kwargs)
+
+    def compute_config_for(self, x, w):
+        """Return the compute config ttnn would pick for this matmul without a program config.
+
+        ttnn lowers its default math fidelity from HiFi2 to LoFi as soon as a program config is
+        passed (matmul_device_operation.cpp:2688), so a tuned call restates the automatic
+        defaults to change only the blocking. Returns None where ttnn's default already matches
+        (both inputs BFP8/BFP4, or both FLOAT32). Same change as PR #57993 (8e7e0f40733).
+        """
+        low_precision = (ttnn.bfloat8_b, ttnn.bfloat4_b)
+        if x.dtype in low_precision and w.dtype in low_precision:
+            return None
+        if x.dtype == ttnn.float32 and w.dtype == ttnn.float32:
+            return None
+        return ttnn.init_device_compute_kernel_config(
+            x.device().arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
 
 
 #: Shared disabled instance so call sites can do ``(tuner or DISABLED).linear(...)``.
