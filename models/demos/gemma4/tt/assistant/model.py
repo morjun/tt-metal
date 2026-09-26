@@ -75,6 +75,12 @@ class SplitLogits(NamedTuple):
 
     parts: tuple
 
+    def deallocate(self, force=True):
+        # Same contract as CmeLogits.deallocate: ~10 spec_decode call sites and the
+        # harness's fused body free their logits unconditionally after the argmax.
+        for p in self.parts:
+            p.deallocate(force)
+
 
 def _inject_zero_kv_weights(state_dict, text_args):
     """Add zero k_proj/v_proj and a unit k_norm for every assistant layer.
