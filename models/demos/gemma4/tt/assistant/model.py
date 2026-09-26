@@ -287,38 +287,47 @@ class Gemma4AssistantModel:
         one way to put any of it in L1, because width sharding splits exactly that
         axis (§5.4).
 
-        Two things here are deliberate and cannot be borrowed from the existing
-        helpers:
-
-        * **The 110-core grid.** ``weight_placement._pick_grid`` and the matmul
-          tuner both cap at 8x8 = 64 cores. ``Nt1`` must divide by the core count to
-          keep ``per_core_N`` small, and the per-bank charge is
-          ``K x 32 x per_core_N x elem`` -- at 64 cores the smallest legal slice
-          already overflows. 11x10 = 110 is the device's full compute grid and the
-          same one ttnn's automatic config picks for the unsplit head.
-        * **An explicit program config.** The matmul validator requires
-          ``per_core_N == in1_shard_width_tiles``; the tuner cannot emit a >64-core
-          config, so the config is built here to match the shard exactly.
+        **The grid is the device's full 11x10 = 110 cores, not the tuner's 8x8.** The
+        per-bank charge is ``K x 32 x per_core_N x elem``, so the slice only fits if
+        ``per_core_N`` is small, which needs many cores. Every grid helper here caps
+        at ``max_x = max_y = 8`` (and ``DecodeMatmulTuner`` clamps the device grid to
+        it, ``matmul_tuning.py:274``); ``_pick_grid(1210, 8, 8)`` returns 5x2 = 10
+        cores and ``per_core_N = 121`` -- 7.9 MB/bank. With the cap lifted to the
+        device grid the same helper returns 11x10 and ``per_core_N = 11``. The cap is
+        lifted **for this call only**: raising it in the tuner would also regrid
+        ``wqkv``-full (48 -> 72 cores) and ``post_projection`` (40 -> 60), shifting
+        every other drafter matmul. ``derive_decode_1d_config`` already takes the
+        caps as arguments, so the config it returns matches the shard exactly --
+        which is what the validator's ``per_core_N == in1_shard_width_tiles`` needs.
         """
         cols = int(os.getenv("GEMMA4_LMHEAD_L1_COLS", "0"))
         if cols <= 0:
             return None, None
+        from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
+
         T = 32
         grid = mesh_device.compute_with_storage_grid_size()
-        cores = grid.x * grid.y
         k = int(self.lm_head.shape[-2])
         vocab = int(self.lm_head.shape[-1])
-        nt = cols // T
-        if cols % T or nt % cores or cols >= vocab:
+        if cols % T or cols >= vocab:
             raise ValueError(
-                f"GEMMA4_LMHEAD_L1_COLS={cols}: must be a multiple of {T}, leave a DRAM "
-                f"remainder (<{vocab}), and have Nt={nt} divisible by the {cores}-core grid"
+                f"GEMMA4_LMHEAD_L1_COLS={cols}: must be a multiple of {T} and leave a DRAM remainder (<{vocab})"
             )
-        per_core_n = nt // cores
+        pc = derive_decode_1d_config(1, k, cols, max_x=grid.x, max_y=grid.y)
+        cores = grid.x * grid.y
+        if pc is None or pc.compute_with_storage_grid_size.x * pc.compute_with_storage_grid_size.y != cores:
+            # _pick_grid takes the largest rectangle whose core count divides Nt; if
+            # that is smaller than the full grid, per_core_N -- and the charge --
+            # grow by the same factor, so refuse rather than silently overflow.
+            raise ValueError(
+                f"GEMMA4_LMHEAD_L1_COLS={cols}: Nt={cols // T} is not divisible by the {cores}-core "
+                f"grid; use a multiple of {T * cores} (e.g. {T * cores * 11} or {T * cores * 3})"
+            )
+        per_core_n = pc.per_core_N
         charge = k * T * per_core_n * self.lm_head.element_size()
         logger.info(
             f"[lm_head-split] pinning {cols}/{vocab} cols ({cols/vocab*100:.1f}%) on "
-            f"{grid.x}x{grid.y}={cores} cores, per_core_N={per_core_n}, "
+            f"{grid.x}x{grid.y}={cores} cores, per_core_N={per_core_n}, in0_block_w={pc.in0_block_w}, "
             f"charge={charge} B/bank ({charge/1024:.0f} KiB)"
         )
         head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])
@@ -334,18 +343,6 @@ class Gemma4AssistantModel:
             head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
         )
         head.deallocate(True)
-        blk = max(d for d in range(1, min(k // T, 8) + 1) if (k // T) % d == 0)
-        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-            compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
-            in0_block_w=blk,
-            out_subblock_h=1,
-            out_subblock_w=1,
-            per_core_M=1,
-            per_core_N=per_core_n,
-            fuse_batch=True,
-            fused_activation=None,
-            mcast_in0=True,
-        )
         return pinned, pc
 
     def step(self, token_tt, target_hidden, shared_kv, page_tables, pos_uint32, pos_int32, return_logits=True):
