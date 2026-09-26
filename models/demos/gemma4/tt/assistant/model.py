@@ -240,6 +240,7 @@ class Gemma4AssistantModel:
         self.lm_head_l1 = None
         self.lm_head_l1_pc = None
         self.lm_head_l1_ckc = None
+        self.lm_head_l1_ring = None  # (in0 spec, out spec) when the slice runs as a gather_in0 ring
         if self.use_cme:
             self.masked_embedding = Gemma4TTMaskedEmbedder(
                 mesh_device=mesh_device,
@@ -375,6 +376,35 @@ class Gemma4AssistantModel:
             head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
         )
         head.deallocate(True)
+        if os.getenv("GEMMA4_LMHEAD_L1_GATHER", "0") == "1":
+            # gather_in0 ring on the same 110 cores, as down_proj's ring. Kt = 32 < 110, so K is
+            # sharded UNEVENLY: 1 tile on the first 32 cores, none on the rest (the factory carries
+            # per-core unpadded_in0_shard_widths for this). The factory forces in0_block_w to the
+            # shard width (1), so this arm is NOT bit-exact with the unsplit head.
+            in0_w = -(-kt // cores) * T
+            crs = shard.grid
+
+            def _wsh(shape):
+                return ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(crs, shape, ttnn.ShardOrientation.ROW_MAJOR),
+                )
+
+            pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=pc.compute_with_storage_grid_size,
+                in0_block_w=in0_w // T,
+                out_subblock_h=1,
+                out_subblock_w=1,
+                per_core_M=1,
+                per_core_N=per_core_n,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=False,
+                gather_in0=True,
+            )
+            self.lm_head_l1_ring = (_wsh([T, in0_w]), _wsh([T, cols // cores]))
+            logger.info(f"[lm_head-split] gather_in0 ring: in0 shard {in0_w // T} tile(s)/core on {cores} cores")
         self.lm_head_l1, self.lm_head_l1_pc, self.lm_head_l1_ckc = pinned, pc, ckc
 
     def step(self, token_tt, target_hidden, shared_kv, page_tables, pos_uint32, pos_int32, return_logits=True):
@@ -437,12 +467,26 @@ class Gemma4AssistantModel:
             elif self.lm_head_l1 is not None:
                 # Split head: the pinned L1 columns and the DRAM remainder, in vocab
                 # order. Kept as parts rather than concatenated here -- see SplitLogits.
-                head = ttnn.linear(
-                    normed,
-                    self.lm_head_l1,
-                    program_config=self.lm_head_l1_pc,
-                    compute_kernel_config=self.lm_head_l1_ckc,
-                )
+                if self.lm_head_l1_ring is not None:
+                    in0_spec, out_spec = self.lm_head_l1_ring
+                    xs = ttnn.to_memory_config(normed, in0_spec)
+                    ring_out = ttnn.linear(
+                        xs,
+                        self.lm_head_l1,
+                        program_config=self.lm_head_l1_pc,
+                        memory_config=out_spec,
+                        compute_kernel_config=self.lm_head_l1_ckc,
+                    )
+                    xs.deallocate(True)
+                    head = ttnn.sharded_to_interleaved(ring_out, ttnn.DRAM_MEMORY_CONFIG)
+                    ring_out.deallocate(True)
+                else:
+                    head = ttnn.linear(
+                        normed,
+                        self.lm_head_l1,
+                        program_config=self.lm_head_l1_pc,
+                        compute_kernel_config=self.lm_head_l1_ckc,
+                    )
                 tail = ttnn.linear(normed, self.lm_head)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     head = ccl_allgather(head, self.mesh_config, self.ccl_manager)

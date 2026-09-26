@@ -4073,3 +4073,135 @@ def test_sharded_l1_weights_in_model(mesh_device, reset_seeds):
     )
     n_sharded = sum(1 for mc in ts.values() if mc.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED)
     assert n_sharded >= 3, f"expected the matmul weights WIDTH_SHARDED in L1, got {ts}"
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_lm_head_gather(mesh_device, reset_seeds):
+    """Can the lm_head L1 slice use ``gather_in0`` the way ``down_proj`` does, and does it pay?
+
+    The down_proj ring needs a core count dividing both Kt and Nt. lm_head has Kt = 32, so a
+    ring over the slice's 110-core grid needs UNEVEN K shards (1 tile on 32 cores, 0 on 78);
+    the factory carries per-core ``unpadded_in0_shard_widths`` for that. The even alternative
+    is a 32-core ring, which caps the pinned slice at 32 x per_core_N tiles.
+
+    Arms, all HiFi2 + packer_l1_acc (the automatic path's compute config), each timed as the
+    slice alone and as the full head (slice + DRAM tail). Ring arms are timed with the
+    in0 reshard and the output ``sharded_to_interleaved`` inside, as down_proj's arm e+ was.
+    """
+    rig = _build_standalone(mesh_device, "dram")
+    a = rig["assistant"]
+    assert a.lm_head_l1 is None, "run with GEMMA4_LMHEAD_L1_COLS unset"
+    W = a.lm_head
+    k, vocab = int(W.shape[-2]), int(W.shape[-1])
+    T = 32
+    torch.manual_seed(0)
+    x = ttnn.from_torch(
+        torch.randn(1, 1, 1, k).bfloat16(), device=mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
+    x_host = ttnn.to_torch(x).reshape(-1).float()
+    hifi2 = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+    g = mesh_device.compute_with_storage_grid_size()
+
+    def grid(gx, gy):
+        return ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+
+    def wsh(crs, shape):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(crs, shape, ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+    def pc1d(gx, gy, blk, pcn, gather):
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=pcn,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=not gather,
+            gather_in0=gather,
+        )
+
+    def run_case(tag, cols, gx, gy, ring):
+        cores = gx * gy
+        nt = cols // T
+        assert nt % cores == 0, (tag, nt, cores)
+        pcn = nt // cores
+        crs = grid(gx, gy)
+        dram_slice = ttnn.slice(W, [0, 0, 0, 0], [1, 1, k, cols])
+        tail = ttnn.slice(W, [0, 0, 0, cols], [1, 1, k, vocab])
+        auto_out = ttnn.linear(x, dram_slice)  # automatic config = what the unsplit head computes
+        auto_t = ttnn.to_torch(auto_out).reshape(-1)[:cols]
+        auto_out.deallocate(True)
+        ref32 = x_host @ ttnn.to_torch(dram_slice).reshape(k, cols).float()
+        wl1 = ttnn.to_memory_config(dram_slice, wsh(crs, [k, cols // cores]))
+        dram_slice.deallocate(True)
+        if ring:
+            in0_w = -(-(k // T) // cores) * T  # ceil(Kt / cores) tiles
+            in0_spec, out_spec = wsh(crs, [T, in0_w]), wsh(crs, [T, cols // cores])
+            pc = pc1d(gx, gy, in0_w // T, pcn, True)
+
+            def slice_fn():
+                xs = ttnn.to_memory_config(x, in0_spec)
+                o = ttnn.linear(xs, wl1, program_config=pc, memory_config=out_spec, compute_kernel_config=hifi2)
+                xs.deallocate(True)
+                back = ttnn.sharded_to_interleaved(o, ttnn.DRAM_MEMORY_CONFIG)
+                o.deallocate(True)
+                return back
+
+        else:
+            pc = pc1d(gx, gy, 2, pcn, False)
+
+            def slice_fn():
+                return ttnn.linear(x, wl1, program_config=pc, compute_kernel_config=hifi2)
+
+        try:
+            out = slice_fn()
+        except Exception as ex:  # noqa: BLE001
+            logger.info(f"[lm-gather] {tag}: FAILED {str(ex)[:300]}")
+            wl1.deallocate(True)
+            tail.deallocate(True)
+            return
+        o_t = ttnn.to_torch(out).reshape(-1)[:cols]
+        out.deallocate(True)
+        me = float((o_t.float() - ref32).abs().mean())
+        exact = bool(torch.equal(o_t, auto_t))
+        mxd = float((o_t.float() - auto_t.float()).abs().max())
+        t_slice = _op_timed(mesh_device, slice_fn, protect=(x, wl1))
+        t_core = float("nan")
+        if ring:  # the ring alone: activation already K-sharded, output left sharded
+            xs0 = ttnn.to_memory_config(x, in0_spec)
+            t_core = _op_timed(
+                mesh_device,
+                lambda: ttnn.linear(xs0, wl1, program_config=pc, memory_config=out_spec, compute_kernel_config=hifi2),
+                protect=(xs0, wl1),
+            )
+            xs0.deallocate(True)
+        t_pair = _op_timed(mesh_device, lambda: _Pair(slice_fn(), ttnn.linear(x, tail)), protect=(x, wl1, tail))
+        t_tail = _op_timed(mesh_device, lambda: ttnn.linear(x, tail), protect=(x, tail))
+        logger.info(
+            f"[lm-gather] {tag:<22} cols={cols} grid={gx}x{gy} per_core_N={pcn} "
+            f"charge={k * T * pcn * 2} B/bank | slice {t_slice:7.2f} us (ring alone {t_core:7.2f}) | tail {t_tail:7.2f} us | "
+            f"slice+tail {t_pair:7.2f} us | mean|e| vs fp32 {me:.4e} | bit-exact vs automatic={exact} "
+            f"max|d|={mxd:.5f}"
+        )
+        wl1.deallocate(True)
+        tail.deallocate(True)
+
+    t_full = _op_timed(mesh_device, lambda: ttnn.linear(x, W), protect=(x, W))
+    logger.info(f"[lm-gather] full head (unsplit, automatic) {t_full:.2f} us")
+    for cols in (35200, 38720):
+        run_case(f"mcast {g.x}x{g.y}", cols, g.x, g.y, ring=False)
+        run_case(f"ring {g.x}x{g.y} (uneven K)", cols, g.x, g.y, ring=True)
+    run_case("mcast 8x4", 10240, 8, 4, ring=False)
+    run_case("ring 8x4 (even K)", 10240, 8, 4, ring=True)
