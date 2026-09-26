@@ -33,6 +33,9 @@ Constraints (first cut):
     a circular-buffer modulo (the assistant attention config doesn't carry one).
 """
 
+import os
+from typing import NamedTuple
+
 import torch
 from loguru import logger
 
@@ -48,6 +51,29 @@ from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.weight_placement import WeightPlacement, place_as_tensor
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
+
+
+class SplitLogits(NamedTuple):
+    """Dense drafter logits produced as column-ordered parts, not one row.
+
+    ``parts``: tuple of [1,1,rows,Ni] TILE tensors whose widths sum to the vocab,
+    in vocab-column order. Produced when ``GEMMA4_LMHEAD_L1_COLS`` pins a leading
+    slice of ``lm_head`` into L1 and leaves the rest in DRAM, so the step runs two
+    matmuls instead of one.
+
+    Consumers dispatch on this type exactly as they do on ``CmeLogits``
+    (``spec_decode._logits_to_host`` / ``_argmax_last``), so the drafter-logits
+    call sites stay untouched.
+
+    **Combine by concatenating ROW_MAJOR, then one argmax** -- not argmax-per-part.
+    Picking between per-part argmaxes needs each part's max VALUE, and ttnn.max
+    measured 68.02 us at N=4096 (PERFORMANCE_TRAJECTORY §2.10), slower than the
+    argmax itself; two of those would eat the saving. Untilizing each part drops
+    the physical 32-row pad, so the concat moves one real row (512 KiB at the full
+    vocab) -- see gemma4-12b/MEASUREMENT_RECORD.md §5.3.
+    """
+
+    parts: tuple
 
 
 def _inject_zero_kv_weights(state_dict, text_args):
@@ -205,6 +231,8 @@ class Gemma4AssistantModel:
         # [H, V] lm_head — building both would waste 134 MB of DRAM.
         self.masked_embedding = None
         self.lm_head = None
+        self.lm_head_l1 = None
+        self.lm_head_l1_pc = None
         if self.use_cme:
             self.masked_embedding = Gemma4TTMaskedEmbedder(
                 mesh_device=mesh_device,
@@ -223,6 +251,7 @@ class Gemma4AssistantModel:
             self.lm_head = _linear(lm_key, col_mapper)
             if self.lm_head is None:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
+            self.lm_head_l1, self.lm_head_l1_pc = self._split_lm_head_to_l1(mesh_device)
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
 
@@ -244,6 +273,80 @@ class Gemma4AssistantModel:
         if len(emb.shape) == 3:
             emb = ttnn.unsqueeze_to_4D(emb)
         return ttnn.to_layout(emb, ttnn.TILE_LAYOUT)
+
+    def _split_lm_head_to_l1(self, mesh_device):
+        """Pin a leading slice of ``lm_head`` into L1, leaving the rest in DRAM.
+
+        ``GEMMA4_LMHEAD_L1_COLS`` = how many vocab columns to pin (0 = off, the
+        default, which keeps the single-matmul path byte-for-byte as before).
+
+        The head is the drafter's largest single op -- ``[1024, 262144]``, 512 MiB,
+        1.411 ms, 47.6% of the step (MEASUREMENT_RECORD.md §7.0) -- but it cannot be
+        pinned whole: at ``per_core_N = 75`` on 110 cores it charges 4800 KiB/bank
+        against ~772 KiB available (§5.1.1, §5.2.1). Pinning a COLUMN SLICE is the
+        one way to put any of it in L1, because width sharding splits exactly that
+        axis (§5.4).
+
+        Two things here are deliberate and cannot be borrowed from the existing
+        helpers:
+
+        * **The 110-core grid.** ``weight_placement._pick_grid`` and the matmul
+          tuner both cap at 8x8 = 64 cores. ``Nt1`` must divide by the core count to
+          keep ``per_core_N`` small, and the per-bank charge is
+          ``K x 32 x per_core_N x elem`` -- at 64 cores the smallest legal slice
+          already overflows. 11x10 = 110 is the device's full compute grid and the
+          same one ttnn's automatic config picks for the unsplit head.
+        * **An explicit program config.** The matmul validator requires
+          ``per_core_N == in1_shard_width_tiles``; the tuner cannot emit a >64-core
+          config, so the config is built here to match the shard exactly.
+        """
+        cols = int(os.getenv("GEMMA4_LMHEAD_L1_COLS", "0"))
+        if cols <= 0:
+            return None, None
+        T = 32
+        grid = mesh_device.compute_with_storage_grid_size()
+        cores = grid.x * grid.y
+        k = int(self.lm_head.shape[-2])
+        vocab = int(self.lm_head.shape[-1])
+        nt = cols // T
+        if cols % T or nt % cores or cols >= vocab:
+            raise ValueError(
+                f"GEMMA4_LMHEAD_L1_COLS={cols}: must be a multiple of {T}, leave a DRAM "
+                f"remainder (<{vocab}), and have Nt={nt} divisible by the {cores}-core grid"
+            )
+        per_core_n = nt // cores
+        charge = k * T * per_core_n * self.lm_head.element_size()
+        logger.info(
+            f"[lm_head-split] pinning {cols}/{vocab} cols ({cols/vocab*100:.1f}%) on "
+            f"{grid.x}x{grid.y}={cores} cores, per_core_N={per_core_n}, "
+            f"charge={charge} B/bank ({charge/1024:.0f} KiB)"
+        )
+        head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])
+        tail = ttnn.slice(self.lm_head, [0, 0, 0, cols], [1, 1, k, vocab])
+        self.lm_head.deallocate(True)
+        self.lm_head = tail  # the DRAM remainder keeps the original attribute
+        shard = ttnn.ShardSpec(
+            ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))}),
+            [k, cols // cores],
+            ttnn.ShardOrientation.ROW_MAJOR,
+        )
+        pinned = ttnn.to_memory_config(
+            head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
+        )
+        head.deallocate(True)
+        blk = max(d for d in range(1, min(k // T, 8) + 1) if (k // T) % d == 0)
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=per_core_n,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+        return pinned, pc
 
     def step(self, token_tt, target_hidden, shared_kv, page_tables, pos_uint32, pos_int32, return_logits=True):
         """One drafter step.
@@ -302,6 +405,15 @@ class Gemma4AssistantModel:
             if self.use_cme:
                 # Replicated weights, ~4096-wide output: no all-gather needed.
                 logits = self.masked_embedding.forward(normed)
+            elif self.lm_head_l1 is not None:
+                # Split head: the pinned L1 columns and the DRAM remainder, in vocab
+                # order. Kept as parts rather than concatenated here -- see SplitLogits.
+                head = ttnn.linear(normed, self.lm_head_l1, program_config=self.lm_head_l1_pc)
+                tail = ttnn.linear(normed, self.lm_head)
+                if self.mesh_config is not None and self.mesh_config.tp > 1:
+                    head = ccl_allgather(head, self.mesh_config, self.ccl_manager)
+                    tail = ccl_allgather(tail, self.mesh_config, self.ccl_manager)
+                logits = SplitLogits(parts=(head, tail))
             else:
                 logits = ttnn.linear(normed, self.lm_head)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:

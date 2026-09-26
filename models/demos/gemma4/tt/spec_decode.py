@@ -33,6 +33,7 @@ import torch
 import ttnn
 from models.demos.gemma4.tt import pli_env
 from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
+from models.demos.gemma4.tt.assistant.model import SplitLogits
 
 _FUSED_DBG = os.environ.get("GEMMA4_SPEC_FUSED_DEBUG") == "1"
 
@@ -519,6 +520,11 @@ class SpeculativeDecoder:
         # working on a plain [.., vocab] tensor. Cheap: one 262144-wide fill per row.
         if isinstance(logits, CmeLogits):
             return self.assistant.masked_embedding.to_host_full_vocab(logits, self._read_replica)
+        if isinstance(logits, SplitLogits):
+            # Column-ordered parts; concatenate on HOST. This is off the decode
+            # critical path (tests, sampling, acceptance checks), so the cheap
+            # device-side concat that _argmax_last does is not needed here.
+            return torch.cat([self._read_replica(p) for p in logits.parts], dim=-1)[..., : self.target.vocab_size]
         t = self._read_replica(logits)
         return t[..., : self.target.vocab_size]
 
@@ -1029,6 +1035,24 @@ class SpeculativeDecoder:
         """
         if isinstance(logits, CmeLogits):
             return self.assistant.masked_embedding.argmax_token_id(logits, rows)
+        if isinstance(logits, SplitLogits):
+            # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
+            # drops the physical 32-row pad, so the concat moves one real row rather
+            # than 32 (the tax §2.10 removed). Concatenating in vocab-column order
+            # makes the returned index already a vocab id -- no offset arithmetic.
+            # The alternative, argmax per part and pick the larger, needs each
+            # part's max VALUE, and ttnn.max is slower than argmax itself (§2.10).
+            rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
+            joined = ttnn.concat(rm, dim=-1)
+            for t in rm:
+                t.deallocate(True)
+            idx = ttnn.argmax(joined, dim=-1, keepdim=False)
+            joined.deallocate(True)
+            if rows < 32:
+                sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
+                idx.deallocate(True)
+                idx = sliced
+            return idx
         R32 = 32
         if rows > R32:
             # Batched packed verify (B*P > 32): argmax each 32-row tile separately

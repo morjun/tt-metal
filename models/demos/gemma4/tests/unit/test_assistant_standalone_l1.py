@@ -55,8 +55,13 @@ from loguru import logger
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
-from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, Gemma4TTMaskedEmbedder, _same_buffer
-from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
+from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
+from models.demos.gemma4.tt.assistant.model import (
+    Gemma4AssistantModel,
+    Gemma4TTMaskedEmbedder,
+    SplitLogits,
+    _same_buffer,
+)
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
 from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather, ccl_allreduce
@@ -377,6 +382,19 @@ def _argmax_token(assistant, logits, rows=1):
     """
     if isinstance(logits, CmeLogits):
         return assistant.masked_embedding.argmax_token_id(logits, rows)
+    if isinstance(logits, SplitLogits):
+        # Mirrors spec_decode._argmax_last's SplitLogits branch (see the rationale there).
+        rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
+        joined = ttnn.concat(rm, dim=-1)
+        for t in rm:
+            t.deallocate(True)
+        idx = ttnn.argmax(joined, dim=-1, keepdim=False)
+        joined.deallocate(True)
+        if rows < 32:
+            sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
+            idx.deallocate(True)
+            idx = sliced
+        return idx
     R32 = 32
     # Mirrors spec_decode._argmax_last's rows==1 fast path (see the rationale there).
     if rows == 1:
