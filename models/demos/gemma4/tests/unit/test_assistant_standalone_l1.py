@@ -3530,11 +3530,26 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     moved = _relocate(_weight_slots(rig["assistant"]), mesh_device, to_l1=True, only=_only)
     assert moved == _expected, f"expected {_expected} down_proj weights, moved {moved} (only={_only})"
     body = _make_fused_k_body(rig, k)
+    # GEMMA4_GATHER_LAYERS restricts the ring to the named down_proj layers, e.g. "0". It
+    # exists for the DRAM+ring arm: GEMMA4_GATHER_DRAM_WEIGHT otherwise rings every DRAM
+    # weight with a gather config (8/step, §6.5), so its us are not matched against the L1
+    # arms, which ring only the relocated layer. With it set, every arm rings the same 3
+    # matmuls per K=3 trace. Matched by object identity with the slot's (post-relocation)
+    # tensor; the ring-count assertion below fails if that ever stops holding.
+    _gather_spec = (os.environ.get("GEMMA4_GATHER_LAYERS") or "").strip()
+    _gather_only = None
+    if _gather_spec:
+        _glabels = {f"L{int(i)}.down_proj" for i in _gather_spec.split(",")}
+        _gather_only = [getattr(o, a) for o, a, lbl in _weight_slots(rig["assistant"]) if lbl in _glabels]
+        assert len(_gather_only) == len(_glabels), f"GEMMA4_GATHER_LAYERS={_gather_spec} matched {len(_gather_only)}"
+    manifest["gather_layers"] = _gather_spec or "all"
     observed_plans = []
     original_plan = rig["assistant"].mm._gather_plan
 
     def observe_plan(x, w):
         plan = original_plan(x, w)
+        if _gather_only is not None and not any(w is t for t in _gather_only):
+            plan = None
         observed_plans.append(
             {
                 "x_shape": list(x.shape),
@@ -3585,7 +3600,10 @@ def test_gather_matched_trace(mesh_device, reset_seeds):
     try:
         observed_ring = sum(p["ring"] for p in observed_plans)
         manifest["observed_ring"] = observed_ring
-        if _env_on("GEMMA4_GATHER_DRAM_WEIGHT") or _env_on("GEMMA4_GATHER_ANY_WEIGHT"):
+        if _gather_only is not None:
+            expected_ring = len(_gather_only) * k if manifest["arm"] == "ring" else 0
+            assert observed_ring == expected_ring, "unexpected ring engagement (GEMMA4_GATHER_LAYERS)"
+        elif _env_on("GEMMA4_GATHER_DRAM_WEIGHT") or _env_on("GEMMA4_GATHER_ANY_WEIGHT"):
             # With a DRAM weight the ring is no longer tied to the RELOCATED layers -- it fires
             # on every shape with a valid gather config (down_proj x4 + o_proj full + o_proj
             # sliding x3 = 8/step here), so the per-layer formula does not apply. Assert only
