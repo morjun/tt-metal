@@ -23,31 +23,31 @@ import sys
 import time
 
 ARMS = {
-    "dram": dict(GEMMA4_L1_RELOC_LAYERS="none", GEMMA4_GATHER_IN0="0"),
+    "dram_mcast": dict(GEMMA4_L1_RELOC_LAYERS="none", GEMMA4_GATHER_IN0="0"),
     "dram_ring": dict(
         GEMMA4_L1_RELOC_LAYERS="none",
         GEMMA4_GATHER_IN0="1",
         GEMMA4_GATHER_DRAM_WEIGHT="1",
         GEMMA4_GATHER_LAYERS="0",
     ),
-    "il": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="interleaved", GEMMA4_GATHER_IN0="0"),
+    "il_mcast": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="interleaved", GEMMA4_GATHER_IN0="0"),
     "il_ring": dict(
         GEMMA4_L1_RELOC_LAYERS="0",
         GEMMA4_L1_PLACEMENT="interleaved",
         GEMMA4_GATHER_IN0="1",
         GEMMA4_GATHER_L1_INTERLEAVED="1",
     ),
-    "mcast": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="sharded", GEMMA4_GATHER_IN0="0"),
-    "ring": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="sharded", GEMMA4_GATHER_IN0="1"),
+    "shard_mcast": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="sharded", GEMMA4_GATHER_IN0="0"),
+    "shard_ring": dict(GEMMA4_L1_RELOC_LAYERS="0", GEMMA4_L1_PLACEMENT="sharded", GEMMA4_GATHER_IN0="1"),
 }
 # (alloc_per_bank, ring plans per K=3 trace) each arm must show, or the cell is mislabelled.
 EXPECT = {
-    "dram": (0, 0),
+    "dram_mcast": (0, 0),
     "dram_ring": (0, 3),
-    "il": (153600, 0),
+    "il_mcast": (153600, 0),
     "il_ring": (153600, 3),
-    "mcast": (524288, 0),
-    "ring": (524288, 3),
+    "shard_mcast": (524288, 0),
+    "shard_ring": (524288, 3),
 }
 TEST = "models/demos/gemma4/tests/unit/test_assistant_standalone_l1.py::test_gather_matched_trace"
 

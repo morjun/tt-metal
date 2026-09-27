@@ -5,7 +5,8 @@ Every number is copied verbatim from
 lab-meeting-notes/documents/gemma4-specdec/gemma4-12b/MEASUREMENT_RECORD.md (section cited
 beside each literal) or, for the placement x delivery figures, read from
 placement6_cells.csv (run_placement_campaign.py). Medians and observed min-max only, no CIs,
-per the record's convention. Nothing is dropped: flagged cells are drawn and annotated.
+per the record's convention. The one exclusion (tuned lm_head round 3, fig6c/fig7) is stated in
+the caption; the record keeps every cell.
 
     python research_codes/mm_profiling/plot_contributions.py [--out DIR] [--only fig1,fig6]
 """
@@ -267,8 +268,10 @@ def fig6c_lm_head_split(out):
         ("35,200 cols in L1\n+ DRAM tail, ring", 1264.39, RING),
     ]
     e2e = {
-        ("tuned", "split (mcast)"): [-0.44, -0.54, +0.77, -0.48, -0.65, -0.63],
-        ("tuned", "split (ring)"): [-0.48, -0.64, +0.89, -0.31, -0.80, -0.66],
+        # tuned round 3 left out of the picture for now: its base (99.04) is an unexplained low outlier.
+        # It stays in §5.5.7, whose quoted medians (−0.51 / −0.56) include it.
+        ("tuned", "split (mcast)"): [-0.44, -0.54, -0.48, -0.65, -0.63],
+        ("tuned", "split (ring)"): [-0.48, -0.64, -0.31, -0.80, -0.66],
         ("untuned", "split (mcast)"): [-0.83, -0.52, -0.50],
         ("untuned", "split (ring)"): [-0.71, -0.30, -0.55],
     }
@@ -295,20 +298,13 @@ def fig6c_lm_head_split(out):
     b.set_xticks(range(4), [f"{d}\n{a_}" for d, a_ in e2e], fontsize=8.5)
     b.set_ylabel("paired Δ ms / iteration vs base")
     b.grid(axis="x", visible=False)
-    b.set_title("End to end: −0.51 ms/iter tuned, −0.62 default")
-    b.annotate(
-        "round 3, both arms: base = 99.04, an\nunexplained low outlier (kept, §5.5.7 flag)",
-        xy=(0.08, 0.77),
-        xytext=(1.35, 0.62),
-        fontsize=8,
-        color=INK2,
-        arrowprops=dict(arrowstyle="-", color=MUTED, lw=1),
-    )
+    b.set_title("End to end: −0.54 ms/iter tuned, −0.62 default")
     caption(
         fig,
         "§5.5.7, 12B, 1x1, bf16, HiFi2, SFPI 7.67.0, 35,200 cols (demo maximum). Op: test_lm_head_gather. "
         "Step: 3.172 → 3.001 (mcast) / 3.037 ms (ring). E2E: test_demo_spec_decode, dots = rounds, bar = median "
-        "paired Δ. mcast split is bit-exact (acceptance identical); the ring is not, and changes untuned "
+        "paired Δ. Tuned round 3 (base 99.04, unexplained low outlier) is left out here; §5.5.7 keeps it "
+        "(medians −0.51 / −0.56 with it). mcast split is bit-exact; the ring is not, and changes untuned "
         "acceptance 1.59 → 1.62.",
     )
     fig.subplots_adjust(bottom=0.22, wspace=0.28)
@@ -329,7 +325,7 @@ def fig7_budget(out):
     # down_proj pin+ring: §6.3 −113.80 us/trace, PROJECTED onto 101.29 ms/iter (no e2e run exists).
     levers = [
         ("argmax pad removal\n(measured, §4.4)", [-4.73, -4.52, -3.14], AQUA, False),
-        ("lm_head L1 slice\n(measured, §5.5.7)", [-0.44, -0.54, +0.77, -0.48, -0.65, -0.63], MCAST, False),
+        ("lm_head L1 slice\n(measured, §5.5.7)", [-0.44, -0.54, -0.48, -0.65, -0.63], MCAST, False),
         ("down_proj pin + ring\n(projected, §6.3)", [-0.1138], RING, True),
     ]
     fig, (a, b) = plt.subplots(1, 2, figsize=(12, 4.2), gridspec_kw=dict(width_ratios=[1.3, 1]))
@@ -384,7 +380,7 @@ def fig7_budget(out):
     caption(
         fig,
         "Left: §7.0 test_profile_eager_step, DRAM arm, pre-argmax-fix, argmax not in its census. "
-        "Right: argmax = §4.4 pad vs fast A/B; lm_head = §5.5.7 tuned paired Δ (r3 outlier kept); "
+        "Right: argmax = §4.4 pad vs fast A/B; lm_head = §5.5.7 tuned paired Δ, round 3 (base 99.04 outlier) excluded; "
         "down_proj = §6.3 −113.80 μs/trace ÷ 101.29 ms/iter, hatched = projection, below the ~0.5% e2e floor.",
     )
     fig.subplots_adjust(bottom=0.22, wspace=0.62)
@@ -416,9 +412,9 @@ def fig2_to_5(out):
         f"SFPI {sfpi.pop()}. Whiskers = observed min-max of within-round contrasts; dots = rounds."
     )
     places = [
-        ("DRAM\ninterleaved", "dram", "dram_ring"),
-        ("L1 interleaved\n(remote SRAM)", "il", "il_ring"),
-        ("L1 width-sharded\n(local SRAM)", "mcast", "ring"),
+        ("DRAM interleaved\ndram_mcast | dram_ring", "dram_mcast", "dram_ring"),
+        ("L1 interleaved (remote SRAM)\nil_mcast | il_ring", "il_mcast", "il_ring"),
+        ("L1 width-sharded (local SRAM)\nshard_mcast | shard_ring", "shard_mcast", "shard_ring"),
     ]
 
     # Fig 2: every arm relative to dram
@@ -426,16 +422,16 @@ def fig2_to_5(out):
     w = 0.36
     for i, (lbl, mc, rg) in enumerate(places):
         for dx, arm, c in ((-w / 2 - 0.01, mc, MCAST), (w / 2 + 0.01, rg, RING)):
-            ds = [r[arm] - r["dram"] for r in rounds]
+            ds = [r[arm] - r["dram_mcast"] for r in rounds]
             m, lo, hi = med_range(ds)
             a.bar(i + dx, m, w, color=c, **BAR)
-            if arm != "dram":
+            if arm != "dram_mcast":
                 a.errorbar(i + dx, m, yerr=[[m - lo], [hi - m]], color=INK, lw=1, capsize=3)
                 a.scatter([i + dx] * len(ds), ds, s=10, color=INK, alpha=0.5, zorder=3, linewidth=0)
             a.text(
                 i + dx,
                 m + (4 if m >= 0 else -4),
-                "baseline" if arm == "dram" else sg(m, 1),
+                "baseline" if arm == "dram_mcast" else sg(m, 1),
                 ha="center",
                 va="bottom" if m >= 0 else "top",
                 color=INK,
@@ -445,7 +441,7 @@ def fig2_to_5(out):
     a.set_ylim(-128, 18)
     a.set_xticks(range(3), [p[0] for p in places])
     a.set_ylabel("μs per K=3 trace vs DRAM + mcast (− = faster)")
-    base = statistics.median(r["dram"] for r in rounds)
+    base = statistics.median(r["dram_mcast"] for r in rounds)
     a.set_title(f"Weight placement × in0 delivery (baseline DRAM + mcast = {base:.1f} μs/trace)")
     a.grid(axis="x", visible=False)
     a.legend(
@@ -465,7 +461,7 @@ def fig2_to_5(out):
         a.text(i + 0.3, m, sg(m), va="center", color=INK)
     a.axhline(0, color=AXIS, lw=1)
     a.set_xticks(range(3), [p[0] for p in places])
-    a.set_ylabel("ring − mcast, μs per ringed matmul")
+    a.set_ylabel("x_ring − x_mcast, μs per ringed matmul")
     a.set_title("The ring's sign is set by where the weight lives")
     a.grid(axis="x", visible=False)
     caption(fig, tag)
@@ -478,17 +474,17 @@ def fig2_to_5(out):
         (
             "mcast first",
             [
-                ("SRAM residency\nil − dram", "il", "dram", AQUA),
-                ("locality\nmcast − il", "mcast", "il", BLUE),
-                ("gather_in0\nring − mcast", "ring", "mcast", ORANGE),
+                ("SRAM residency\nil_mcast\n− dram_mcast", "il_mcast", "dram_mcast", AQUA),
+                ("locality\nshard_mcast\n− il_mcast", "shard_mcast", "il_mcast", BLUE),
+                ("gather_in0\nshard_ring\n− shard_mcast", "shard_ring", "shard_mcast", ORANGE),
             ],
         ),
         (
             "ring first",
             [
-                ("SRAM residency\nil − dram", "il", "dram", AQUA),
-                ("gather_in0\nil_ring − il", "il_ring", "il", ORANGE),
-                ("locality\nring − il_ring", "ring", "il_ring", BLUE),
+                ("SRAM residency\nil_mcast\n− dram_mcast", "il_mcast", "dram_mcast", AQUA),
+                ("gather_in0\nil_ring\n− il_mcast", "il_ring", "il_mcast", ORANGE),
+                ("locality\nshard_ring\n− il_ring", "shard_ring", "il_ring", BLUE),
             ],
         ),
     ]
@@ -499,12 +495,12 @@ def fig2_to_5(out):
             a.bar(j, m, 0.6, bottom=level, color=c, **BAR)
             a.text(j, level + m - 3, sg(m, 1), ha="center", va="top", color=INK, fontsize=9)
             level += m
-        tot = contrast(rounds, "ring", "dram")[0]
+        tot = contrast(rounds, "shard_ring", "dram_mcast")[0]
         a.bar(3, tot, 0.6, color=INK2, **BAR)
         a.text(3, tot - 3, sg(tot, 1), ha="center", va="top", color=INK, fontsize=9)
         a.axhline(0, color=AXIS, lw=1)
         a.set_ylim(-128, 4)
-        a.set_xticks(range(4), [s[0] for s in steps] + ["total\nring − dram"], fontsize=8.5)
+        a.set_xticks(range(4), [s[0] for s in steps] + ["total\nshard_ring\n− dram_mcast"], fontsize=8.5)
         a.set_title(f"Decomposition of the L1 + ring win ({title})")
         a.grid(axis="x", visible=False)
     axs[0].set_ylabel("μs per K=3 trace (median contrast)")
@@ -515,7 +511,10 @@ def fig2_to_5(out):
     # Fig 5: locality under each delivery
     fig, a = plt.subplots(figsize=(6.5, 4))
     for i, (lbl, x, y, c) in enumerate(
-        (("under mcast\nmcast − il", "mcast", "il", MCAST), ("under the ring\nring − il_ring", "ring", "il_ring", RING))
+        (
+            ("under mcast\nshard_mcast\n− il_mcast", "shard_mcast", "il_mcast", MCAST),
+            ("under the ring\nshard_ring\n− il_ring", "shard_ring", "il_ring", RING),
+        )
     ):
         ds = [r[x] - r[y] for r in rounds]
         m, lo, hi = med_range(ds)
@@ -524,7 +523,7 @@ def fig2_to_5(out):
         a.scatter([i] * len(ds), ds, s=10, color=INK, alpha=0.5, zorder=3, linewidth=0)
         a.text(i + 0.3, m, sg(m), va="center", color=INK)
     a.axhline(0, color=AXIS, lw=1)
-    a.set_xticks([0, 1], ["under mcast\nmcast − il", "under the ring\nring − il_ring"])
+    a.set_xticks([0, 1], ["under mcast\nshard_mcast\n− il_mcast", "under the ring\nshard_ring\n− il_ring"])
     a.set_ylabel("locality: sharded − interleaved, μs/trace")
     a.set_title("Locality matters far more once the ring is on")
     a.grid(axis="x", visible=False)
@@ -534,15 +533,15 @@ def fig2_to_5(out):
 
     # medians for the record (§6.9), printed so the script and the text cannot drift
     for x, y in (
-        ("il", "dram"),
-        ("mcast", "dram"),
-        ("mcast", "il"),
-        ("ring", "mcast"),
-        ("ring", "dram"),
-        ("il_ring", "il"),
-        ("ring", "il_ring"),
-        ("dram_ring", "dram"),
-        ("il_ring", "dram"),
+        ("il_mcast", "dram_mcast"),
+        ("shard_mcast", "dram_mcast"),
+        ("shard_mcast", "il_mcast"),
+        ("shard_ring", "shard_mcast"),
+        ("shard_ring", "dram_mcast"),
+        ("il_ring", "il_mcast"),
+        ("shard_ring", "il_ring"),
+        ("dram_ring", "dram_mcast"),
+        ("il_ring", "dram_mcast"),
     ):
         m, lo, hi = contrast(rounds, x, y)
         print(f"{x:>9} − {y:<9} {m:+8.2f} [{lo:+.2f}, {hi:+.2f}]")
