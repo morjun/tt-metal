@@ -4294,3 +4294,95 @@ def test_lm_head_gather_rounding(mesh_device, reset_seeds):
                 f"differing cores {differ if len(differ) <= 40 else str(differ[:40]) + '...'}"
             )
         wl1.deallocate(True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_down_proj_gather_blocks(mesh_device, reset_seeds):
+    """12B down_proj shape (K=8192, N=1024, 8x4 = 32 cores, per_core_N=1), weight pinned in L1.
+
+    Handshake counts: mcast issues Kt / in0_block_w sender->all handshakes (the tuner's
+    default blk=8 gives 32); the ring issues ring_size = 32 steps of 8 K-tiles each. Times the
+    mcast path at several block widths against the ring, with the activation interleaved in
+    DRAM and in L1, all HiFi2 + packer_l1_acc. Random data: this is a timing probe.
+    """
+    k, n, gx, gy, T = 8192, 1024, 8, 4, 32
+    cores = gx * gy
+    crs = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+    hifi2 = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+
+    def wsh(shape):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(crs, shape, ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+    def pc1d(blk, gather):
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=n // T // cores,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=not gather,
+            gather_in0=gather,
+        )
+
+    torch.manual_seed(0)
+    w = ttnn.from_torch(
+        torch.randn(1, 1, k, n).bfloat16() * 0.02,
+        device=mesh_device,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=wsh([k, n // cores]),
+    )
+    xh = torch.randn(1, 1, 1, k).bfloat16()
+    x_dram = ttnn.from_torch(xh, device=mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    x_l1 = ttnn.to_memory_config(x_dram, ttnn.L1_MEMORY_CONFIG)
+    kt = k // T
+    for xname, x in (("DRAM", x_dram), ("L1", x_l1)):
+        for blk in (1, 2, 4, 8, 16, 32):
+            pc = pc1d(blk, False)
+            try:
+                t = _op_timed(
+                    mesh_device,
+                    lambda: ttnn.linear(x, w, program_config=pc, compute_kernel_config=hifi2),
+                    protect=(x, w),
+                )
+                logger.info(
+                    f"[dp-blk] mcast in0 {xname:<4} in0_block_w={blk:>2} handshakes={kt // blk:>3}: {t:7.2f} us"
+                )
+            except Exception as ex:  # noqa: BLE001
+                logger.info(f"[dp-blk] mcast in0 {xname:<4} in0_block_w={blk:>2}: FAILED {str(ex)[:120]}")
+    in0_spec, out_spec = wsh([T, k // cores]), wsh([T, n // cores])
+    pcr = pc1d(kt // cores, True)
+    xs0 = ttnn.to_memory_config(x_l1, in0_spec)
+    t_ring = _op_timed(
+        mesh_device,
+        lambda: ttnn.linear(xs0, w, program_config=pcr, memory_config=out_spec, compute_kernel_config=hifi2),
+        protect=(xs0, w),
+    )
+    for xname, x in (("DRAM", x_dram), ("L1", x_l1)):
+
+        def full():
+            xs = ttnn.to_memory_config(x, in0_spec)
+            o = ttnn.linear(xs, w, program_config=pcr, memory_config=out_spec, compute_kernel_config=hifi2)
+            xs.deallocate(True)
+            b = ttnn.sharded_to_interleaved(o, ttnn.DRAM_MEMORY_CONFIG)
+            o.deallocate(True)
+            return b
+
+        t_full = _op_timed(mesh_device, full, protect=(x, w))
+        logger.info(
+            f"[dp-blk] ring in0 {xname:<4} steps={cores} blk={kt // cores}: ring alone {t_ring:7.2f} us, "
+            f"with reshard + sharded_to_interleaved {t_full:7.2f} us"
+        )
