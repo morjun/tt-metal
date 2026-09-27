@@ -4205,3 +4205,92 @@ def test_lm_head_gather(mesh_device, reset_seeds):
         run_case(f"ring {g.x}x{g.y} (uneven K)", cols, g.x, g.y, ring=True)
     run_case("mcast 8x4", 10240, 8, 4, ring=False)
     run_case("ring 8x4 (even K)", 10240, 8, 4, ring=True)
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_lm_head_gather_rounding(mesh_device, reset_seeds):
+    """Where the ring's result differs from mcast, per core (L1_WEIGHT_PINNING.md §12.7).
+
+    The gathered compute kernel walks K-shards from each core's own ring index
+    (``curr_ring_idx = (ring_idx + block) % ring_size``). With Kt = 32 on a 110-core ring
+    only shards 0..31 hold data, so cores 0 and 32..109 still accumulate K in natural
+    order 0..31, while cores 1..31 start mid-K. If block grouping and order are the whole
+    story, the ring equals mcast at ``in0_block_w = 1`` bit-for-bit on those cores and
+    differs only on 1..31. Per-core = one ``cols / cores`` column group (row-major shards).
+    """
+    rig = _build_standalone(mesh_device, "dram")
+    W = rig["assistant"].lm_head
+    k, T = int(W.shape[-2]), 32
+    torch.manual_seed(0)
+    x = ttnn.from_torch(
+        torch.randn(1, 1, 1, k).bfloat16(), device=mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
+    hifi2 = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+
+    def wsh(crs, shape):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(crs, shape, ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+    def pc1d(gx, gy, blk, pcn, gather):
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            in0_block_w=blk,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=pcn,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=not gather,
+            gather_in0=gather,
+        )
+
+    for cols, gx, gy in ((35200, 11, 10), (10240, 8, 4)):
+        cores = gx * gy
+        pcn = cols // T // cores
+        crs = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+        dram_slice = ttnn.slice(W, [0, 0, 0, 0], [1, 1, k, cols])
+        wl1 = ttnn.to_memory_config(dram_slice, wsh(crs, [k, cols // cores]))
+        dram_slice.deallocate(True)
+
+        def mcast(blk):
+            o = ttnn.linear(x, wl1, program_config=pc1d(gx, gy, blk, pcn, False), compute_kernel_config=hifi2)
+            t = ttnn.to_torch(o).reshape(-1)[:cols]
+            o.deallocate(True)
+            return t
+
+        in0_w = -(-(k // T) // cores) * T
+        xs = ttnn.to_memory_config(x, wsh(crs, [T, in0_w]))
+        o = ttnn.linear(
+            xs,
+            wl1,
+            program_config=pc1d(gx, gy, in0_w // T, pcn, True),
+            memory_config=wsh(crs, [T, cols // cores]),
+            compute_kernel_config=hifi2,
+        )
+        ring = ttnn.to_torch(ttnn.sharded_to_interleaved(o, ttnn.DRAM_MEMORY_CONFIG)).reshape(-1)[:cols]
+        o.deallocate(True)
+        xs.deallocate(True)
+        m1, m2 = mcast(1), mcast(2)
+        w = cols // cores
+        for name, a, b in (
+            ("ring vs mcast blk1", ring, m1),
+            ("ring vs mcast blk2", ring, m2),
+            ("mcast blk1 vs blk2", m1, m2),
+        ):
+            exact = [bool(torch.equal(a[i * w : (i + 1) * w], b[i * w : (i + 1) * w])) for i in range(cores)]
+            differ = [i for i, e in enumerate(exact) if not e]
+            logger.info(
+                f"[lm-round] {gx}x{gy} {name:<19}: bit-exact on {sum(exact)}/{cores} cores; "
+                f"differing cores {differ if len(differ) <= 40 else str(differ[:40]) + '...'}"
+            )
+        wl1.deallocate(True)

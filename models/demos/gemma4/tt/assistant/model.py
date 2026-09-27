@@ -339,7 +339,8 @@ class Gemma4AssistantModel:
         # (in0_block_w=2, HiFi2, packer_l1_acc, no fp32 dest) reproduces the automatic path
         # BIT-FOR-BIT on the same slice (test_lm_head_split asserts it), so the pinned
         # columns compute exactly what the unsplit head did and the split changes placement
-        # and nothing else. Note with packer_l1_acc more K-blocks is MORE precise, not less.
+        # and nothing else. in0_block_w matters because it decides which K-sums the FPU adds in dest
+        # and which the packer adds into a bf16 L1 partial (tt-metal-concepts.md §1.10).
         kt = k // T
         blk = 2 if kt % 2 == 0 else 1
         pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
