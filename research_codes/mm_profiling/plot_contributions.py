@@ -97,141 +97,147 @@ def med_range(xs):
     return statistics.median(xs), min(xs), max(xs)
 
 
-# --------------------------------------------------------------------------- Fig 1
-def fig1_argmax(out):
-    # record §4.4: drafter step at ctx 512, and the end-to-end A/B (3 counterbalanced rounds)
-    parts = [("4 decoder layers", 1.644, 1.644, BLUE), ("lm_head matmul", 1.411, 1.411, ORANGE)]
-    parts.append(("argmax (token pick)", 1.586, 0.102, AQUA))
-    fast, pad = [101.21, 101.29, 101.32], [105.94, 105.81, 104.46]
-    totals = {1: 4.642, 2: 3.157}  # measured totals; the rounded parts sum 1 us off
+DRAFT = (
+    "A 3-step draft is the drafter proposing 3 tokens; it runs once per decoding iteration, before the "
+    "target model verifies them."
+)
 
-    fig, (a, b) = plt.subplots(1, 2, figsize=(13, 4.6), gridspec_kw=dict(width_ratios=[2.1, 1]))
-    rows = ["After\n(unpadded)", "Before\n(padded to 32 rows)"]
-    for i, idx in enumerate((2, 1)):
+
+def gain_panel(ax, groups, title, base_ms):
+    """End-to-end gain: paired per-round deltas (dots) and their median (bar), in ms per iteration."""
+    for x, lbl, ds, c in groups:
+        m = statistics.median(ds)
+        ax.bar(x, m, 0.5, color=c, alpha=0.25, **BAR)
+        ax.scatter([x] * len(ds), ds, s=60, color=c, edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.hlines(m, x - 0.25, x + 0.25, color=INK, lw=2.5, zorder=4)
+        pct = 100 * m / base_ms
+        ax.text(x + 0.3, m, f"{sg(m)} ms\n({sg(pct, 2 if abs(pct) < 1 else 1)}%)", va="center", **VAL)
+    ax.axhline(0, color=AXIS, lw=1)
+    ax.set_xticks([g[0] for g in groups], [g[1] for g in groups])
+    ax.set_ylabel("Δ ms per decoding iteration\n(lower = faster)")
+    ax.grid(axis="x", visible=False)
+    ax.set_title(title)
+
+
+def draft_breakdown(ax, rows, parts, title, xmax):
+    """Per 3-step draft, stacked by component. rows: (label, [values ms], total ms)."""
+    for i, (lbl, vals, tot) in enumerate(rows):
         left = 0
-        for label, pre, post, c in parts:
-            v = post if idx == 2 else pre
-            a.barh(i, v, left=left, height=0.55, color=c, **BAR)
-            if v > 0.3:
-                a.text(left + v / 2, i, f"{v:.2f}", ha="center", va="center", color="white", fontsize=12)
+        for v, (_, c) in zip(vals, parts):
+            ax.barh(i, v, left=left, height=0.55, color=c, **BAR)
+            if v > 0.9:
+                ax.text(left + v / 2, i, f"{v:.2f}", ha="center", va="center", color=INK, fontsize=12)
             left += v
-        a.text(left + 0.06, i, f"{totals[idx]:.2f} ms", va="center", fontweight="semibold", **VAL)
-    a.set_yticks([0, 1], rows)
-    a.set_xlim(0, 5.5)
-    a.set_xlabel("time per draft token (ms)")
-    a.grid(axis="y", visible=False)
-    a.set_title("Drafter step −32%: the argmax was 34% of it")
-    a.legend(
-        handles=[Patch(color=c, label=lbl) for lbl, _, _, c in parts],
+        pct = "" if i == len(rows) - 1 else f"  ({sg(100 * (tot / rows[-1][2] - 1), 1)}%)"
+        ax.text(left + 0.1, i, f"{tot:.2f} ms{pct}", va="center", fontweight="semibold", **VAL)
+    ax.set_yticks(range(len(rows)), [r[0] for r in rows])
+    ax.set_xlim(0, xmax)
+    ax.set_xlabel("ms per 3-step draft")
+    ax.grid(axis="y", visible=False)
+    ax.set_title(title)
+    ax.legend(
+        handles=[Patch(color=c, label=lbl) for lbl, c in parts],
         loc="upper center",
-        bbox_to_anchor=(0.45, -0.2),
-        ncol=3,
+        bbox_to_anchor=(0.45, -0.22),
+        ncol=len(parts),
     )
 
-    for x, ys, c in ((0, pad, INK2), (1, fast, BLUE)):
-        m = statistics.median(ys)
-        b.scatter([x] * len(ys), ys, s=60, color=c, edgecolor=SURFACE, linewidth=2, zorder=3)
-        b.hlines(m, x - 0.25, x + 0.25, color=INK, linewidth=2.5)
-        b.text(x + 0.32, m, f"{m:.1f}", va="center", **VAL)
-    b.set_xticks([0, 1], ["Before", "After"])
-    b.set_xlim(-0.5, 1.9)
-    b.set_ylim(100.5, 106.5)
-    b.set_ylabel("ms per decoding iteration")
-    b.grid(axis="x", visible=False)
-    b.set_title("End to end −4.3%")
-    fig.subplots_adjust(bottom=0.26, wspace=0.28)
+
+# --------------------------------------------------------------------------- Fig 01
+def fig01_argmax_gain(out):
+    # record §4.4 end-to-end A/B: 3 counterbalanced rounds, fast (unpadded) vs pad, ms/iter
+    fast, pad = [101.21, 101.29, 101.32], [105.94, 105.81, 104.46]
+    d = [f - p_ for f, p_ in zip(fast, pad)]
+    fig, a = plt.subplots(figsize=(7, 5.2))
+    gain_panel(a, [(0, "unpadded argmax\nvs padded", d, AQUA)], "Argmax fix: −4.5 ms per iteration", 105.81)
+    a.set_xlim(-0.6, 1.1)
+    a.set_ylim(-5.5, 0.4)
     save(
         fig,
         out,
         "fig01_argmax_gain",
-        """
-Removing a padded argmax from the speculative drafter.
+        f"""
+End-to-end gain of removing a padded argmax from the speculative drafter.
 
-Left: time of one drafter step (one draft token), split into the 4 decoder layers, the lm_head
-matmul (1024 x 262,144) and the argmax that picks the token. The old argmax padded the single
-logits row to 32 rows before reducing it, so every step scanned 32 x 262,144 values (16 MiB) to
-find one index. Reducing the unpadded row returns the same index (verified exact) and cuts the
-argmax from 1.586 ms to 0.102 ms (15.5x). The layers and the lm_head are unchanged; the step
-goes from 4.642 to 3.157 ms (-32.0%).
+Change in decoding time per speculative iteration, unpadded argmax against the old padded one,
+paired within each of 3 alternating rounds (dots) with their median (bar): -4.52 ms per
+iteration, -4.27% of the 105.81 ms baseline (range -3.14 to -4.73 ms). Throughput goes from
+25.14 to 26.26 tokens/s per user (+4.5%). Token acceptance is identical (1.66 of 3 drafts), so
+the output is unchanged. In the round with the smallest gain (-3.14 ms) the baseline ran at
+104.46 ms, about 1.4 ms faster than in the other two rounds; no cause was found (clock and
+temperature were not logged in this run) and the round is kept.
 
-Right: end-to-end decoding time per speculative iteration, before vs after, 3 alternating
-rounds (dots) and their median (bar): 105.81 -> 101.29 ms/iteration (-4.27%, range -3.01 to
--4.46%), i.e. 25.14 -> 26.26 tokens/s per user. Token acceptance is identical (1.66 of 3 drafts),
-so the output is unchanged. One "before" round ran at 104.46 ms, about 1.4 ms faster than the
-other two; no cause was found (clock and temperature were not logged in this run) and it is
-kept.
+{DRAFT}
 """,
     )
 
 
 # --------------------------------------------------------------------------- Fig 02
-def fig02_lm_head_gain(out):
-    # record §5.5.7 (HiFi2, current code): step level (4 rotated rounds, identical to +-0.001 ms)
-    # and e2e paired deltas at 35,200 cols.
-    steps = [  # (label, backbone, head, argmax, total)
-        ("Split, lm_head part\nas shard_ring", 1.658, 1.258, 0.121, 3.037),
-        ("Split, lm_head part\nas shard_mcast", 1.658, 1.220, 0.122, 3.001),
-        ("Whole lm_head\nin DRAM", 1.658, 1.412, 0.102, 3.172),
+def fig02_argmax_breakdown(out):
+    # record §4.4 step breakdown (test_fused_draft_k_steps, ctx 512), x3 = per 3-step draft:
+    # the instrument times the 3-step trace and reports it per step, so x3 is its measured value.
+    parts = [("4 decoder layers", BLUE), ("lm_head matmul", ORANGE), ("argmax (token pick)", AQUA)]
+    rows = [
+        ("After\n(unpadded)", [4.932, 4.233, 0.306], 9.471),
+        ("Before\n(padded to 32 rows)", [4.932, 4.233, 4.758], 13.926),
     ]
-    e2e = {
-        # tuned round 3 left out of the picture for now: its base (99.04) is an unexplained low outlier.
-        # The record keeps it (its quoted medians, -0.51 / -0.56, include it).
-        ("tuned", "split, shard_mcast"): [-0.44, -0.54, -0.48, -0.65, -0.63],
-        ("tuned", "split, shard_ring"): [-0.48, -0.64, -0.31, -0.80, -0.66],
-        ("default", "split, shard_mcast"): [-0.83, -0.52, -0.50],
-        ("default", "split, shard_ring"): [-0.71, -0.30, -0.55],
-    }
-    fig, (a, b) = plt.subplots(1, 2, figsize=(14, 4.9), gridspec_kw=dict(width_ratios=[1.9, 1.2]))
-    parts = [("4 decoder layers", BLUE_L), ("lm_head matmul", ORANGE), ("argmax", AQUA)]
-    for i, (lbl, bb, hd, am, tot) in enumerate(steps):
-        left = 0
-        for v, (_, c) in zip((bb, hd, am), parts):
-            a.barh(i, v, left=left, height=0.55, color=c, **BAR)
-            if v > 0.3:
-                a.text(left + v / 2, i, f"{v:.2f}", ha="center", va="center", color=INK, fontsize=12)
-            left += v
-        pct = "" if i == 2 else f"  ({100 * (tot / 3.172 - 1):+.1f}%)".replace("-", "−")
-        a.text(left + 0.05, i, f"{tot:.2f} ms{pct}", va="center", fontweight="semibold", **VAL)
-    a.set_yticks(range(3), [s_[0] for s_ in steps])
-    a.set_xlim(0, 4.4)
-    a.set_xlabel("time per draft token (ms)")
-    a.grid(axis="y", visible=False)
-    a.set_title("Drafter step −5.4%: the lm_head matmul gets 190 μs faster")
-    a.legend(
-        handles=[Patch(color=c, label=lbl) for lbl, c in parts], loc="upper center", bbox_to_anchor=(0.45, -0.2), ncol=3
+    fig, a = plt.subplots(figsize=(12, 4.4))
+    draft_breakdown(a, rows, parts, "The argmax was 34% of the draft; now 3%", 16.5)
+    fig.subplots_adjust(bottom=0.28)
+    save(
+        fig,
+        out,
+        "fig02_argmax_breakdown",
+        f"""
+Where the argmax fix comes from, inside one 3-step draft.
+
+Time of a 3-step draft split into the drafter's 4 decoder layers, its lm_head matmul
+(1024 x 262,144) and the argmax that picks each token. The old argmax padded the single logits
+row to 32 rows before reducing it, so every step scanned 32 x 262,144 values (16 MiB) to find one
+index. Reducing the unpadded row returns the same index (verified exact) and cuts the argmax
+from 4.76 to 0.31 ms per draft (15.5x). The layers and the lm_head are unchanged; the draft goes
+from 13.93 to 9.47 ms (-32.0%).
+
+{DRAFT}
+""",
     )
 
-    xs = {
-        ("tuned", "split, shard_mcast"): -0.22,
-        ("tuned", "split, shard_ring"): 0.22,
-        ("default", "split, shard_mcast"): 0.78,
-        ("default", "split, shard_ring"): 1.22,
-    }
-    for (drafter, arm), ds in e2e.items():
-        c, x = (MCAST if "mcast" in arm else RING), xs[(drafter, arm)]
-        b.scatter([x] * len(ds), ds, s=60, color=c, edgecolor=SURFACE, linewidth=2, zorder=3)
+
+# --------------------------------------------------------------------------- Fig 03
+def fig03_lm_head_gain(out):
+    # record §5.5.7 e2e paired deltas at 35,200 cols. Tuned round 3 left out of the picture for now:
+    # its base (99.04) is an unexplained low outlier; the record keeps it.
+    e2e = [
+        (-0.22, "tuned", "shard_mcast", [-0.44, -0.54, -0.48, -0.65, -0.63], MCAST),
+        (0.22, "tuned", "shard_ring", [-0.48, -0.64, -0.31, -0.80, -0.66], RING),
+        (0.78, "default", "shard_mcast", [-0.83, -0.52, -0.50], MCAST),
+        (1.22, "default", "shard_ring", [-0.71, -0.30, -0.55], RING),
+    ]
+    fig, a = plt.subplots(figsize=(10, 5.4))
+    base = {"tuned": 100.47, "default": 101.47}  # median base ms/iter per config (tuned: round 3 left out)
+    for x, cfg, _, ds, c in e2e:
         m = statistics.median(ds)
-        b.hlines(m, x - 0.14, x + 0.14, color=INK, lw=2.5)
-        b.text(x + 0.16, m, sg(m), va="center", fontsize=11, color=INK)
-    b.axhline(0, color=AXIS, lw=1)
-    b.set_xticks([0, 1], ["tuned\nmatmul configs", "ttnn default\nmatmul configs"])
-    b.set_xlim(-0.55, 1.65)
-    b.set_ylim(-0.9, 0.15)
-    b.set_ylabel("Δ ms per iteration (lower = faster)")
-    b.grid(axis="x", visible=False)
-    b.legend(
+        a.scatter([x] * len(ds), ds, s=60, color=c, edgecolor=SURFACE, linewidth=2, zorder=3)
+        a.hlines(m, x - 0.14, x + 0.14, color=INK, lw=2.5, zorder=4)
+        a.text(x + 0.16, m, f"{sg(m)}\n({sg(100 * m / base[cfg], 2)}%)", va="center", fontsize=11, color=INK)
+    a.axhline(0, color=AXIS, lw=1)
+    a.set_xticks([0, 1], ["tuned\nmatmul configs", "ttnn default\nmatmul configs"])
+    a.set_xlim(-0.55, 1.7)
+    a.set_ylim(-0.95, 0.15)
+    a.set_ylabel("Δ ms per decoding iteration\n(lower = faster)")
+    a.grid(axis="x", visible=False)
+    a.legend(
         handles=[Patch(color=MCAST, label="shard_mcast"), Patch(color=RING, label="shard_ring")],
         loc="upper right",
         ncol=2,
     )
-    b.set_title("End to end: −0.5 ms per iteration")
-    fig.subplots_adjust(bottom=0.24, wspace=0.42)
+    a.set_title("lm_head 13% in L1: −0.5 ms per iteration")
     save(
         fig,
         out,
-        "fig02_lm_head_gain",
-        """
-Gain from pinning part of the drafter's lm_head in on-chip SRAM.
+        "fig03_lm_head_gain",
+        f"""
+End-to-end gain from pinning part of the drafter's lm_head in on-chip SRAM.
 
 The drafter's lm_head (1024 x 262,144, 512 MiB in bf16) is too large for L1, and ttnn cannot
 place only part of one tensor in L1. So the weight is split along its columns: 35,200 columns
@@ -239,26 +245,53 @@ place only part of one tensor in L1. So the weight is split along its columns: 3
 DRAM, and the two partial logits are joined before the argmax. The result is bit-exact against
 the unsplit head.
 
-Left: one drafter step, split into the 4 decoder layers, the lm_head matmul and the argmax. With
-the pinned part run as shard_mcast (activation multicast), the lm_head goes from 1.412 to 1.220 ms
-and the step from 3.172 to 3.001 ms (-5.4%); joining the two partial logits costs the argmax
-20 us. Running the pinned part as shard_ring (gather_in0 ring) instead gives back 38 us
-(3.037 ms, -4.3%), because its K is too thin for the ring (next figure). Step times were
-identical to +-0.001 ms over 4 rounds.
-
-Right: end-to-end change in ms per decoding iteration (about 100 ms) against the unsplit head,
+Change in decoding time per speculative iteration (about 100 ms) against the unsplit head,
 paired within rounds (dots) with their median (bar), for the drafter with tuned matmul configs
-and with ttnn's default configs. shard_mcast: -0.54 ms tuned (5 rounds), -0.62 ms default
-(3 rounds). shard_ring is not bit-exact and changed token acceptance in the default
-configuration. One tuned round is left out of this figure: its baseline ran unusually fast
-(99.04 ms vs about 100.4) for no identified reason; with it the tuned medians are -0.51
-(shard_mcast) and -0.56 (shard_ring).
+and with ttnn's default configs. shard_mcast (the pinned part's activation multicast):
+-0.54 ms tuned (5 rounds), -0.62 ms default (3 rounds). shard_ring (the pinned part run as a
+gather_in0 ring) is not bit-exact and changed token acceptance in the default configuration.
+One tuned round is left out of this figure: its baseline ran unusually fast (99.04 ms vs about
+100.4) for no identified reason; with it the tuned medians are -0.51 (shard_mcast) and -0.56
+(shard_ring).
+
+{DRAFT}
 """,
     )
 
 
-# --------------------------------------------------------------------------- Fig 03
-def fig03_lm_head_ring_thin_k(out):
+# --------------------------------------------------------------------------- Fig 04
+def fig04_lm_head_breakdown(out):
+    # record §5.5.7 step level (4 rotated rounds, identical to +-0.001 ms), x3 = per 3-step draft.
+    parts = [("4 decoder layers", BLUE_L), ("lm_head matmul", ORANGE), ("argmax", AQUA)]
+    rows = [
+        ("Split, lm_head part\nas shard_ring", [4.974, 3.774, 0.363], 9.111),
+        ("Split, lm_head part\nas shard_mcast", [4.974, 3.660, 0.366], 9.003),
+        ("Whole lm_head\nin DRAM", [4.974, 4.236, 0.306], 9.516),
+    ]
+    fig, a = plt.subplots(figsize=(12, 5))
+    draft_breakdown(a, rows, parts, "The lm_head matmul gets 0.58 ms faster per draft", 11.8)
+    fig.subplots_adjust(bottom=0.26)
+    save(
+        fig,
+        out,
+        "fig04_lm_head_breakdown",
+        f"""
+Where the lm_head gain comes from, inside one 3-step draft.
+
+Time of a 3-step draft split into the drafter's 4 decoder layers, its lm_head matmul and the
+argmax. With the pinned part of the lm_head run as shard_mcast, the lm_head goes from 4.24 to
+3.66 ms per draft and the draft from 9.52 to 9.00 ms (-5.4%); joining the two partial logits
+costs the argmax 0.06 ms. Running the pinned part as shard_ring instead gives back 0.11 ms
+(9.11 ms, -4.3%), because its K is too thin for the ring (next figure). Times were identical
+to +-0.003 ms over 4 rounds.
+
+{DRAFT}
+""",
+    )
+
+
+# --------------------------------------------------------------------------- Fig 05
+def fig05_lm_head_ring_thin_k(out):
     # record §5.5.7 op-level table, second run: the lm_head slice, weight L1 width-sharded.
     rows = [
         ("10,240 columns\non 32 cores", 21.43, 22.00, 26.57),
@@ -317,7 +350,7 @@ def fig03_lm_head_ring_thin_k(out):
     save(
         fig,
         out,
-        "fig03_lm_head_ring_thin_k",
+        "fig05_lm_head_ring_thin_k",
         """
 Why the pinned part of the lm_head is run with multicast, not the gather_in0 ring.
 
@@ -339,8 +372,8 @@ K = 256 tiles gives each of 32 cores 8 tiles and the ring is 3.2x faster (last f
     )
 
 
-# --------------------------------------------------------------------------- Fig 09
-def fig09_down_proj_ring_steps(out):
+# --------------------------------------------------------------------------- Fig 11
+def fig11_down_proj_ring_steps(out):
     # record §6.8: 12B down_proj shape, 32 cores, per_core_N=1, weight L1 width-sharded, isolated-op
     blk = [1, 2, 4, 8, 16, 32]
     dram = [221.87, 119.45, 66.95, 41.19, 28.80, 23.74]
@@ -379,7 +412,7 @@ def fig09_down_proj_ring_steps(out):
     save(
         fig,
         out,
-        "fig09_down_proj_ring_steps",
+        "fig11_down_proj_ring_steps",
         """
 Why the gather_in0 ring wins on down_proj: the multicast matmul's cost is set by its number of
 K-steps.
@@ -394,6 +427,70 @@ DRAM or L1 moves it by at most 3.3 us.
 The ring (orange point) splits K = 256 tiles over the 32 cores, 8 tiles each, and runs the same
 32 steps as the default multicast configuration in 12.44 us instead of 40.22 us (15.07 us
 including its layout conversions). One run per point.
+""",
+    )
+
+
+# --------------------------------------------------------------------------- Fig 06
+E2E_CELLS = Path(__file__).with_name("down_proj_e2e_cells.csv")
+
+
+def fig06_down_proj_gain(out):
+    # run_down_proj_e2e.py: 12B demo, tuned, canonical prompt, 500 tokens, round 0 = warm-up (dropped)
+    rows = [r for r in csv.DictReader(E2E_CELLS.open()) if r["warmup"] != "True"]
+    by = {}
+    for r in rows:
+        by.setdefault(r["round"], {})[r["arm"]] = r
+    rounds = [v for v in by.values() if len(v) == 3]
+    assert len(rounds) == len(by), "a round is missing an arm; deltas must be paired within a round"
+    ms = {arm: [float(v[arm]["ms_per_iter"]) for v in rounds] for arm in ("dram_mcast", "shard_mcast", "shard_ring")}
+    base = statistics.median(ms["dram_mcast"])
+    d = {
+        arm: [float(v[arm]["ms_per_iter"]) - float(v["dram_mcast"]["ms_per_iter"]) for v in rounds]
+        for arm in ("shard_mcast", "shard_ring")
+    }
+    acc = {r["accept"] for r in rows}
+    same_text = len({r["text_sha"] for r in rows}) == 1
+    fig, a = plt.subplots(figsize=(8, 5.4))
+    gain_panel(
+        a,
+        [
+            (0, "shard_mcast\npinned in L1", d["shard_mcast"], MCAST),
+            (1, "shard_ring\npinned + ring", d["shard_ring"], RING),
+        ],
+        f"down_proj in L1 + ring: {sg(statistics.median(d['shard_ring']))} ms per iteration",
+        base,
+    )
+    a.set_xlim(-0.6, 1.9)
+    lo = min(min(v) for v in d.values())
+    hi = max(max(v) for v in d.values())
+    pad = 0.15 * (hi - lo + 0.05)
+    a.set_ylim(min(lo - pad, -0.02), max(hi + pad, 0.02))
+    dm, dr = (statistics.median(d[k]) for k in ("shard_mcast", "shard_ring"))
+    save(
+        fig,
+        out,
+        "fig06_down_proj_gain",
+        f"""
+End-to-end gain from pinning one drafter down_proj weight in on-chip SRAM, alone and with the
+gather_in0 ring.
+
+Only one of the drafter's four down_proj weights (8192 x 1024, 16 MiB) fits in the L1 left free
+by the runtime buffers, so this is one layer. shard_mcast pins it in L1 width-sharded on the
+cores that compute with it; shard_ring additionally delivers the activation with the gather_in0
+ring instead of multicast. The baseline, dram_mcast, keeps it in DRAM ({base:.2f} ms per
+iteration).
+
+Change in decoding time per speculative iteration, paired within each of {len(rounds)} rounds
+(dots) with their median (bar): shard_mcast {sg(dm)} ms ({sg(100 * dm / base, 2)}%), shard_ring
+{sg(dr)} ms ({sg(100 * dr / base, 2)}%). Token acceptance {'is identical in every run (' + '/'.join(sorted(acc)) + ' of 3 drafts)' if len(acc) == 1 else 'varies: ' + ', '.join(sorted(acc))}{'; the generated text is identical in every run' if same_text else '; the generated text differs between some runs'}.
+shard_ring was faster than the baseline in {sum(x < 0 for x in d['shard_ring'])} of {len(rounds)} rounds. shard_mcast's
+effect is smaller than the run-to-run spread (the baseline alone varies by
+{max(ms['dram_mcast']) - min(ms['dram_mcast']):.2f} ms across rounds), so it is not resolved end to end; on the drafter alone
+it is -40 us per 3-step draft (see the placement figure). The rounds rotate the arm order so each
+arm runs in each position equally often, with one warm-up round discarded.
+
+{DRAFT}
 """,
     )
 
@@ -413,7 +510,7 @@ def contrast(rounds, a, b):
     return med_range([r[a] - r[b] for r in rounds])
 
 
-def fig04_to_08_down_proj(out):
+def fig07_to_10_down_proj(out):
     rounds, rows = load_cells()
     sfpi = {r["sfpi"] for r in rows}
     assert len(sfpi) == 1 and len({r["commit"] for r in rows}) == 1 and len({r["harness_sha256"] for r in rows}) == 1
@@ -435,74 +532,6 @@ def fig04_to_08_down_proj(out):
         "shard = weight in L1 width-sharded on the cores that compute with it, so no weight read is needed. "
         "mcast = the activation is multicast to all cores; ring = gather_in0, the activation is split along K "
         "and passed around a ring of cores."
-    )
-
-    # Fig 04: the down_proj headline, per draft step and end to end
-    base_trace = statistics.median(r["dram_mcast"] for r in rounds)
-    arms4 = [
-        ("dram_mcast\nweight in DRAM", "dram_mcast", INK2),
-        ("shard_mcast\npinned in L1", "shard_mcast", MCAST),
-        ("shard_ring\npinned + ring", "shard_ring", RING),
-    ]
-    fig, (a, b) = plt.subplots(1, 2, figsize=(14, 5.2))
-    for i, (lbl, arm, c) in enumerate(arms4):
-        if arm == "dram_mcast":
-            a.text(i, -1, f"baseline\n{base_trace / 3:,.0f} μs", ha="center", va="top", color=INK2, fontsize=12)
-            b.text(i, -0.004, "baseline", ha="center", va="top", color=INK2, fontsize=12)
-            continue
-        m, lo, hi = contrast(rounds, arm, "dram_mcast")
-        a.bar(i, m / 3, 0.55, color=c, **BAR)
-        a.errorbar(i, m / 3, yerr=[[(m - lo) / 3], [(hi - m) / 3]], color=INK, lw=1.2, capsize=4)
-        a.text(i, lo / 3 - 1, f"{sg(m / 3, 1)} μs\n({sg(100 * m / base_trace, 2)}%)", ha="center", va="top", **VAL)
-        b.bar(i, m / 1000, 0.55, color=c, hatch="//", **BAR)
-        b.text(
-            i,
-            m / 1000 - 0.004,
-            f"{sg(m / 1000, 2)} ms\n({sg(100 * m / 1000 / 100.42, 2)}%)",
-            ha="center",
-            va="top",
-            **VAL,
-        )
-    for ax in (a, b):
-        ax.axhline(0, color=AXIS, lw=1)
-        ax.set_xticks(range(3), [x[0] for x in arms4])
-        ax.grid(axis="x", visible=False)
-    a.set_ylim(-52, 3)
-    a.set_xlim(-0.6, 2.6)
-    b.set_xlim(-0.6, 2.6)
-    a.set_ylabel("Δ μs per draft step (lower = faster)")
-    a.set_title("Drafter step: −38 μs (−1.2%) with L1 + ring")
-    b.set_ylim(-0.16, 0.01)
-    b.set_ylabel("Δ ms per iteration (lower = faster)")
-    b.set_title("End to end: about −0.11 ms (estimated)")
-    fig.subplots_adjust(wspace=0.3)
-    save(
-        fig,
-        out,
-        "fig04_down_proj_gain",
-        f"""
-Gain from pinning one drafter down_proj weight in on-chip SRAM, alone and with the gather_in0
-ring.
-
-Only one of the drafter's four down_proj weights (8192 x 1024, 16 MiB) fits in the L1 left free
-by the runtime buffers, so this is one layer. shard_mcast pins it in L1 width-sharded on the
-cores that compute with it; shard_ring additionally delivers the activation with the gather_in0
-ring instead of multicast.
-
-Left: change in the time of one drafter step against dram_mcast ({base_trace / 3:,.0f} us per step):
-shard_mcast -13.5 us (-0.43%), shard_ring -37.6 us (-1.19%). Whiskers are the full min-max over
-rounds.
-
-Right: the same savings in ms per decoding iteration (one 3-step draft per iteration, about
-100.4 ms): -0.04 ms and -0.11 ms. These are estimated from the drafter measurement, not measured
-end to end (hatched): an effect this small is below the run-to-run spread of an end-to-end run.
-Why the saving is small: that one layer is under 2% of the drafter step's kernel time. The next
-figures take the -113 us per draft apart.
-
-{glossary}
-
-{method}
-""",
     )
 
     # Fig 2: every arm relative to dram_mcast
@@ -541,7 +570,7 @@ figures take the -113 us per draft apart.
     save(
         fig,
         out,
-        "fig05_down_proj_placement_x_delivery",
+        "fig07_down_proj_placement_x_delivery",
         f"""
 One down_proj layer of the drafter, six ways: three places for its weight x two ways of feeding
 the activation to the matmul. Each bar is the change in the time of a 3-step draft against
@@ -562,30 +591,29 @@ dram_mcast (weight in DRAM, activation multicast; {base:.0f} us).
     # Fig 3: ring minus its own mcast, per ringed matmul
     fig, a = plt.subplots(figsize=(9.5, 5.2))
     for i, (lbl, mc, rg) in enumerate(places):
-        ds = [(r[rg] - r[mc]) / 3 for r in rounds]
+        ds = [r[rg] - r[mc] for r in rounds]
         m, lo, hi = med_range(ds)
         a.bar(i, m, 0.5, color=RING if m < 0 else INK2, **BAR)
         a.errorbar(i, m, yerr=[[m - lo], [hi - m]], color=INK, lw=1.2, capsize=4)
-        a.text(
-            i, hi + 0.6 if m >= 0 else lo - 0.6, sg(m, 1) + " μs", ha="center", va="bottom" if m >= 0 else "top", **VAL
-        )
+        a.text(i, hi + 2 if m >= 0 else lo - 2, sg(m, 0) + " μs", ha="center", va="bottom" if m >= 0 else "top", **VAL)
     a.axhline(0, color=AXIS, lw=1)
-    a.set_ylim(-28, 7)
+    a.set_ylim(-84, 21)
     a.set_xticks(range(3), [p[0] for p in places])
-    a.set_ylabel("ring − mcast per matmul (μs)\nabove 0 = ring slower")
+    a.set_ylabel("ring − mcast, μs per 3-step draft\nabove 0 = ring slower")
     a.set_title("The ring's benefit flips sign with the weight's placement")
     a.grid(axis="x", visible=False)
     save(
         fig,
         out,
-        "fig06_down_proj_ring_per_matmul",
+        "fig08_down_proj_ring_by_placement",
         f"""
 What switching the activation delivery from multicast to the gather_in0 ring is worth, per
-matmul, for each weight placement: dram_ring - dram_mcast, il_ring - il_mcast and
-shard_ring - shard_mcast, each divided by the 3 ringed matmuls in a draft.
+3-step draft, for each weight placement: dram_ring - dram_mcast, il_ring - il_mcast and
+shard_ring - shard_mcast. The ring is used on the same 3 matmuls in every case (the one pinned
+down_proj layer, once per draft step).
 
-With the weight in DRAM the ring costs +2.7 us per matmul. With the weight in L1 it saves 13.4 us
-(spread over all banks) or 24.2 us (on the compute cores). The ring blocks K more finely than
+With the weight in DRAM the ring costs +8 us per draft. With the weight in L1 it saves 40 us
+(spread over all banks) or 72 us (on the compute cores). The ring blocks K more finely than
 multicast does, so it issues more, smaller weight reads; that is cheap from SRAM and expensive
 from DRAM.
 
@@ -638,7 +666,7 @@ from DRAM.
     save(
         fig,
         out,
-        "fig07_down_proj_breakdown",
+        "fig09_down_proj_breakdown",
         f"""
 The full saving of shard_ring over dram_mcast (-113 us per 3-step draft), taken apart in two
 orders.
@@ -680,7 +708,7 @@ within-round contrasts, so they need not add up exactly to the total.
     save(
         fig,
         out,
-        "fig08_down_proj_locality",
+        "fig10_down_proj_locality",
         f"""
 The value of locality: the weight in L1 on the cores that compute with it (shard) against the
 weight in L1 spread over all banks (il), for each activation delivery.
@@ -713,18 +741,22 @@ costs far more than a local one.
 
 
 FIGS = {
-    "fig01": fig1_argmax,
-    "fig02": fig02_lm_head_gain,
-    "fig03": fig03_lm_head_ring_thin_k,
-    "campaign": fig04_to_08_down_proj,
-    "fig09": fig09_down_proj_ring_steps,
+    "fig01": fig01_argmax_gain,
+    "fig02": fig02_argmax_breakdown,
+    "fig03": fig03_lm_head_gain,
+    "fig04": fig04_lm_head_breakdown,
+    "fig05": fig05_lm_head_ring_thin_k,
+    "fig06": fig06_down_proj_gain,
+    "campaign": fig07_to_10_down_proj,
+    "fig11": fig11_down_proj_ring_steps,
 }
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default=",".join(k for k in FIGS if k != "campaign" or CELLS.exists()))
+    have = {"campaign": CELLS.exists(), "fig06": E2E_CELLS.exists()}
+    p.add_argument("--only", default=",".join(k for k in FIGS if have.get(k, True)))
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     for k in args.only.split(","):
