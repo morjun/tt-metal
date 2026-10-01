@@ -1524,23 +1524,23 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
         }
     }
 
-    // If CB layout already calculated, skip allocation but report for new devices
+    // If CB layout already calculated, skip allocation but report its resolved
+    // ranges for every execution. Graph captures can start after a program was
+    // cached on this device, so reporting only for new devices misses exactly
+    // the CBs that determine the lifetime L1 ceiling in a traced decode.
     if (not this->local_circular_buffer_allocation_needed_) {
-        // Report CB allocations for any NEW devices (using cached addresses)
-        if (!new_devices.empty() && !this->circular_buffers_.empty()) {
-            for (const IDevice* dev : new_devices) {
+        if (!this->circular_buffers_.empty()) {
+            for (const IDevice* dev : devices_to_track) {
                 for (const auto& circular_buffer : this->circular_buffers_) {
-                    if (!circular_buffer->globally_allocated()) {
-                        tt::tt_metal::GraphTracker::instance().track_allocate_cb(
-                            circular_buffer->core_ranges(),
-                            circular_buffer->address(),
-                            circular_buffer->size(),
-                            circular_buffer->globally_allocated(),
-                            dev);
-                    }
+                    tt::tt_metal::GraphTracker::instance().track_allocate_cb(
+                        circular_buffer->core_ranges(),
+                        circular_buffer->address(),
+                        circular_buffer->size(),
+                        circular_buffer->globally_allocated(),
+                        dev);
                 }
-
-                // Also register program with the NEW device
+            }
+            for (const IDevice* dev : new_devices) {
                 auto* device_obj = dynamic_cast<Device*>(const_cast<IDevice*>(dev));
                 if (device_obj) {
                     device_obj->register_program(this);

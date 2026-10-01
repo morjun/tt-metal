@@ -1444,9 +1444,15 @@ class SpeculativeDecoder:
         vidx.deallocate(True)
         vh.deallocate(True)
         _lg.info("[spec-trace] capture fused: begin_trace_capture")
+        from research_codes.mm_profiling import lm_head_l1_capture as _l1_profile
+
+        _l1_profile.snapshot(self.mesh_device, "before_iteration", {"target": self.target, "assistant": self.assistant})
+        _l1_profile.begin()
         tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         vx, vidx, vh = self._fused_body(tr)
         ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        _l1_profile.end("iteration")
+        _l1_profile.snapshot(self.mesh_device, "after_iteration", {"target": self.target, "assistant": self.assistant})
         _lg.info("[spec-trace] capture fused: DONE")
         tr["id"] = tid
         tr["verify_x"] = vx
@@ -1807,9 +1813,15 @@ class SpeculativeDecoder:
         vidx.deallocate(True)
         vh.deallocate(True)
         _lg.info("[spec-trace] capture batched fused: begin_trace_capture")
+        from research_codes.mm_profiling import lm_head_l1_capture as _l1_profile
+
+        _l1_profile.snapshot(self.mesh_device, "before_iteration", {"target": self.target, "assistant": self.assistant})
+        _l1_profile.begin()
         tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         vx, vidx, vh = self._fused_body_batched(tr)
         ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        _l1_profile.end("iteration")
+        _l1_profile.snapshot(self.mesh_device, "after_iteration", {"target": self.target, "assistant": self.assistant})
         _lg.info("[spec-trace] capture batched fused: DONE")
         tr["id"] = tid
         tr["verify_x"] = vx

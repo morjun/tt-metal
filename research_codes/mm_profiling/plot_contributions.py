@@ -509,54 +509,67 @@ def fig11_down_proj_ring_steps(out):
     dram = [221.87, 119.45, 66.95, 41.19, 28.80, 23.74]
     l1 = [218.57, 116.29, 65.21, 40.22, 28.18, 23.63]
     steps = [256 // b for b in blk]
-    fig, a = plt.subplots(figsize=(10, 5.4))
+    fig, (a, b) = plt.subplots(1, 2, figsize=(15, 5.4), gridspec_kw={"width_ratios": [1.25, 1]})
     a.plot(
         steps, dram, color=MCAST, lw=2.5, marker="o", ms=8, mec=SURFACE, mew=2, label="shard_mcast, activation in DRAM"
     )
     a.plot(steps, l1, color=VIOLET, lw=2.5, marker="o", ms=8, mec=SURFACE, mew=2, label="shard_mcast, activation in L1")
-    a.scatter(
-        [32],
-        [12.44],
-        s=130,
-        color=RING,
-        edgecolor=SURFACE,
-        linewidth=2,
-        zorder=4,
-        label="shard_ring (gather_in0), 32 steps",
-    )
-    a.annotate(
-        "at 32 steps: 40.2 μs multicast\nvs 12.4 μs ring",
-        xy=(34, 12.44),
-        xytext=(52, 30),
-        fontsize=12,
-        color=INK,
-        arrowprops=dict(arrowstyle="-", color=MUTED, lw=1),
-    )
     a.set_xscale("log", base=2)
     a.set_xticks(steps, [str(s_) for s_ in steps])
-    a.set_xlabel("K-steps per matmul (fewer steps = wider blocks)")
-    a.set_ylabel("μs per down_proj matmul")
+    a.invert_xaxis()
+    a.set_xlabel("Multicast K-block iterations = 256 / block width")
+    a.set_ylabel("Isolated matmul time (μs)")
     a.set_ylim(0, 235)
-    a.set_title("Why the ring wins on down_proj: multicast pays per K-step")
+    a.set_title("Multicast improves as block width grows")
     a.legend(loc="upper left")
+
+    # Ring rounds come from the 32-core ring, not the multicast block width.
+    # The 12.44 us arm starts pre-sharded; 15.07 us includes layout conversions.
+    labels = ["Multicast\n32 blocks", "Multicast\n8 blocks", "Ring + layout\n32 rounds", "Ring kernel\n32 rounds"]
+    times = [40.22, 23.63, 15.07, 12.44]
+    bars = b.bar(range(4), times, color=[VIOLET, VIOLET, RING, RING], width=0.66)
+    b.set_xticks(range(4), labels)
+    b.set_ylim(0, 48)
+    b.set_ylabel("Isolated op time (μs)")
+    b.set_title("Ring stays faster, even versus 8-block multicast")
+    b.grid(axis="x", visible=False)
+    for bar, value in zip(bars, times):
+        b.text(bar.get_x() + bar.get_width() / 2, value + 0.8, f"{value:.2f}", ha="center", va="bottom")
+    fig.text(
+        0.5,
+        -0.01,
+        "Code suggests different work per round: one multicast sender waits for all receivers; "
+        "ring cores forward shards concurrently. Individual costs were not isolated.",
+        ha="center",
+        color=MUTED,
+        fontsize=10,
+    )
+    fig.tight_layout(w_pad=3)
     save(
         fig,
         out,
         "fig11_down_proj_ring_steps",
         """
-Why the gather_in0 ring wins on down_proj: the multicast matmul's cost is set by its number of
-K-steps.
+The ring is faster than multicast at the same number of activation-delivery rounds, and also
+faster than an 8-block multicast configuration. The figure separates the multicast block-width
+sweep from that route comparison because the two routes define their round counts differently.
 
 The drafter's down_proj (K = 8192, N = 1024) on 32 cores with the weight pinned in L1
 width-sharded, as one matmul in isolation. The multicast kernel walks K in blocks; sweeping the
-block width from 1 to 32 tiles takes it from 256 steps to 8. Its time falls almost linearly with
-the step count, about 0.8 us per step whatever a step carries (221.9 us at 256 steps, 41.2 at 32,
-23.7 at 8), so the cost is per-step overhead, not bandwidth. Whether the activation starts in
-DRAM or L1 moves it by at most 3.3 us.
+block width from 1 to 32 tiles takes it from 256 K-block iterations to 8. Its time falls
+from 218.57 us to 23.63 us with activation in L1. Whether the activation starts in DRAM or L1
+moves multicast time by at most 3.3 us at a given width.
 
-The ring (orange point) splits K = 256 tiles over the 32 cores, 8 tiles each, and runs the same
-32 steps as the default multicast configuration in 12.44 us instead of 40.22 us (15.07 us
-including its layout conversions). One run per point.
+The ring splits K = 256 tiles over 32 cores, 8 tiles each. Its 32 rounds come from the ring's
+core count. With multicast also at 32 K-block iterations, the ring kernel takes 12.44 us versus
+40.22 us for multicast. The ring takes 15.07 us including its input/output layout conversions,
+still faster than 8-block multicast at 23.63 us. Source code shows one multicast sender waiting
+for all receivers before writing each block, while ring cores forward shards concurrently to the
+next ring core. That difference is a plausible mechanism for different work per round, not a
+measured breakdown: sender read, semaphore wait, and compute/packing costs were not isolated.
+The 8-block multicast setting uses a wider block and changes CB footprint and accumulation order;
+it is a tuning sensitivity point, not a numerical-equivalence result.
+The experiment used random L1-pinned weights, one run, 20 calls per trace and 20 replays.
 """,
     )
 

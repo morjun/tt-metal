@@ -292,6 +292,14 @@ def decode_forward(
         k_cache = tt_k
         v_cache = tt_v
 
+    if kv_cache is not None and not is_kv_shared:
+        # Paged update has consumed the height-sharded K/V staging tensors.
+        # SDPA below reads k_cache/v_cache, not these tensors. Releasing them
+        # here removes 2 x 32 KiB of live LOCKSTEP L1 at the global-layer SDPA
+        # CB high-water, which otherwise blocks the next uniform lm_head shard.
+        tt_k.deallocate(True)
+        tt_v.deallocate(True)
+
     # 6. SDPA (scale=1.0)
     sliding_window = config.sliding_window if config.is_sliding else None
 

@@ -17,6 +17,7 @@
 #include <sstream>
 #include <enchantum/enchantum.hpp>
 #include <memory>
+#include <map>
 #include <string>
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/circular_buffer.hpp>
@@ -38,6 +39,50 @@ std::string tensorMemoryLayoutToString(TensorMemoryLayout layout) {
         case TensorMemoryLayout::BLOCK_SHARDED: return "BLOCK_SHARDED";
         default: return "UNKNOWN";  // Handle unexpected values
     }
+}
+
+// Map just this L1 buffer's pages. Calling reports::get_buffer_pages() here
+// walks every live L1 buffer for every allocation and becomes quadratic during
+// a full Gemma4 iteration.
+std::string physical_l1_ranges(const tt::tt_metal::Buffer* buffer) {
+    if (buffer->buffer_type() != tt::tt_metal::BufferType::L1) {
+        return "";
+    }
+    using Coord = std::pair<uint32_t, uint32_t>;
+    using Span = std::pair<uint32_t, uint32_t>;
+    std::map<Coord, std::vector<Span>> ranges;
+    const auto page_size = buffer->page_size();
+    const auto buffer_type = buffer->buffer_type();
+    if (is_sharded(buffer->buffer_layout())) {
+        const auto& mapping = *const_cast<tt::tt_metal::Buffer*>(buffer)->get_buffer_page_mapping();
+        for (const auto& page : mapping) {
+            const auto core = mapping.all_cores[page.core_id];
+            const uint32_t address = buffer->address() + page.device_page * buffer->aligned_page_size();
+            ranges[{core.x, core.y}].emplace_back(address, address + page_size);
+        }
+    } else {
+        const auto num_banks = buffer->allocator()->get_num_banks(buffer_type);
+        for (uint32_t page = 0; page < buffer->num_pages(); ++page) {
+            const auto bank = page % num_banks;
+            const auto core = buffer->allocator()->get_logical_core_from_bank_id(bank);
+            const uint32_t address = buffer->page_address(bank, page);
+            ranges[{core.x, core.y}].emplace_back(address, address + page_size);
+        }
+    }
+    nlohmann::json result = nlohmann::json::object();
+    for (auto& [core, spans] : ranges) {
+        std::sort(spans.begin(), spans.end());
+        nlohmann::json merged = nlohmann::json::array();
+        for (const auto& [lo, hi] : spans) {
+            if (!merged.empty() && lo <= merged.back()[1].get<uint32_t>()) {
+                merged.back()[1] = std::max(hi, merged.back()[1].get<uint32_t>());
+            } else {
+                merged.push_back({lo, hi});
+            }
+        }
+        result[std::to_string(core.first) + "," + std::to_string(core.second)] = std::move(merged);
+    }
+    return result.dump();
 }
 
 nlohmann::json to_json(const ttnn::graph::GraphProcessor::Vertex& data) {
@@ -244,6 +289,9 @@ void GraphProcessor::track_allocate(const tt::tt_metal::Buffer* buffer) {
         {kNumCores, std::to_string(buffer->num_cores().value_or(0))},  // use 0 for interleaved
         {kDeviceId, std::to_string(buffer->device()->id())},
         {kMaxSizePerBank, std::to_string(max_size_per_bank)}};
+    if (buffer->buffer_type() == tt::tt_metal::BufferType::L1) {
+        params["physical_ranges"] = physical_l1_ranges(buffer);
+    }
     {
         graph.push_back(Vertex{
             .counter = counter,
@@ -361,7 +409,8 @@ void GraphProcessor::track_program(tt::tt_metal::Program* program, const tt::tt_
     track_deallocate_cb(device);
 
     if (run_mode == RunMode::NORMAL) {
-        // we will track real buffer allocations during program run
+        // Resolved CB ranges are reported by ProgramImpl::allocate_circular_buffers
+        // for both fresh and cached program layouts.
         return;
     }
 

@@ -504,6 +504,35 @@ def _time_fused_k_steps(mesh_device, rig, k, reps=TRACE_REPS, mode="full"):
     return ms, capture_s
 
 
+@_needs_assistant
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
+def test_lm_head_l1_address_capture(mesh_device, reset_seeds):
+    """Capture one actual K=3 fused drafter trace with resident L1 snapshots."""
+    from research_codes.mm_profiling import lm_head_l1_capture as profile
+
+    assert profile.enabled(), "set GEMMA4_LMHEAD_PROFILE_OUT to a fresh output directory"
+    assert os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3") == "3"
+    rig = _build_standalone(mesh_device, "dram", tune_matmuls=os.getenv("GEMMA4_TUNE_MATMULS", "1") == "1")
+    if rig["assistant"].lm_head_l1 is not None:
+        assert profile._owners({"head": rig["assistant"].lm_head_l1}), "pinned head owner was not resolved"
+    profile.snapshot(mesh_device, "assistant_loaded", {"assistant": rig["assistant"]})
+    body = _make_fused_k_body(rig, 3)
+    idx, hidden = body()  # compile the same program set before trace capture
+    ttnn.synchronize_device(mesh_device)
+    idx.deallocate(True)
+    hidden.deallocate(True)
+    profile.snapshot(mesh_device, "before_iteration", {"assistant": rig["assistant"]})
+    profile.begin()
+    trace = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    idx, hidden = body()
+    ttnn.end_trace_capture(mesh_device, trace, cq_id=0)
+    profile.end("iteration")
+    profile.snapshot(mesh_device, "after_iteration", {"assistant": rig["assistant"]})
+    ttnn.release_trace(mesh_device, trace)
+    idx.deallocate(True)
+    hidden.deallocate(True)
+
+
 def _time_per_step_replay(mesh_device, rig, k, reps=max(4, TRACE_REPS // 8)):
     """CONTROL: one step traced, replayed K times, paying host dispatch per step.
 
@@ -2428,6 +2457,9 @@ def test_lm_head_split(mesh_device, reset_seeds):
     dram_slice.deallocate(True)
 
     # ---- apply the split exactly as the model does ---------------------------------
+    # Splitting deallocates the original DRAM weight. Keep a separate copy only
+    # for the optional counterbalanced op timing that runs after the split.
+    abba_full_weight = ttnn.clone(W) if os.getenv("GEMMA4_LMSPLIT_OP_ABBA", "0") == "1" else None
     os.environ["GEMMA4_LMHEAD_L1_COLS"] = str(cols)
     try:
         a._split_lm_head_to_l1(mesh_device)
@@ -2624,6 +2656,27 @@ def test_lm_head_split(mesh_device, reset_seeds):
         f"[lm-split] tail DRAM {t_tail:9.2f} | pair (slice L1 + tail) {t_pair:9.2f} | vs full {t_pair - t_full:+.2f} us"
     )
     logger.info(f"[lm-split] argmax over SplitLogits (untilize x2 + concat + argmax) {t_argmax_split:9.2f} us")
+    if os.getenv("GEMMA4_LMSPLIT_OP_ABBA", "0") == "1":
+        # Fresh trace timing, counterbalanced against drift after all warmups.
+        def timed_full():
+            return _op_timed(mesh_device, lambda: ttnn.linear(x, abba_full_weight), protect=(x, abba_full_weight))
+
+        def timed_pair():
+            return _op_timed(
+                mesh_device,
+                lambda: _Pair(
+                    ttnn.linear(x, P, program_config=a.lm_head_l1_pc, compute_kernel_config=a.lm_head_l1_ckc),
+                    ttnn.linear(x, T_),
+                ),
+                protect=(x, P, T_),
+            )
+
+        op_abba = [timed_full(), timed_pair(), timed_pair(), timed_full()]
+        logger.info(
+            f"[lm-split] op ABBA full,pair,pair,full us={op_abba}; "
+            f"paired deltas={op_abba[1]-op_abba[0]:+.2f},{op_abba[2]-op_abba[3]:+.2f}"
+        )
+        abba_full_weight.deallocate(True)
     assert op_argmax_ok, "op-level argmax differs between split and unsplit head"
     # NOT token identity. The split changes the K-reduction order, so bf16 logits move by a
     # few ULP; where the top-2 are that close the winner flips, and every later step then

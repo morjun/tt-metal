@@ -708,6 +708,9 @@ def _run_spec_decode(
         bounded_sliding_kv_cache=False,  # spec-decode needs unbounded sliding KV
     )
     target = generator.model[0]
+    from research_codes.mm_profiling import lm_head_l1_capture as _l1_profile
+
+    _l1_profile.snapshot(mesh_device, "target_loaded", {"target": target})
     model_args = generator.model_args
 
     page_table = create_tt_page_table(batch_size, paged_attention_config)
@@ -719,6 +722,7 @@ def _run_spec_decode(
     generator.warmup_model_prefill(
         kv_cache=tt_kv_cache, enable_trace=prefill_enable_trace, can_sample_on_device=False, greedy_only=True
     )
+    _l1_profile.snapshot(mesh_device, "prefill_warmup", {"target": target})
 
     input_tokens_prefill_pt, encoded_prompts, decoding_pos, prefill_lens = preprocess_inputs_prefill(
         [prompt], tokenizer, model_args, instruct, max_generated_tokens, max_prefill_len=max_seq_len
@@ -739,6 +743,7 @@ def _run_spec_decode(
     prefill_elapsed = time.perf_counter() - prefill_t0
     if hasattr(prefill_logits, "deallocate"):
         prefill_logits.deallocate(True)
+    _l1_profile.snapshot(mesh_device, "prefill_done", {"target": target})
 
     prompt_len = int(decoding_pos[0])
     anchor_pos = prompt_len - 1
@@ -771,6 +776,7 @@ def _run_spec_decode(
         ccl_manager=target.ccl_manager,
         assistant_path=assistant_path,
     )
+    _l1_profile.snapshot(mesh_device, "assistant_loaded", {"target": target, "assistant": assistant})
 
     spec = SpeculativeDecoder(
         target_model=target,
